@@ -298,15 +298,15 @@ export default function (pi: ExtensionAPI) {
   console.log("[pi-symbol-index] Extension loaded");
 
   // Auto-build index on session_start when go.mod exists
-  pi.on("session_start", async (event) => {
-    console.log(`[pi-symbol-index] session_start: ${event.cwd}`);
+  pi.on("session_start", async (_event, ctx) => {
+    console.log(`[pi-symbol-index] session_start in ${ctx.cwd}`);
     try {
       const goMod = await fs
-        .readFile(path.join(event.cwd, "go.mod"), "utf-8")
+        .readFile(path.join(ctx.cwd, "go.mod"), "utf-8")
         .catch(() => null);
       if (goMod) {
         console.log("[pi-symbol-index] Found go.mod, building index...");
-        await buildIndex(event.cwd);
+        await buildIndex(ctx.cwd);
       }
     } catch (e: any) {
       console.warn(
