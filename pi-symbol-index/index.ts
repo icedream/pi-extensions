@@ -444,6 +444,25 @@ export default async function (api: ExtensionAPI): Promise<void> {
   });
 
   api.registerTool({
+    name: "pi_list_blocks",
+    label: "List Code Blocks",
+    description: 'List all editable code blocks with their hashes, file paths, and line ranges.',
+    parameters: Type.Object({
+      file: Type.Optional(Type.String({ description: 'Filter blocks by filename. Leave blank to list all.' })),
+    }),
+    execute: async (id, params) => {
+      const index = await readIndex();
+      if (!index) throw new Error("No symbol index found. Run pi_symbol_build first.");
+      let blocks = index.blocks;
+      if (params && params.file) blocks = blocks.filter(b => b.file === params.file);
+      const output = blocks.map(b => `${b.file}:${b.startLine}-${b.endLine} hash=${b.hash}`)
+        .join("\n")
+        + (blocks.length === 0 ? "\n(No blocks found)" : "");
+      return { content: [{ type: "text", text: output }] };
+    },
+  });
+
+  api.registerTool({
     name: "pi_replace_block",
     label: "Replace Code Block",
     description: 'Replace a code block by hash. No "oldText" required — the extension finds the block by hash. If the hash check fails (file was modified externally), the operation is refused to prevent desync.',
