@@ -2,8 +2,8 @@
   "name": "pi-symbol-index",
   "version": "0.1.0",
   "dependencies": {
+    "@sinclair/typebox": "^0.34.4",
     "vscode-jsonrpc": "^9.0.1",
-    "vscode-languageserver-protocol": "^3.18.0",
     "vscode-languageserver-types": "^3.18.0"
   },
   "pi": {
