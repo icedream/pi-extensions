@@ -9,3 +9,5 @@ While I personally use these, I only currently maintain them as I need to work w
 | Extension | Description |
 |-----------|-------------|
 | [copilot-baseurl-fix](copilot-baseurl-fix/) | Fixes GitHub Copilot Business/Enterprise compaction failures (421 / Connection error) |
+| [pi-symbol-index](pi-symbol-index/) | Builds and exposes a symbol index for Go projects via `gopls` |
+
