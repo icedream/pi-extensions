@@ -7,6 +7,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import {
   StreamMessageReader,
@@ -34,6 +35,7 @@ interface PiIndex {
   languages: string[];
   buildTs: string;
   files: Record<string, { status: "ok" | "partial" | "broken"; symbols: IndexSymbol[] }>;
+  blocks: BlockIndex[];
 }
 
 const INDEX_DIR = ".pi-index";
@@ -47,6 +49,37 @@ const KIND_MAP: Record<number, string> = {
 
 function getKindName(kind: number): string {
   return KIND_MAP[kind] ?? "unknown";
+}
+
+function sha256(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+interface BlockIndex {
+  file: string;
+  startLine: number;
+  endLine: number;
+  hash: string;
+}
+
+async function buildBlockIndex(workspaceFolder: string, symbols: IndexSymbol[], file: string): Promise<BlockIndex[]> {
+  const fileSymbols = symbols.filter(s => s.file === file);
+  const sorted = fileSymbols.sort((a, b) => a.lineRange[0] - b.lineRange[0]);
+  if (sorted.length === 0) return [];
+
+  const filePath = path.join(workspaceFolder, file);
+  const textLines = (await fs.readFile(filePath, "utf-8")).split("\n");
+
+  const blocks: BlockIndex[] = [];
+  for (let i = 0; i < sorted.length; i++) {
+    const sym = sorted[i];
+    const nextStart = i + 1 < sorted.length ? sorted[i + 1].lineRange[0] - 2 : textLines.length - 1; // -2 to include up to last line
+    const endLine = Math.max(sym.lineRange[1], nextStart);
+    const blockText = textLines.slice(sym.lineRange[0] - 1, endLine).join("\n") + "\n";
+    const hash = sha256(blockText);
+    blocks.push({ file, startLine: sym.lineRange[0], endLine, hash });
+  }
+  return blocks;
 }
 
 // =========================================
@@ -320,10 +353,19 @@ async function buildIndex(): Promise<void> {
   }
   console.log(`[pi_symbol_index] Indexed ${totalSymbols} symbols across ${totalFiles} files`);
 
+  // Build blocks for each file based on symbol line ranges
+  const allBlocks: BlockIndex[] = [];
+  for (const file of files) {
+    const symbols = result[file]?.symbols || [];
+    const blocks = await buildBlockIndex(workspaceFolder, symbols, file);
+    allBlocks.push(...blocks);
+  }
+  console.log(`[pi_symbol_index] Found ${allBlocks.length} editable blocks`);
+
   if (!await fs.access(INDEX_DIR).catch(() => false)) await fs.mkdir(INDEX_DIR, { recursive: true });
   const index: PiIndex = {
     version: 1, projectRoot: workspaceFolder, languages: [lang.name],
-    buildTs: new Date().toISOString(), files: result,
+    buildTs: new Date().toISOString(), files: result, blocks: allBlocks,
   };
   const indexPath = path.join(workspaceFolder, INDEX_DIR, INDEX_FILE);
   await fs.writeFile(indexPath, JSON.stringify(index, null, 2));
@@ -398,6 +440,38 @@ export default async function (api: ExtensionAPI): Promise<void> {
         symbolMap[key.replace(/^.*?\//, "")] = index.files[key].symbols;
       }
       return { content: [{ type: "text", text: JSON.stringify(symbolMap, null, 2) }] };
+    },
+  });
+
+  api.registerTool({
+    name: "pi_replace_block",
+    label: "Replace Code Block",
+    description: 'Replace a code block by hash. No "oldText" required — the extension finds the block by hash. If the hash check fails (file was modified externally), the operation is refused to prevent desync.',
+    parameters: Type.Object({
+      file: Type.String({ description: "Filename of the file to replace." }),
+      hash: Type.String({ description: "SHA256 block hash to locate the block." }),
+      newText: Type.String({ description: "The replacement text to insert." }),
+    }),
+    execute: async (_id, params) => {
+      if (!params || !params.file || !params.hash || typeof params.newText !== "string") throw new Error('Invalid parameters. Provide file, hash, and newText as string fields.');
+      const index = await readIndex();
+      if (!index) throw new Error("No symbol index found. Run pi_symbol_build first.");
+      const block = index.blocks.find(b => b.file === params.file && b.hash === params.hash);
+      if (!block) throw new Error(`Block hash ${params.hash} not found or file ${params.file} doesn't exist.`);
+      // Re-read the live file and verify the block still matches
+      let liveText: string;
+      try { liveText = await fs.readFile(path.join(workspaceFolder, params.file), "utf-8"); } catch (e) { throw new Error(`Failed to read ${params.file}: ${(e as any).message}`); }
+      const liveLines = liveText.split("\n");
+      const currentBlockText = liveLines.slice(block.startLine - 1, block.endLine).join("\n") + "\n";
+      const currentHash = sha256(currentBlockText);
+      if (currentHash !== params.hash) throw new Error(`Block hash mismatch (file changed externally). Expected ${params.hash}, got ${currentHash}.`);
+      // Apply replacement using Pi's internal edit tool via a fake Pi call
+      // For now, use the extension to perform the file write if we have it available.
+      const newLines = params.newText.split("\n");
+      const newFileContent = [...liveLines.slice(0, block.startLine - 1), ...newLines, ...liveLines.slice(block.endLine)].join("\n");
+      await fs.writeFile(path.join(workspaceFolder, params.file), newFileContent);
+      console.log(`[pi_replace_block] Replaced block ${params.hash} in ${params.file}`);
+      return { content: [{ type: "text", text: `Block replaced at ${params.file}:${block.startLine}-${block.endLine}` }] };
     },
   });
 }
