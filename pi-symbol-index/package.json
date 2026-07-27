@@ -1,5 +1,6 @@
 {
   "name": "pi-symbol-index",
+  "type": "module",
   "version": "0.1.0",
   "dependencies": {
     "@sinclair/typebox": "^0.34.4",
@@ -10,6 +11,9 @@
     "extensions": [
       "./index.ts"
     ]
+  },
+  "scripts": {
+    "test": "npx tsx test.test.ts"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",

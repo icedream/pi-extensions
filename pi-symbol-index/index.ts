@@ -377,9 +377,14 @@ async function detectLanguage(workspaceFolder: string): Promise<{ name: string; 
 // Core index building
 // =========================================
 
-async function buildIndex(): Promise<void> {
-  const workspaceFolder = await getWorkspace();
-  if (!workspaceFolder) throw new Error("No workspace folder");
+async function buildIndex(target?: string): Promise<void> {
+  let workspaceFolder: string;
+  if (target) {
+    workspaceFolder = target;
+  } else {
+    workspaceFolder = await getWorkspace();
+    if (!workspaceFolder) throw new Error("No workspace folder");
+  }
 
   const lang = await detectLanguage(workspaceFolder);
   if (!lang) throw new Error("No supported project detected (need go.mod or package.json)");
@@ -408,7 +413,8 @@ async function buildIndex(): Promise<void> {
   }
   console.log(`[pi_symbol_index] Found ${allBlocks.length} editable blocks`);
 
-  if (!await fs.access(INDEX_DIR).catch(() => false)) await fs.mkdir(INDEX_DIR, { recursive: true });
+  const indexDirPath = path.join(workspaceFolder, INDEX_DIR);
+  if (!await fs.access(indexDirPath).catch(() => false)) await fs.mkdir(indexDirPath, { recursive: true });
   const index: PiIndex = {
     version: 1, projectRoot: workspaceFolder, languages: [lang.name],
     buildTs: new Date().toISOString(), files: result, blocks: allBlocks,
@@ -418,8 +424,9 @@ async function buildIndex(): Promise<void> {
   console.log(`[pi_symbol_index] Wrote ${INDEX_DIR}/${INDEX_FILE}`);
 }
 
-async function readIndex(): Promise<PiIndex | null> {
-  const indexPath = path.join(INDEX_DIR, INDEX_FILE);
+async function readIndex(target?: string): Promise<PiIndex | null> {
+  const workspaceFolder = target || (await getWorkspace()) || '';
+  const indexPath = path.join(workspaceFolder, INDEX_DIR, INDEX_FILE);
   try {
     const data = await fs.readFile(indexPath, "utf-8");
     return JSON.parse(data);
@@ -431,6 +438,8 @@ async function readIndex(): Promise<PiIndex | null> {
 // =========================================
 // Extension registration
 // =========================================
+
+export { readIndex, buildIndex, INDEX_DIR, INDEX_FILE };
 
 export default async function (api: ExtensionAPI): Promise<void> {
   // Trigger workspace resolution during session_start
