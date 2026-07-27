@@ -27,6 +27,8 @@ interface IndexSymbol {
   lineRange: [number, number];
   container?: string;
   usages: Array<{ file: string; range: [number, number] }>;
+  incomingCalls: Array<{ name: string; kind: string; file: string; lineRange: [number, number] }>;
+  outgoingCalls: Array<{ name: string; kind: string; file: string; lineRange: [number, number] }>;
 }
 
 interface PiIndex {
@@ -139,7 +141,7 @@ async function extractFromGopls(workspaceFolder: string, files: string[]): Promi
     await client.connection.sendRequest("initialize", {
       processId: null,
       rootUri: `file://${workspaceFolder}`,
-      capabilities: { textDocument: { documentSymbol: {}, references: {} }, workspace: { symbol: {} } },
+      capabilities: { textDocument: { documentSymbol: {}, references: {}, callHierarchy: {} }, workspace: { symbol: {} } },
     }) as any;
   } catch (e: any) {
     console.log(`[pi_symbol_index] gopls initialize: ${e.message}`);
@@ -170,6 +172,7 @@ async function extractFromGopls(workspaceFolder: string, files: string[]): Promi
               name: s.name, kind: getKindName(s.kind), file,
               lineRange: [range.start.line + 1, range.end.line + 1],
               container: s.containerName || undefined, usages: [],
+              incomingCalls: [], outgoingCalls: [],
             });
           }
         }
@@ -193,6 +196,48 @@ async function extractFromGopls(workspaceFolder: string, files: string[]): Promi
               file: r!.uri.replace(/^file:\/\//, ""),
               range: [r!.range.start.line + 1, r!.range.end.line + 1],
             }));
+          }
+
+          // Get call hierarchy for function/method symbols
+          if (sym.name && sym.lineRange[1] >= sym.lineRange[0]) {
+            try {
+              const chItems: any[] = await client.connection.sendRequest(
+                "textDocument/prepareCallHierarchy",
+                { textDocument: { uri: fileUri }, position: { line: sym.lineRange[0] - 1, character: charIdx } },
+              ) as any[];
+              if (Array.isArray(chItems)) {
+                for (const item of chItems) {
+                  if (item && typeof item === 'object') {
+                    try {
+                      const inc: any[] = await client.connection.sendRequest(
+                        "callHierarchy/incomingCalls",
+                        { item },
+                      ) as any[];
+                      if (Array.isArray(inc)) {
+                        sym.incomingCalls.push(...inc.map((c) => {
+                          const f = c.from;
+                          const file = f?.uri?.replace(/^file:\/\//, "");
+                          return { name: f?.name, file, kind: getKindName(f?.kind ?? 0),
+                            lineRange: f?.range ? [f.range.start?.line + 1, f.range.end?.line + 1] : [0, 0] };
+                        }).filter((c: any) => c?.name));
+                      }
+                      const out: any[] = await client.connection.sendRequest(
+                        "callHierarchy/outgoingCalls",
+                        { item },
+                      ) as any[];
+                      if (Array.isArray(out)) {
+                        sym.outgoingCalls.push(...out.map((c) => {
+                          const t = c.to;
+                          const file = t?.uri?.replace(/^file:\/\//, "");
+                          return { name: t?.name, file, kind: getKindName(t?.kind ?? 0),
+                            lineRange: t?.range ? [t.range.start?.line + 1, t.range.end?.line + 1] : [0, 0] };
+                        }).filter((c: any) => c?.name));
+                      }
+                    } catch (e: any) { /* skip */ }
+                  }
+                }
+              }
+            } catch (e: any) { /* skip */ }
           }
         } catch { /* skip */ }
       }
@@ -258,6 +303,7 @@ async function extractFromTsProgram(workspaceFolder: string, files: string[]): P
                 name: symText, kind: getKindName(kind), file: relative,
                 lineRange: [start.line + 1, end.line + 1],
                 container: container && container !== "<module>" ? container : undefined, usages: [],
+              incomingCalls: [], outgoingCalls: [],
               });
             } catch { /* skip nodes without sourcemapping */ }
           }
