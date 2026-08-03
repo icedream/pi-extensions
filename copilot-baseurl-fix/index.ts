@@ -19,10 +19,12 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const DEFAULT_HOST = "api.individual.githubcopilot.com";
 const FLAG = "__piCopilotBaseUrlFix";
+const AUTH_PATH = join(homedir(), CONFIG_DIR_NAME, "agent", "auth.json");
 
 /**
  * Extract the correct API host from the user's token.
@@ -31,9 +33,7 @@ const FLAG = "__piCopilotBaseUrlFix";
  */
 function seatHost(): string | null {
   try {
-    const auth = JSON.parse(
-      readFileSync(join(homedir(), ".pi", "agent", "auth.json"), "utf8"),
-    );
+    const auth = JSON.parse(readFileSync(AUTH_PATH, "utf8"));
     const token = auth?.["github-copilot"]?.access;
     const proxyEp =
       typeof token === "string"
