@@ -1,13 +1,17 @@
-// Pi Symbol Index Extension — Phase 2: gopls + TypeScript compiler API
+// Pi Symbol Index Extension — Config-driven, language-agnostic LSP client
 //
-// Uses vscode-jsonrpc (LSP JSON-RPC over LSP framing) to drive gopls,
-// plus the TypeScript compiler API, to build a symbol index.
+// Configuration is loaded from pi-symbol-index.json in the extension directory.
+// Each language entry specifies: server binary, args, env, detection files,
+// file extensions, and a symbol kind mapping.
+//
+// This approach lets users add new languages without modifying code —
+// just add a config entry and ensure the LSP server is installed.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
-import { createHash } from "node:crypto";
+import fsSync from "node:fs";
 import path from "node:path";
 import {
   StreamMessageReader,
@@ -15,9 +19,28 @@ import {
   createMessageConnection,
 } from "vscode-jsonrpc/node";
 import type { Location } from "vscode-languageserver-types/node";
+import { SymbolKind } from "vscode-languageserver-types";
+import { createHash } from "node:crypto";
 
 // =========================================
-// Types
+// Config types
+// =========================================
+
+interface LanguageConfig {
+  server: string;
+  args: string[];
+  env?: Record<string, string>;
+  detect: string[];
+  extensions: string[];
+  symbolKindMap: Record<string, string>;
+}
+
+interface Config {
+  languages: Record<string, LanguageConfig>;
+}
+
+// =========================================
+// Core types
 // =========================================
 
 interface IndexSymbol {
@@ -40,23 +63,6 @@ interface PiIndex {
   blocks: BlockIndex[];
 }
 
-const INDEX_DIR = ".pi-index";
-const INDEX_FILE = "symbols.json";
-
-const KIND_MAP: Record<number, string> = {
-  12: "function", 6: "method", 11: "interface", 23: "struct", 5: "class",
-  1: "file", 2: "module", 13: "variable", 14: "constant", 25: "enum",
-  7: "property", 10: "event", 3: "namespace", 16: "package",
-};
-
-function getKindName(kind: number): string {
-  return KIND_MAP[kind] ?? "unknown";
-}
-
-function sha256(text: string): string {
-  return createHash("sha256").update(text).digest("hex");
-}
-
 interface BlockIndex {
   file: string;
   startLine: number;
@@ -64,24 +70,65 @@ interface BlockIndex {
   hash: string;
 }
 
-async function buildBlockIndex(workspaceFolder: string, symbols: IndexSymbol[], file: string): Promise<BlockIndex[]> {
-  const fileSymbols = symbols.filter(s => s.file === file);
-  const sorted = fileSymbols.sort((a, b) => a.lineRange[0] - b.lineRange[0]);
-  if (sorted.length === 0) return [];
+interface LspClient {
+  proc: import("node:child_process").ChildProcess;
+  connection: import("vscode-jsonrpc").MessageConnection;
+}
 
-  const filePath = path.join(workspaceFolder, file);
-  const textLines = (await fs.readFile(filePath, "utf-8")).split("\n");
+// =========================================
+// Constants
+// =========================================
 
-  const blocks: BlockIndex[] = [];
-  for (let i = 0; i < sorted.length; i++) {
-    const sym = sorted[i];
-    const nextStart = i + 1 < sorted.length ? sorted[i + 1].lineRange[0] - 2 : textLines.length - 1; // -2 to include up to last line
-    const endLine = Math.max(sym.lineRange[1], nextStart);
-    const blockText = textLines.slice(sym.lineRange[0] - 1, endLine).join("\n") + "\n";
-    const hash = sha256(blockText);
-    blocks.push({ file, startLine: sym.lineRange[0], endLine, hash });
+export const INDEX_DIR = ".pi-index";
+export const INDEX_FILE = "symbols.json";
+
+// =========================================
+// Config loading
+// =========================================
+
+let config: Config | null = null;
+let extensionPath: string = "";
+
+async function loadConfig(extPath: string): Promise<Config> {
+  console.log(`[DEBUG] loadConfig called with extPath=${extPath}`);
+  if (config) return config;
+  const configPath = path.join(extPath, "pi-symbol-index.json");
+  try {
+    const raw = await fs.readFile(configPath, "utf-8");
+    config = JSON.parse(raw);
+  } catch {
+    // Fallback: use built-in defaults
+    config = {
+      languages: {
+        go: {
+          server: "gopls", args: ["serve"], env: { GOFLAGS: "" },
+          detect: ["go.mod"], extensions: [".go"],
+          symbolKindMap: { function: "function", method: "method", interface: "interface", struct: "struct", type: "type", package: "package", const: "constant", var: "variable", field: "field", label: "label" }
+        },
+        rust: {
+          server: "rust-analyzer", args: ["--stdio"],
+          detect: ["Cargo.toml"], extensions: [".rs"],
+          symbolKindMap: { function: "function", method: "method", struct: "struct", enum: "enum", enum_variant: "enum_variant", constant: "constant", trait: "interface", module: "module", type_parameter: "type_parameter", macro_rules: "macro" }
+        },
+        python: {
+          server: "pyright", args: ["--stdio"],
+          detect: ["pyproject.toml", "setup.py", "setup.cfg", "Pipfile"], extensions: [".py", ".pyi"],
+          symbolKindMap: { function: "function", method: "method", class: "class", module: "module", constant: "constant", variable: "variable", parameter: "parameter", property: "property" }
+        },
+        c_cpp: {
+          server: "clangd", args: [],
+          detect: ["compile_commands.json", "Makefile", "CMakeLists.txt"], extensions: [".c", ".cpp", ".h", ".hpp", ".cc", ".cxx"],
+          symbolKindMap: { function: "function", method: "method", struct: "struct", class: "class", enum: "enum", typedef: "type", macro: "macro", namespace: "namespace", variable: "variable" }
+        },
+        typescript: {
+          server: "typescript-language-server", args: ["--stdio"],
+          detect: ["package.json", "tsconfig.json"], extensions: [".ts", ".tsx", ".js", ".jsx", ".mjs", ".mts"],
+          symbolKindMap: { function: "function", method: "method", class: "class", interface: "interface", type: "type", enum: "enum", const: "constant", variable: "variable", parameter: "parameter", property: "property", module: "module", namespace: "namespace" }
+        }
+      }
+    };
   }
-  return blocks;
+  return config;
 }
 
 // =========================================
@@ -92,31 +139,35 @@ let resolvedCwd: string = "";
 
 async function getWorkspace(): Promise<string> {
   if (resolvedCwd) return resolvedCwd;
-  return new Promise<string>((resolve) => {
-    const check = async (ctx: { cwd: string }) => {
-      resolvedCwd = ctx.cwd || "";
-      resolve(resolvedCwd);
-    };
-    check({ cwd: "" });
-  });
+  const { execSync } = await import("node:child_process");
+  resolvedCwd = execSync("pwd").toString().trim();
+  return resolvedCwd;
 }
 
 // =========================================
-// Gopls extraction (LSP via vscode-jsonrpc)
+// SHA256 hashing
+// =========================================
+
+function sha256(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+// =========================================
+// LSP client factory
 // =========================================
 
 async function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-interface LspClient {
-  proc: import("node:child_process").ChildProcess;
-  connection: import("vscode-jsonrpc").MessageConnection;
-}
-
-async function buildLspClient(serverName: string, args: string[], workspaceFolder: string): Promise<LspClient> {
+async function buildLspClient(
+  serverName: string,
+  args: string[],
+  workspaceFolder: string,
+  env: Record<string, string> = {},
+): Promise<LspClient> {
   const proc = spawn(serverName, args, {
-    env: { ...process.env, GOFLAGS: "" },
+    env: { ...process.env, ...env },
     cwd: workspaceFolder,
   });
   proc.stderr?.on("data", (chunk: Buffer) => {
@@ -131,10 +182,19 @@ async function buildLspClient(serverName: string, args: string[], workspaceFolde
   return { proc, connection };
 }
 
-async function extractFromGopls(workspaceFolder: string, files: string[]): Promise<Record<string, { status: string; symbols: IndexSymbol[] }>> {
-  const client = await buildLspClient("gopls", ["serve"], workspaceFolder);
+// =========================================
+// Generic LSP symbol extraction
+// =========================================
+
+async function extractSymbolsFromLsp(
+  client: LspClient,
+  workspaceFolder: string,
+  files: string[],
+  symbolKindMap: Record<string, string>,
+): Promise<Record<string, { status: string; symbols: IndexSymbol[] }>> {
   const result: Record<string, { status: string; symbols: IndexSymbol[] }> = {};
-  const slice = files.slice(0, 100); // cap files for performance
+  const slice = files.slice(0, 100);
+
   client.connection.listen();
 
   try {
@@ -144,7 +204,7 @@ async function extractFromGopls(workspaceFolder: string, files: string[]): Promi
       capabilities: { textDocument: { documentSymbol: {}, references: {}, callHierarchy: {} }, workspace: { symbol: {} } },
     }) as any;
   } catch (e: any) {
-    console.log(`[pi_symbol_index] gopls initialize: ${e.message}`);
+    console.log(`[pi_symbol_index] initialize: ${e.message}`);
   }
 
   client.connection.sendNotification("initialized", {});
@@ -155,7 +215,7 @@ async function extractFromGopls(workspaceFolder: string, files: string[]): Promi
     try {
       const text = await fs.readFile(filePath, "utf-8");
       client.connection.sendNotification("textDocument/didOpen", {
-        textDocument: { uri: fileUri, languageId: "go", version: 1, text },
+        textDocument: { uri: fileUri, languageId: getLangId(file), version: 1, text },
       });
       await sleep(300);
       const symbols: any = await client.connection.sendRequest("textDocument/documentSymbol", {
@@ -168,11 +228,17 @@ async function extractFromGopls(workspaceFolder: string, files: string[]): Promi
           const loc = s.location || s;
           const range = loc.range || loc;
           if (range.start?.line != null) {
+            console.log(`[DEBUG] extractSymbolsFromLsp: ${s.name} kind=${s.kind} (type=${typeof s.kind})`);
+            console.log(`[DEBUG] extractSymbolsFromLsp: symbolKindMap keys=${JSON.stringify(Object.keys(symbolKindMap))}`);
             fileSymbols.push({
-              name: s.name, kind: getKindName(s.kind), file,
+              name: s.name,
+              kind: symbolKindMap[String(s.kind)] ?? "unknown",
+              file,
               lineRange: [range.start.line + 1, range.end.line + 1],
-              container: s.containerName || undefined, usages: [],
-              incomingCalls: [], outgoingCalls: [],
+              container: s.containerName || undefined,
+              usages: [],
+              incomingCalls: [],
+              outgoingCalls: [],
             });
           }
         }
@@ -198,7 +264,7 @@ async function extractFromGopls(workspaceFolder: string, files: string[]): Promi
             }));
           }
 
-          // Get call hierarchy for function/method symbols
+          // Get call hierarchy
           if (sym.name && sym.lineRange[1] >= sym.lineRange[0]) {
             try {
               const chItems: any[] = await client.connection.sendRequest(
@@ -207,225 +273,372 @@ async function extractFromGopls(workspaceFolder: string, files: string[]): Promi
               ) as any[];
               if (Array.isArray(chItems)) {
                 for (const item of chItems) {
-                  if (item && typeof item === 'object') {
+                  if (item && typeof item === "object") {
                     try {
                       const inc: any[] = await client.connection.sendRequest(
                         "callHierarchy/incomingCalls",
                         { item },
                       ) as any[];
                       if (Array.isArray(inc)) {
-                        sym.incomingCalls.push(...inc.map((c) => {
-                          const f = c.from;
-                          const file = f?.uri?.replace(/^file:\/\//, "");
-                          return { name: f?.name, file, kind: getKindName(f?.kind ?? 0),
-                            lineRange: f?.range ? [f.range.start?.line + 1, f.range.end?.line + 1] : [0, 0] };
-                        }).filter((c: any) => c?.name));
+                        sym.incomingCalls = inc
+                          .filter((c) => c?.from?.uri)
+                          .map((c) => ({
+                            name: c.from.name,
+                            kind: symbolKindMap[String(c.from.kind)] ?? "unknown",
+                            file: c.from.uri!.replace(/^file:\/\//, ""),
+                            lineRange: [c.from.range.start.line + 1, c.from.range.end.line + 1],
+                          }));
                       }
                       const out: any[] = await client.connection.sendRequest(
                         "callHierarchy/outgoingCalls",
                         { item },
                       ) as any[];
                       if (Array.isArray(out)) {
-                        sym.outgoingCalls.push(...out.map((c) => {
-                          const t = c.to;
-                          const file = t?.uri?.replace(/^file:\/\//, "");
-                          return { name: t?.name, file, kind: getKindName(t?.kind ?? 0),
-                            lineRange: t?.range ? [t.range.start?.line + 1, t.range.end?.line + 1] : [0, 0] };
-                        }).filter((c: any) => c?.name));
+                        sym.outgoingCalls = out
+                          .filter((c) => c.to?.uri)
+                          .map((c) => ({
+                            name: c.to.name,
+                            kind: symbolKindMap[String(c.to.kind)] ?? "unknown",
+                            file: c.to.uri!.replace(/^file:\/\//, ""),
+                            lineRange: [c.to.range.start.line + 1, c.to.range.end.line + 1],
+                          }));
                       }
-                    } catch (e: any) { /* skip */ }
+                    } catch {}
                   }
                 }
               }
-            } catch (e: any) { /* skip */ }
+            } catch {}
           }
-        } catch { /* skip */ }
+        } catch {}
       }
 
       result[file] = { status: "ok", symbols: fileSymbols };
     } catch (e: any) {
-      console.error(`[pi_symbol_index] Failed to index ${file}: ${e.message}`);
+      console.log(`[pi_symbol_index] Error processing ${file}: ${e.message}`);
       result[file] = { status: "broken", symbols: [] };
     }
   }
 
+  try { client.connection.dispose(); } catch {}
   return result;
 }
 
 // =========================================
-// TypeScript extraction (compiler API)
+// TypeScript compiler API extraction
 // =========================================
 
-async function extractFromTsProgram(workspaceFolder: string, files: string[]): Promise<Record<string, { status: string; symbols: IndexSymbol[] }>> {
-  let ts: any;
-  let requireTs = (path: string) => { try { return require(path); } catch { return null; } };
-  // Try loading from workspace/node_modules first, so index.ts works in any workspace
-  { const w = requireTs(path.join(workspaceFolder, "node_modules", "typescript")); if (w) ts = w.default || w; }
-  if (!ts) { try { ts = await import("typescript"); } catch { try { ts = require("typescript"); } catch { throw new Error("TypeScript module not found — install typescript in the project."); } } }
-  const fullPaths = files.map((f) => path.join(workspaceFolder, f));
-  const program = ts!.createProgram(fullPaths, { noEmit: true });
-  const result: Record<string, { status: string; symbols: IndexSymbol[] }> = {};
-
-  for (const sf of program.getSourceFiles()) {
-    if (sf.isDeclarationFile || !sf.fileName.startsWith(workspaceFolder)) continue;
-    const relative = path.relative(workspaceFolder, sf.fileName);
-    const symbols: IndexSymbol[] = [];
-    const seen = new Set<string>();
-
-    function nodeSymbolKind(node: any): number | undefined {
-      if (ts!.isFunctionDeclaration(node)) return 12;
-      if (ts!.isMethodDeclaration(node)) return 6;
-      if (ts!.isClassDeclaration(node)) return 5;
-      if (ts!.isInterfaceDeclaration(node)) return 11;
-      if (ts!.isTypeAliasDeclaration(node)) return 11;
-      if (ts!.isEnumDeclaration(node)) return 25;
-      if (ts!.isVariableStatement(node) && node.declarations && node.declarations[0]) return 13;
-      return undefined;
-    }
-
-    function walk(node: any, container?: string): void {
-      try {
-        const kind = nodeSymbolKind(node);
-        let symText = "";
-        try {
-          const name = (node as any).name as any;
-          symText = name?.text || name?.escapedText || "";
-        } catch {}
-        if (kind != null && symText) {
-          const fullName = container ? `${container}.${symText}` : symText;
-          if (!seen.has(fullName)) {
-            seen.add(fullName);
-            try {
-              const sfRef = (node as any).getSourceFile && (node as any).getSourceFile() || sf;
-              const start = sfRef.getLineAndCharacterOfPosition(node.getStart ? node.getStart(sfRef) : node.getStart());
-              const end = sfRef.getLineAndCharacterOfPosition(node.getEnd());
-              symbols.push({
-                name: symText, kind: getKindName(kind), file: relative,
-                lineRange: [start.line + 1, end.line + 1],
-                container: container && container !== "<module>" ? container : undefined, usages: [],
-              incomingCalls: [], outgoingCalls: [],
-              });
-            } catch { /* skip nodes without sourcemapping */ }
-          }
-        }
-        const next = (kind === 5 || kind === 11) ? symText : container || "<module>";
-        ts!.forEachChild(node, (child: any) => walk(child, next));
-      } catch { /* skip */ }
-    }
-
-    walk(sf);
-    result[relative] = { status: "ok", symbols };
-  }
-
-  return result;
+function getLangId(file: string): string {
+  if (file.endsWith(".go")) return "go";
+  if (file.endsWith(".rs")) return "rust";
+  if (file.endsWith(".py")) return "python";
+  if (file.endsWith(".c") || file.endsWith(".cpp") || file.endsWith(".h") || file.endsWith(".hpp")) return "cpp";
+  if (file.endsWith(".ts") || file.endsWith(".tsx")) return "typescript";
+  if (file.endsWith(".js") || file.endsWith(".jsx")) return "javascript";
+  return "typescript";
 }
 
-// =========================================
-// File discovery
-// =========================================
-
-async function listGoFiles(workspaceFolder: string): Promise<string[]> {
-  const files: string[] = [];
-  async function walk(dir: string): Promise<void> {
-    let entries;
-    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+function findTsFilesInDir(dir: string, files: string[], seen: Set<string>): void {
+  if (seen.has(dir)) return;
+  seen.add(dir);
+  const skip = ["node_modules", "out", "dist", "_test", ".pi-index"];
+  try {
+    const entries = fsSync.readdirSync(dir, { withFileTypes: true });
     for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "vendor" || entry.name === ".git" || entry.name === "out" || entry.name === "dist" || entry.name === "_test") continue;
-        await walk(path.join(dir, entry.name));
-      } else if (entry.name.endsWith(".go")) {
-        files.push(path.relative(workspaceFolder, path.join(dir, entry.name)));
+        if (!skip.includes(entry.name)) {
+          findTsFilesInDir(fullPath, files, seen);
+        }
+      } else if (entry.isFile() && /\.(ts|tsx|js|jsx|mjs|mts)$/.test(entry.name)) {
+        const rel = path.relative(dir, fullPath);
+        files.push(rel);
       }
     }
-  }
-  await walk(workspaceFolder);
-  return files;
+  } catch {}
 }
 
 async function listTsFiles(workspaceFolder: string): Promise<string[]> {
-  const exts = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".mts"];
   const files: string[] = [];
-  async function walk(dir: string): Promise<void> {
-    let entries;
-    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "vendor" || entry.name === ".git" || entry.name === "out" || entry.name === "dist" || entry.name === "_test") continue;
-        await walk(path.join(dir, entry.name));
-      } else if (exts.some((e) => entry.name.endsWith(e))) {
-        files.push(path.relative(workspaceFolder, path.join(dir, entry.name)));
-      }
-    }
-  }
-  await walk(workspaceFolder);
+  const seen = new Set<string>();
+  findTsFilesInDir(workspaceFolder, files, seen);
   return files;
 }
 
-async function detectLanguage(workspaceFolder: string): Promise<{ name: string; files: string[] } | null> {
+async function extractSymbolsFromTsProgram(
+  workspaceFolder: string,
+  files: string[],
+  symbolKindMap: Record<string, string>,
+): Promise<Record<string, { status: string; symbols: IndexSymbol[] }>> {
   try {
-    await fs.access(path.join(workspaceFolder, "go.mod"));
-    return { name: "go", files: await listGoFiles(workspaceFolder) };
-  } catch {}
+    console.log(`[DEBUG] extractSymbolsFromTsProgram ENTRY`);
+  } catch (e: any) {
+    console.error(`[pi_symbol_index] extractSymbolsFromTsProgram outer error: ${e.message}`);
+    return {};
+  }
+  const result: Record<string, { status: string; symbols: IndexSymbol[] }> = {};
+  const slice = files.slice(0, 50);
+
   try {
-    await fs.access(path.join(workspaceFolder, "package.json"));
-    return { name: "typescript", files: await listTsFiles(workspaceFolder) };
-  } catch {}
+    console.log(`[DEBUG] extractSymbolsFromTsProgram: workspace=${workspaceFolder}`);
+    console.log(`[DEBUG] extractSymbolsFromTsProgram: files=${JSON.stringify(files)}`);
+  } catch (e: any) {
+    console.log(`[pi_symbol_index] TS program entry failed: ${e.message}`);
+    return {};
+  }
+
+  try {
+    console.log(`[DEBUG] TS: about to load module`);
+    let tsModule: any;
+    try {
+      tsModule = await import(path.join(workspaceFolder, "node_modules", "typescript"));
+      console.log(`[DEBUG] TS: loaded from workspace`);
+    } catch (e: any) {
+      console.log(`[DEBUG] TS: workspace failed: ${e.message}`);
+      tsModule = await import("typescript");
+      console.log(`[DEBUG] TS: loaded from global`);
+    }
+    if (!tsModule || !tsModule.createProgram) {
+      console.log("[pi_symbol_index] TypeScript module not available");
+      return {};
+    }
+    const ts = tsModule.default || tsModule;
+    console.log(`[DEBUG] TS: createProgram ready`);
+    // Use ALL files as roots
+    const allRoots = slice.map(f => path.join(workspaceFolder, f));
+    console.log(`[DEBUG] TS: roots=${JSON.stringify(allRoots)}`);
+    if (allRoots.length === 0) return {};
+    const program = ts.createProgram({
+      rootNames: allRoots,
+      options: { allowJs: true, skipLibCheck: true, noEmit: true },
+      host: ts.createCompilerHost({ allowJs: true, skipLibCheck: true }, true),
+    });
+    console.log(`[DEBUG] TS: program created`);
+    const sf = program.getSourceFile(allRoots[0]);
+    console.log(`[DEBUG] TS: sf=${!!sf}`);
+    if (!sf) return {};
+
+    // Walk all source files
+    const allFiles = program.getSourceFiles().filter((f: any) => !f.isDeclarationFile);
+    let nodeCount = 0;
+    const walk = (node: any) => {
+      nodeCount++;
+      try {
+        if (node.name && (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node) || ts.isClassDeclaration(node) || ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node) || ts.isEnumDeclaration(node))) {
+          console.log(`[DEBUG] TS: found symbol ${node.name.text} kind=${node.kind}`);
+          const fileName = node.getSourceFile() ? path.relative(workspaceFolder, node.getSourceFile().fileName) : "";
+          const start = node.getStart(node.getSourceFile() || sf);
+          const end = node.getEnd();
+          const sourceFile = node.getSourceFile() || sf;
+          const lines = sourceFile.text.split("\n");
+          const startLine = sourceFile.getLineAndCharacterOfPosition(start).line + 1;
+          const endLine = sourceFile.getLineAndCharacterOfPosition(end).line + 1;
+          if (!result[fileName]) {
+            result[fileName] = { status: "ok", symbols: [] };
+          }
+          result[fileName].symbols.push({
+            name: node.name.text,
+            kind: symbolKindMap[String(ts.SyntaxKind[node.kind])] ?? "unknown",
+            file: fileName,
+            lineRange: [startLine, endLine],
+            container: undefined,
+            usages: [],
+            incomingCalls: [],
+            outgoingCalls: [],
+          });
+        }
+      } catch {}
+      ts.forEachChild(node, walk);
+    };
+    for (const file of allFiles) {
+      ts.forEachChild(file, walk);
+    }
+    console.log(`[DEBUG] TS: after walk, ${Object.keys(result).length} files`);
+    return result;
+  } catch (e: any) {
+    console.log(`[pi_symbol_index] TypeScript extraction failed: ${e.message}`);
+    return {};
+  }
+}
+
+// =========================================
+// Language detection from config
+// =========================================
+
+async function detectLanguage(workspaceFolder: string): Promise<LanguageConfig | null> {
+  console.log(`[DEBUG] detectLanguage: extPath=${extensionPath}, workspace=${workspaceFolder}`);
+  const cfg = await loadConfig(extensionPath);
+  console.log(`[DEBUG] detectLanguage: cfg.languages=${JSON.stringify(Object.keys(cfg.languages))}`);
+  for (const [name, lang] of Object.entries(cfg.languages)) {
+    console.log(`[DEBUG] detectLanguage: name=${name}, detect=[${lang.detect.join(', ')}]`);
+    try {
+      for (const f of lang.detect) {
+        const fp = path.join(workspaceFolder, f);
+        console.log(`[DEBUG] detectLanguage: trying access(${fp})`);
+        await fs.access(fp);
+        console.log(`[DEBUG] detectLanguage: FOUND ${name}`);
+        return lang;
+      }
+    } catch (e) {
+      console.log(`[DEBUG] detectLanguage: access failed for ${name}: ${e.message}`);
+    }
+  }
+  console.log(`[DEBUG] detectLanguage: no language found, returning null`);
   return null;
 }
 
 // =========================================
-// Core index building
+// Build index
 // =========================================
 
-async function buildIndex(target?: string): Promise<void> {
-  let workspaceFolder: string;
-  if (target) {
-    workspaceFolder = target;
-  } else {
-    workspaceFolder = await getWorkspace();
-    if (!workspaceFolder) throw new Error("No workspace folder");
+async function buildBlockIndex(index: PiIndex, workspaceFolder: string): Promise<void> {
+  const blocks: BlockIndex[] = [];
+  for (const file of Object.keys(index.files)) {
+    for (const sym of index.files[file].symbols) {
+      if (sym.lineRange[0] >= 1 && sym.lineRange[1] >= sym.lineRange[0]) {
+        blocks.push({ file, startLine: sym.lineRange[0], endLine: sym.lineRange[1], hash: "" });
+      }
+    }
+  }
+  for (const block of blocks) {
+    try {
+      const textLines = (await fs.readFile(path.join(workspaceFolder, block.file), "utf-8")).split("\n");
+      const blockText = textLines.slice(block.startLine - 1, block.endLine).join("\n") + "\n";
+      block.hash = sha256(blockText);
+      console.log(`[pi_replace_block] Built hash for ${block.file}:${block.startLine}-${block.endLine} = ${block.hash.slice(0, 16)}...`);
+    } catch (e: any) {
+      console.log(`[pi_replace_block] Failed to compute hash for ${block.file}:${block.startLine}-${block.endLine}: ${e.message}`);
+      block.hash = "";
+    }
+  }
+  index.blocks = blocks;
+  console.log(`[pi_symbol_index] Found ${blocks.length} editable blocks`);
+}
+
+export async function buildIndex(target?: string, extPath?: string): Promise<void> {
+  if (extPath) extensionPath = extPath;
+  const workspaceFolder = target || (await getWorkspace());
+  const langConfig = await detectLanguage(workspaceFolder);
+  if (!langConfig) {
+    console.log("[pi_symbol_index] No supported language detected");
+    return;
   }
 
-  const lang = await detectLanguage(workspaceFolder);
-  if (!lang) throw new Error("No supported project detected (need go.mod or package.json)");
+  let symbolKindMap: Record<string, string>;
+  let symbols: Record<string, { status: string; symbols: IndexSymbol[] }>;
 
-  console.log(`[pi_symbol_index] Indexing for ${lang.name} in ${workspaceFolder}`);
-  const files = lang.files;
-  console.log(`[pi_symbol_index] Found ${files.length} ${lang.name} files`);
-
-  const result = lang.name === "go"
-    ? await extractFromGopls(workspaceFolder, files)
-    : await extractFromTsProgram(workspaceFolder, files);
-
-  let totalSymbols = 0, totalFiles = 0;
-  for (const [, data] of Object.entries(result)) {
-    totalSymbols += data.symbols.length;
-    totalFiles++;
+  // Try LSP server first
+  try {
+    console.log(`[DEBUG] buildIndex: server=${langConfig.server}`);
+    const serverPath = await findServer(langConfig.server, workspaceFolder);
+    console.log(`[DEBUG] buildIndex: serverPath=${serverPath}`);
+    if (serverPath) {
+      // Find files
+      let files: string[] = [];
+      for (const ext of langConfig.extensions) {
+        files = files.concat(await findFilesByExt(workspaceFolder, ext));
+      }
+      console.log(`[DEBUG] buildIndex: files=[${files.join(', ')}]`);
+      if (files.length > 0) {
+        console.log(`[pi_symbol_index] Indexing for ${langConfig.server} in ${workspaceFolder}`);
+        console.log(`[pi_symbol_index] Found ${files.length} files`);
+        const client = await buildLspClient(serverPath, langConfig.args, workspaceFolder, langConfig.env || {});
+        symbols = await extractSymbolsFromLsp(client, workspaceFolder, files, langConfig.symbolKindMap);
+        symbolKindMap = langConfig.symbolKindMap;
+      }
+    }
+  } catch (e: any) {
+    console.log(`[pi_symbol_index] LSP failed: ${e.message}`);
   }
-  console.log(`[pi_symbol_index] Indexed ${totalSymbols} symbols across ${totalFiles} files`);
 
-  // Build blocks for each file based on symbol line ranges
-  const allBlocks: BlockIndex[] = [];
-  for (const file of files) {
-    const symbols = result[file]?.symbols || [];
-    const blocks = await buildBlockIndex(workspaceFolder, symbols, file);
-    allBlocks.push(...blocks);
+  // Fallback to compiler API
+  console.log(`[DEBUG] buildIndex: symbols=${JSON.stringify(Object.keys(symbols || {}))}`);
+  if (!symbols || Object.keys(symbols).length === 0) {
+    console.log(`[DEBUG] buildIndex: entering fallback`);
+    if (langConfig.server === "typescript-language-server") {
+      console.log(`[DEBUG] buildIndex: falling back to TS compiler API`);
+      const tsFiles = await listTsFiles(workspaceFolder);
+      console.log(`[DEBUG] buildIndex: TS files=[${tsFiles.join(', ')}]`);
+      symbols = await extractSymbolsFromTsProgram(workspaceFolder, tsFiles, langConfig.symbolKindMap);
+      symbolKindMap = langConfig.symbolKindMap;
+    }
   }
-  console.log(`[pi_symbol_index] Found ${allBlocks.length} editable blocks`);
 
+  if (!symbols || Object.keys(symbols).length === 0) {
+    console.log("[pi_symbol_index] No symbols extracted");
+    return;
+  }
+
+  // Count symbols
+  let totalSymbols = 0;
+  for (const key of Object.keys(symbols)) {
+    totalSymbols += symbols[key].symbols.length;
+  }
+  console.log(`[pi_symbol_index] Indexed ${totalSymbols} symbols across ${Object.keys(symbols).length} files`);
+
+  const index: PiIndex = {
+    version: 1,
+    projectRoot: workspaceFolder,
+    languages: [langConfig.server],
+    buildTs: new Date().toISOString(),
+    files: symbols,
+    blocks: [],
+  };
+
+  await buildBlockIndex(index, workspaceFolder);
+
+  // Write index
+  const indexPath = path.join(workspaceFolder, INDEX_DIR, INDEX_FILE);
   const indexDirPath = path.join(workspaceFolder, INDEX_DIR);
   if (!await fs.access(indexDirPath).catch(() => false)) await fs.mkdir(indexDirPath, { recursive: true });
-  const index: PiIndex = {
-    version: 1, projectRoot: workspaceFolder, languages: [lang.name],
-    buildTs: new Date().toISOString(), files: result, blocks: allBlocks,
-  };
-  const indexPath = path.join(workspaceFolder, INDEX_DIR, INDEX_FILE);
   await fs.writeFile(indexPath, JSON.stringify(index, null, 2));
   console.log(`[pi_symbol_index] Wrote ${INDEX_DIR}/${INDEX_FILE}`);
 }
 
-async function readIndex(target?: string): Promise<PiIndex | null> {
-  const workspaceFolder = target || (await getWorkspace()) || '';
+async function findServer(serverName: string, workspaceFolder: string): Promise<string | null> {
+  // Check node_modules/.bin first
+  const localBin = path.join(workspaceFolder, "node_modules", ".bin", serverName);
+  const localBinWin = localBin + ".cmd";
+  try { await fs.access(localBin); return localBin; } catch {}
+  try { await fs.access(localBinWin); return localBinWin; } catch {}
+  // Then check PATH
+  try {
+    const { exec } = await import("node:child_process");
+    return new Promise((resolve) => {
+      exec(`which ${serverName}`, { timeout: 5000 }, (err, stdout) => {
+        if (err) resolve(null);
+        else resolve(stdout.trim());
+      });
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function findFilesByExt(workspaceFolder: string, ext: string): Promise<string[]> {
+  const files: string[] = [];
+  const skip = ["node_modules", "out", "dist", "_test", ".pi-index"];
+  const walk = (dir: string) => {
+    try {
+      for (const entry of fsSync.readdirSync(dir, { withFileTypes: true })) {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (!skip.includes(entry.name)) walk(fullPath);
+        } else if (entry.isFile() && entry.name.endsWith(ext)) {
+          files.push(path.relative(workspaceFolder, fullPath));
+        }
+      }
+    } catch {}
+  };
+  walk(workspaceFolder);
+  return files;
+}
+
+// =========================================
+// Read index
+// =========================================
+
+export async function readIndex(target?: string): Promise<PiIndex | null> {
+  const workspaceFolder = target || (await getWorkspace());
   const indexPath = path.join(workspaceFolder, INDEX_DIR, INDEX_FILE);
   try {
     const data = await fs.readFile(indexPath, "utf-8");
@@ -436,89 +649,65 @@ async function readIndex(target?: string): Promise<PiIndex | null> {
 }
 
 // =========================================
-// Extension registration
+// Pi tool registration
 // =========================================
 
-export { readIndex, buildIndex, INDEX_DIR, INDEX_FILE };
-
-export default async function (api: ExtensionAPI): Promise<void> {
-  // Trigger workspace resolution during session_start
-  api.on("session_start", async (_event: any, ctx: { cwd?: string }) => {
-    if (ctx && ctx.cwd) {
-      resolvedCwd = ctx.cwd;
-    }
+export default function (pi: ExtensionAPI): void {
+  pi.registerFlag("symbol-index-server", {
+    description: "LSP server to use for indexing (optional override)",
+    type: "string",
+    default: "",
   });
 
-  api.registerTool({
-    name: "pi_symbol_build",
+  pi.registerTool("pi_symbol_build", {
     label: "Build Symbol Index",
-    description: "Scan the project and build the Pi Symbol Index. Replaces the index if it's stale.",
-    parameters: Type.Object({}),
-    execute: async () => {
-      await buildIndex();
+    description: "Scan the project directory and build/update the symbol index.",
+    parameters: Type.Object({
+      target: Type.Optional(Type.String({ description: "Target directory to index. Defaults to current workspace." })),
+    }),
+    execute: async (_id, params) => {
+      const target = params?.target || undefined;
+      await buildIndex(target);
       return { content: [{ type: "text", text: "Index built." }] };
     },
   });
 
-  api.registerTool({
-    name: "pi_symbol_info",
+  pi.registerTool("pi_symbol_info", {
     label: "Symbol Info",
-    description: "Get info about a specific symbol (name, kind, line range, container, usages).",
+    description: "Search for a symbol by name in the index.",
     parameters: Type.Object({
-      name: Type.String({ description: "The symbol name to look up." }),
+      name: Type.String({ description: "Symbol name to search for." }),
     }),
-    execute: async (id, params) => {
-      if (!params || typeof params.name !== "string") throw new Error('Please provide a valid symbol name as string parameter: {"name": "SymbolName"}.');
+    execute: async (_id, params) => {
+      if (!params?.name) throw new Error("Missing name parameter.");
       const index = await readIndex();
-      if (!index) throw new Error("No symbol index found. Run pi_symbol_build first.");
-      const results: IndexSymbol[] = [];
-      for (const key of Object.keys(index.files)) {
-        for (const s of index.files[key].symbols) {
-          if (s.name === params.name && s.usages.length > 0) results.push({ ...s, usages: s.usages });
+      if (!index) throw new Error("No index found. Run pi_symbol_build first.");
+      const found: IndexSymbol[] = [];
+      for (const file of Object.keys(index.files)) {
+        for (const sym of index.files[file].symbols) {
+          if (sym.name.toLowerCase().includes(params.name.toLowerCase())) {
+            found.push({ ...sym, usages: [], incomingCalls: [], outgoingCalls: [] });
+          }
         }
       }
-      if (results.length === 0) throw new Error(`No symbol found matching ${params.name}`);
-      return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(found, null, 2) }] };
     },
   });
 
-  api.registerTool({
-    name: "pi_project_symbols",
+  pi.registerTool("pi_project_symbols", {
     label: "Project Symbols",
-    description: "List all indexed symbols across the entire project.",
+    description: "List all symbols in the index.",
     parameters: Type.Object({}),
-    execute: async () => {
+    execute: async (_id, _params) => {
       const index = await readIndex();
-      if (!index) throw new Error("No symbol index found. Run pi_symbol_build first.");
-      const symbolMap: Record<string, IndexSymbol[]> = {};
-      for (const key of Object.keys(index.files)) {
-        symbolMap[key.replace(/^.*?\//, "")] = index.files[key].symbols;
-      }
-      return { content: [{ type: "text", text: JSON.stringify(symbolMap, null, 2) }] };
+      if (!index) throw new Error("No index found. Run pi_symbol_build first.");
+      const files = Object.keys(index.files);
+      const totalSymbols = files.reduce((sum, f) => sum + index.files[f].symbols.length, 0);
+      return { content: [{ type: "text", text: `${files.length} files, ${totalSymbols} symbols` }] };
     },
   });
 
-  api.registerTool({
-    name: "pi_list_blocks",
-    label: "List Code Blocks",
-    description: 'List all editable code blocks with their hashes, file paths, and line ranges.',
-    parameters: Type.Object({
-      file: Type.Optional(Type.String({ description: 'Filter blocks by filename. Leave blank to list all.' })),
-    }),
-    execute: async (id, params) => {
-      const index = await readIndex();
-      if (!index) throw new Error("No symbol index found. Run pi_symbol_build first.");
-      let blocks = index.blocks;
-      if (params && params.file) blocks = blocks.filter(b => b.file === params.file);
-      const output = blocks.map(b => `${b.file}:${b.startLine}-${b.endLine} hash=${b.hash}`)
-        .join("\n")
-        + (blocks.length === 0 ? "\n(No blocks found)" : "");
-      return { content: [{ type: "text", text: output }] };
-    },
-  });
-
-  api.registerTool({
-    name: "pi_replace_block",
+  pi.registerTool("pi_replace_block", {
     label: "Replace Code Block",
     description: 'Replace a code block by hash. No "oldText" required — the extension finds the block by hash. If the hash check fails (file was modified externally), the operation is refused to prevent desync.',
     parameters: Type.Object({
@@ -527,25 +716,48 @@ export default async function (api: ExtensionAPI): Promise<void> {
       newText: Type.String({ description: "The replacement text to insert." }),
     }),
     execute: async (_id, params) => {
-      if (!params || !params.file || !params.hash || typeof params.newText !== "string") throw new Error('Invalid parameters. Provide file, hash, and newText as string fields.');
+      if (!params?.file || !params.hash || typeof params.newText !== "string") throw new Error('Invalid parameters. Provide file, hash, and newText as string fields.');
       const index = await readIndex();
       if (!index) throw new Error("No symbol index found. Run pi_symbol_build first.");
       const block = index.blocks.find(b => b.file === params.file && b.hash === params.hash);
       if (!block) throw new Error(`Block hash ${params.hash} not found or file ${params.file} doesn't exist.`);
-      // Re-read the live file and verify the block still matches
       let liveText: string;
-      try { liveText = await fs.readFile(path.join(workspaceFolder, params.file), "utf-8"); } catch (e) { throw new Error(`Failed to read ${params.file}: ${(e as any).message}`); }
+      try { liveText = await fs.readFile(path.join(await getWorkspace(), params.file), "utf-8"); } catch (e) { throw new Error(`Failed to read ${params.file}: ${(e as any).message}`); }
       const liveLines = liveText.split("\n");
       const currentBlockText = liveLines.slice(block.startLine - 1, block.endLine).join("\n") + "\n";
       const currentHash = sha256(currentBlockText);
       if (currentHash !== params.hash) throw new Error(`Block hash mismatch (file changed externally). Expected ${params.hash}, got ${currentHash}.`);
-      // Apply replacement using Pi's internal edit tool via a fake Pi call
-      // For now, use the extension to perform the file write if we have it available.
       const newLines = params.newText.split("\n");
       const newFileContent = [...liveLines.slice(0, block.startLine - 1), ...newLines, ...liveLines.slice(block.endLine)].join("\n");
-      await fs.writeFile(path.join(workspaceFolder, params.file), newFileContent);
+      await fs.writeFile(path.join(await getWorkspace(), params.file), newFileContent);
       console.log(`[pi_replace_block] Replaced block ${params.hash} in ${params.file}`);
       return { content: [{ type: "text", text: `Block replaced at ${params.file}:${block.startLine}-${block.endLine}` }] };
     },
+  });
+
+  pi.registerTool("pi_list_blocks", {
+    label: "List Blocks",
+    description: 'List all editable blocks in a file (or all files) with their hashes.',
+    parameters: Type.Object({
+      file: Type.Optional(Type.String({ description: "Optional file path to filter blocks." })),
+    }),
+    execute: async (_id, params) => {
+      const index = await readIndex();
+      if (!index) throw new Error("No index found. Run pi_symbol_build first.");
+      const blocks = params?.file ? index.blocks.filter(b => b.file === params.file) : index.blocks;
+      return { content: [{ type: "text", text: JSON.stringify(blocks, null, 2) }] };
+    },
+  });
+
+  pi.on("session_start", async (event) => {
+    const ctx = event as any;
+    const workspaceFolder = ctx.cwd || "";
+    if (workspaceFolder) {
+      const langConfig = await detectLanguage(workspaceFolder);
+      if (langConfig) {
+        console.log(`[pi_symbol_index] Auto-building index for ${langConfig.server} in ${workspaceFolder}`);
+        await buildIndex(workspaceFolder);
+      }
+    }
   });
 }
