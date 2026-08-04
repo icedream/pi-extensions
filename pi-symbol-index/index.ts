@@ -774,14 +774,28 @@ export default function (pi: ExtensionAPI): void {
   // Lazy build: on first tool use, check if index exists and build if needed
   let _indexBuilt = false;
   let _indexBuiltFolder = "";
+  let _indexBuildTs = "";
 
   async function ensureIndex(workspaceFolder: string): Promise<void> {
-    if (_indexBuilt && _indexBuiltFolder === workspaceFolder) return;
+    if (_indexBuilt && _indexBuiltFolder === workspaceFolder) {
+      // Check if index is still valid (index file exists and was built after workspace folder)
+      const indexPath = path.join(workspaceFolder, INDEX_DIR, INDEX_FILE);
+      try {
+        const stat = await fs.stat(indexPath);
+        if (stat.mtimeMs > 0) {
+          return; // Index is valid
+        }
+      } catch {
+        // Index file missing, need to build
+      }
+    }
     const indexPath = path.join(workspaceFolder, INDEX_DIR, INDEX_FILE);
     try {
       await fs.access(indexPath);
       _indexBuilt = true;
       _indexBuiltFolder = workspaceFolder;
+      const stat = await fs.stat(indexPath);
+      _indexBuildTs = stat.mtimeMs.toString();
       return;
     } catch {
       // Index doesn't exist, build it
@@ -792,6 +806,7 @@ export default function (pi: ExtensionAPI): void {
     }
     _indexBuilt = true;
     _indexBuiltFolder = workspaceFolder;
+    _indexBuildTs = new Date().toISOString();
   }
 
   pi.on("session_start", async (event) => {
