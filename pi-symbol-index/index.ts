@@ -466,7 +466,7 @@ function getLangId(file: string): string {
   return "typescript";
 }
 
-function findTsFilesInDir(dir: string, files: string[], seen: Set<string>): void {
+function findTsFilesInDir(dir: string, files: string[], seen: Set<string>, root: string): void {
   if (seen.has(dir)) return;
   seen.add(dir);
   const skip = ["node_modules", "out", "dist", "_test", ".pi-index", ".git"];
@@ -476,10 +476,10 @@ function findTsFilesInDir(dir: string, files: string[], seen: Set<string>): void
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         if (!skip.includes(entry.name)) {
-          findTsFilesInDir(fullPath, files, seen);
+          findTsFilesInDir(fullPath, files, seen, root);
         }
       } else if (entry.isFile() && /\.(ts|tsx|js|jsx|mjs|mts)$/.test(entry.name)) {
-        const rel = path.relative(dir, fullPath);
+        const rel = path.relative(root, fullPath);
         files.push(rel);
       }
     }
@@ -489,7 +489,7 @@ function findTsFilesInDir(dir: string, files: string[], seen: Set<string>): void
 async function listTsFiles(workspaceFolder: string): Promise<string[]> {
   const files: string[] = [];
   const seen = new Set<string>();
-  findTsFilesInDir(workspaceFolder, files, seen);
+  findTsFilesInDir(workspaceFolder, files, seen, workspaceFolder);
   return files;
 }
 
@@ -626,13 +626,24 @@ async function extractSymbolsFromTsProgram(
 async function detectLanguage(workspaceFolder: string): Promise<LanguageConfig | null> {
   const cfg = await loadConfig(extensionPath);
   for (const [name, lang] of Object.entries(cfg.languages)) {
-    try {
-      for (const f of lang.detect) {
-        const fp = path.join(workspaceFolder, f);
-        await fs.access(fp);
+    for (const f of lang.detect) {
+      // Check workspace root
+      try {
+        await fs.access(path.join(workspaceFolder, f));
         return lang;
-      }
-    } catch (e) {
+      } catch {}
+      // Check subdirectories
+      try {
+        const entries = fsSync.readdirSync(workspaceFolder, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory() && !entry.name.startsWith('.')) {
+            try {
+              await fs.access(path.join(workspaceFolder, entry.name, f));
+              return lang;
+            } catch {}
+          }
+        }
+      } catch {}
     }
   }
   return null;
@@ -647,9 +658,7 @@ export async function buildIndex(target?: string, extPath?: string, hooks?: Rebu
   hooks?.onStart?.();
   const workspaceFolder = target || (await getWorkspace());
   const langConfig = await detectLanguage(workspaceFolder);
-  if (!langConfig) {
-    return;
-  }
+  if (!langConfig) return;
 
   let symbolKindMap: Record<string, string>;
   let symbols: Record<string, { status: string; symbols: IndexSymbol[] }>;
@@ -677,7 +686,7 @@ export async function buildIndex(target?: string, extPath?: string, hooks?: Rebu
     if (langConfig.server === "typescript-language-server") {
       const tsFiles: string[] = [];
       const seenSet = new Set<string>();
-      findTsFilesInDir(workspaceFolder, tsFiles, seenSet);
+      findTsFilesInDir(workspaceFolder, tsFiles, seenSet, workspaceFolder);
       symbols = await extractSymbolsFromTsProgram(workspaceFolder, tsFiles, langConfig.symbolKindMap);
       symbolKindMap = langConfig.symbolKindMap;
     }
