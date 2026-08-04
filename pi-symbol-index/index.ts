@@ -838,7 +838,12 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "symbol_index_info",
     label: "Symbol Info",
-    description: "Look up a symbol by exact name in the index. Returns file location, line range, type, usages, and call hierarchy.",
+    description: "Look up a symbol by exact name in the index. Returns file location, line range, type, usages, and call hierarchy.\n\nBefore using this tool, call symbol_index_build first to ensure the index is up-to-date. If you're working with a specific file that isn't indexed yet, pass its path as the 'file' parameter to extract it on-demand.",
+    promptGuidelines: [
+      "Always run symbol_index_build first before using symbol_index_info, symbol_index_replace_block, or symbol_index_list_blocks.",
+      "Use symbol_index_info to look up a symbol's location before editing it.",
+      "If the index is stale or a file isn't indexed, pass the file path to symbol_index_info to extract it on-demand.",
+    ],
     parameters: Type.Object({
       name: Type.String({ description: "Exact symbol name to look up." }),
       file: Type.Optional(Type.String({ description: "Optional file path to extract symbols for on-demand." })),
@@ -907,7 +912,11 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "symbol_index_replace_block",
     label: "Replace Code Block",
-    description: 'Replace a code block by short hash prefix. No "oldText" required — the extension finds the block by hash. If the hash check fails (file was modified externally), the operation is refused to prevent desync.',
+    description: 'Replace a code block by short hash prefix. No "oldText" required — the extension finds the block by hash. If the hash check fails (file was modified externally), the operation is refused to prevent desync.\n\nBefore using this tool, call symbol_index_build first to ensure the block hashes are in the index.',
+    promptGuidelines: [
+      "Always run symbol_index_build first before using symbol_index_replace_block.",
+      "Use symbol_index_list_blocks to find the shortId of a block you want to replace.",
+    ],
     parameters: Type.Object({
       file: Type.String({ description: "Filename of the file to replace." }),
       shortId: Type.String({ description: "Short block ID (6 chars, base36 of CRC32) to locate the block. Use symbol_index_list_blocks to get block IDs." }),
@@ -947,7 +956,10 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "symbol_index_list_blocks",
     label: "List Blocks",
-    description: 'List all editable blocks in a file (or all files) with their short hash IDs.',
+    description: 'List all editable blocks in a file (or all files) with their short hash IDs.\n\nBefore using this tool, call symbol_index_build first.',
+    promptGuidelines: [
+      "Always run symbol_index_build first before using symbol_index_list_blocks.",
+    ],
     parameters: Type.Object({
       file: Type.Optional(Type.String({ description: "Optional file path to filter blocks." })),
     }),
@@ -972,7 +984,10 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "symbol_index_detect_duplicates",
     label: "Detect Duplicate Code Blocks",
-    description: 'Find code blocks that have identical full SHA256 hashes across the project — these are likely copied code.',
+    description: 'Find code blocks that have identical full SHA256 hashes across the project — these are likely copied code.\n\nBefore using this tool, call symbol_index_build first.',
+    promptGuidelines: [
+      "Always run symbol_index_build first before using symbol_index_detect_duplicates.",
+    ],
     parameters: Type.Object({
       file: Type.Optional(Type.String({ description: "Optional file path to limit search." })),
     }),
