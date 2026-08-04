@@ -320,14 +320,14 @@ async function main(): Promise<void> {
   }
 }
 
-testStalenessDetection().catch(e => { console.error(e); process.exit(1); });
+testPerFileMtime().catch(e => { console.error(e); process.exit(1); });
 
 main().catch((e) => { console.error(e); process.exit(1); });
 
-// Test 17: staleness detection
-async function testStalenessDetection() {
-  const name = "staleness detection";
-  const testDir = path.join(os.tmpdir(), "sym_test_stale");
+// Test 17: per-file mtime tracking
+async function testPerFileMtime() {
+  const name = "per-file mtime tracking";
+  const testDir = path.join(os.tmpdir(), "sym_test_mtime");
   await fs.rm(testDir, { recursive: true, force: true });
   await fs.mkdir(path.join(testDir, "src"), { recursive: true });
 
@@ -342,33 +342,21 @@ func Add(a, b int) int {
 
   await buildIndex(testDir, __dirname);
 
-  // Read the index and check sourceMtime
+  // Read the index and check buildMtimes
   const index = await readIndex(testDir);
   if (!index) {
     console.log(`✗ ${name}: no index`);
     return;
   }
 
-  const sourceMtime = index.sourceMtime;
-  console.log(`  sourceMtime: ${sourceMtime}`);
-
-  // Wait a moment and modify a source file
-  await new Promise(resolve => setTimeout(resolve, 100));
-  await fs.writeFile(path.join(testDir, "src/main.go"), `package main
-
-func Add(a, b int) int {
-	return a + b + 1
-}
-`);
-
-  // Read the file stat
-  const stat = await fs.stat(path.join(testDir, "src/main.go"));
-  console.log(`  file mtime: ${stat.mtimeMs}, index sourceMtime: ${sourceMtime}`);
-
-  // The file is now newer than the index — ensureIndex should rebuild
-  // (We can't easily test this without accessing the module internals,
-  //  but the logic is there)
-  console.log(`✓ ${name}: sourceMtime stored (${sourceMtime})`);
+  const mtimes = index.buildMtimes;
+  const fileKeys = Object.keys(mtimes);
+  if (fileKeys.length === 0) {
+    console.log(`✗ ${name}: no buildMtimes`);
+    return;
+  }
+  console.log(`  buildMtimes: ${JSON.stringify(mtimes)}`);
+  console.log(`✓ ${name}: per-file mtime stored for ${fileKeys.length} file(s)`);
 }
 
-testStalenessDetection();
+

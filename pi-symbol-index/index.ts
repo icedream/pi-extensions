@@ -59,7 +59,7 @@ interface PiIndex {
   projectRoot: string;
   languages: string[];
   buildTs: string;
-  sourceMtime: number;
+  buildMtimes: Record<string, number>; // per-file mtime at build time
   files: Record<string, { status: "ok" | "partial" | "broken"; symbols: IndexSymbol[] }>;
   blocks: BlockIndex[];
 }
@@ -531,18 +531,6 @@ export async function buildIndex(target?: string, extPath?: string): Promise<voi
     totalSymbols += symbols[key].symbols.length;
   }
 
-  // Find oldest source file mtime for staleness detection
-  let oldestSourceMtime = Infinity;
-  for (const file of Object.keys(symbols)) {
-    try {
-      const filePath = path.join(workspaceFolder, file);
-      const stat = await fs.stat(filePath);
-      if (stat.mtimeMs < oldestSourceMtime) {
-        oldestSourceMtime = stat.mtimeMs;
-      }
-    } catch {}
-  }
-
   // Build block index and detect duplicates
   const blocks: BlockIndex[] = [];
   const hashGroups: Record<string, BlockIndex[]> = {};
@@ -569,12 +557,22 @@ export async function buildIndex(target?: string, extPath?: string): Promise<voi
     }
   }
 
+  // Capture per-file mtimes for incremental staleness detection
+  const buildMtimes: Record<string, number> = {};
+  for (const file of Object.keys(symbols)) {
+    try {
+      const filePath = path.join(workspaceFolder, file);
+      const stat = await fs.stat(filePath);
+      buildMtimes[file] = stat.mtimeMs;
+    } catch {}
+  }
+
   const index: PiIndex = {
     version: 1,
     projectRoot: workspaceFolder,
     languages: [langConfig.server],
     buildTs: new Date().toISOString(),
-    sourceMtime: oldestSourceMtime === Infinity ? Date.now() : oldestSourceMtime,
+    buildMtimes,
     files: symbols,
     blocks,
   };
@@ -807,7 +805,7 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
-    // Read index to get stored sourceMtime
+    // Read index to check staleness
     const index = await readIndex();
     if (!index) {
       // Index file exists but is corrupt, rebuild
@@ -820,25 +818,125 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
-    // Compare stored sourceMtime against oldest source file
-    let oldestSourceMtime = index.sourceMtime || Infinity;
+    // Compare per-file mtime against stored buildMtimes
+    const buildMtimes = index.buildMtimes || {};
+    const changedFiles: string[] = [];
+
+    for (const [file, storedMtime] of Object.entries(buildMtimes)) {
+      const filePath = path.join(workspaceFolder, file);
+      try {
+        const stat = await fs.stat(filePath);
+        if (stat.mtimeMs > storedMtime) {
+          changedFiles.push(file);
+        }
+      } catch {
+        // File deleted — stale entry
+        changedFiles.push(file);
+      }
+    }
+
+    // Detect new files (not in buildMtimes)
+    const langConfig = await detectLanguage(workspaceFolder);
+    if (langConfig) {
+      for (const ext of langConfig.extensions) {
+        const files = await findFilesByExt(workspaceFolder, ext);
+        for (const file of files) {
+          if (!buildMtimes[file]) {
+            changedFiles.push(file);
+          }
+        }
+      }
+    }
+
+    if (changedFiles.length === 0) {
+      // No changes — cache is valid
+      _indexBuilt = true;
+      _indexBuiltFolder = workspaceFolder;
+      return;
+    }
+
+    // Rebuild only changed files
+    if (changedFiles.length === Object.keys(buildMtimes).length && changedFiles.length > 5) {
+      // Most files changed — full rebuild is more efficient
+      await buildIndex(workspaceFolder);
+    } else {
+      // Partial rebuild — only re-extract symbols for changed files
+      await partialRebuild(workspaceFolder, langConfig, changedFiles);
+    }
+
+    _indexBuilt = true;
+    _indexBuiltFolder = workspaceFolder;
+  }
+
+  async function partialRebuild(
+    workspaceFolder: string,
+    langConfig: LanguageConfig,
+    changedFiles: string[],
+  ): Promise<void> {
+    const index = await readIndex();
+    if (!index) return;
+
+    // Re-extract symbols for changed files
+    let partialResult: Record<string, { status: string; symbols: IndexSymbol[] }> = {};
+
+    if (langConfig.server === "typescript-language-server") {
+      partialResult = await extractSymbolsFromTsProgram(workspaceFolder, changedFiles, langConfig.symbolKindMap);
+    } else {
+      const serverPath = await findServer(langConfig.server, workspaceFolder);
+      if (serverPath) {
+        const client = await buildLspClient(serverPath, langConfig.args, workspaceFolder, langConfig.env || {});
+        partialResult = await extractSymbolsFromLsp(client, workspaceFolder, changedFiles, langConfig.symbolKindMap);
+      }
+    }
+
+    // Merge into index
+    for (const [file, data] of Object.entries(partialResult)) {
+      index.files[file] = data;
+    }
+
+    // Remove deleted files
+    const currentFiles = new Set(Object.keys(partialResult));
+    for (const file of Object.keys(index.files)) {
+      if (!currentFiles.has(file)) {
+        delete index.files[file];
+      }
+    }
+
+    // Rebuild blocks index
+    const blocks: BlockIndex[] = [];
+    for (const file of Object.keys(index.files)) {
+      for (const sym of index.files[file].symbols) {
+        const block: BlockIndex = { file, startLine: sym.lineRange[0], endLine: sym.lineRange[1], hash: "", shortId: "" };
+        blocks.push(block);
+      }
+    }
+    for (const block of blocks) {
+      try {
+        const textLines = (await fs.readFile(path.join(workspaceFolder, block.file), "utf-8")).split("\n");
+        const blockText = textLines.slice(block.startLine - 1, block.endLine).join("\n") + "\n";
+        block.hash = sha256(blockText);
+        block.shortId = toBase36(crc32(blockText));
+      } catch {
+        block.hash = "";
+        block.shortId = "";
+      }
+    }
+    index.blocks = blocks;
+
+    // Update buildMtimes
     for (const file of Object.keys(index.files)) {
       try {
         const filePath = path.join(workspaceFolder, file);
         const stat = await fs.stat(filePath);
-        if (stat.mtimeMs > oldestSourceMtime) {
-          // Source file is newer than index — stale
-          await buildIndex(workspaceFolder);
-          _indexBuilt = true;
-          _indexBuiltFolder = workspaceFolder;
-          return;
-        }
-      } catch {}
+        index.buildMtimes[file] = stat.mtimeMs;
+      } catch {
+        delete index.buildMtimes[file];
+      }
     }
 
-    // No source files are newer than index — cache is valid
-    _indexBuilt = true;
-    _indexBuiltFolder = workspaceFolder;
+    // Write updated index
+    const indexPath = path.join(workspaceFolder, INDEX_DIR, INDEX_FILE);
+    await fs.writeFile(indexPath, JSON.stringify(index, null, 2));
   }
 
   pi.on("session_start", async (event) => {
