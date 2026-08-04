@@ -59,6 +59,7 @@ interface PiIndex {
   projectRoot: string;
   languages: string[];
   buildTs: string;
+  sourceMtime: number;
   files: Record<string, { status: "ok" | "partial" | "broken"; symbols: IndexSymbol[] }>;
   blocks: BlockIndex[];
 }
@@ -530,6 +531,18 @@ export async function buildIndex(target?: string, extPath?: string): Promise<voi
     totalSymbols += symbols[key].symbols.length;
   }
 
+  // Find oldest source file mtime for staleness detection
+  let oldestSourceMtime = Infinity;
+  for (const file of Object.keys(symbols)) {
+    try {
+      const filePath = path.join(workspaceFolder, file);
+      const stat = await fs.stat(filePath);
+      if (stat.mtimeMs < oldestSourceMtime) {
+        oldestSourceMtime = stat.mtimeMs;
+      }
+    } catch {}
+  }
+
   // Build block index and detect duplicates
   const blocks: BlockIndex[] = [];
   const hashGroups: Record<string, BlockIndex[]> = {};
@@ -561,6 +574,7 @@ export async function buildIndex(target?: string, extPath?: string): Promise<voi
     projectRoot: workspaceFolder,
     languages: [langConfig.server],
     buildTs: new Date().toISOString(),
+    sourceMtime: oldestSourceMtime === Infinity ? Date.now() : oldestSourceMtime,
     files: symbols,
     blocks,
   };
@@ -771,42 +785,60 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
-  // Lazy build: on first tool use, check if index exists and build if needed
+  // Lazy build: on each tool use, check if index is stale and rebuild if needed
   let _indexBuilt = false;
   let _indexBuiltFolder = "";
-  let _indexBuildTs = "";
 
   async function ensureIndex(workspaceFolder: string): Promise<void> {
-    if (_indexBuilt && _indexBuiltFolder === workspaceFolder) {
-      // Check if index is still valid (index file exists and was built after workspace folder)
-      const indexPath = path.join(workspaceFolder, INDEX_DIR, INDEX_FILE);
-      try {
-        const stat = await fs.stat(indexPath);
-        if (stat.mtimeMs > 0) {
-          return; // Index is valid
-        }
-      } catch {
-        // Index file missing, need to build
-      }
-    }
     const indexPath = path.join(workspaceFolder, INDEX_DIR, INDEX_FILE);
+
+    // Check if index exists
+    let indexStat: fsSync.Stats;
     try {
-      await fs.access(indexPath);
+      indexStat = await fs.stat(indexPath);
+    } catch {
+      // Index file missing, build it
+      const langConfig = await detectLanguage(workspaceFolder);
+      if (langConfig) {
+        await buildIndex(workspaceFolder);
+      }
       _indexBuilt = true;
       _indexBuiltFolder = workspaceFolder;
-      const stat = await fs.stat(indexPath);
-      _indexBuildTs = stat.mtimeMs.toString();
       return;
-    } catch {
-      // Index doesn't exist, build it
     }
-    const langConfig = await detectLanguage(workspaceFolder);
-    if (langConfig) {
-      await buildIndex(workspaceFolder);
+
+    // Read index to get stored sourceMtime
+    const index = await readIndex();
+    if (!index) {
+      // Index file exists but is corrupt, rebuild
+      const langConfig = await detectLanguage(workspaceFolder);
+      if (langConfig) {
+        await buildIndex(workspaceFolder);
+      }
+      _indexBuilt = true;
+      _indexBuiltFolder = workspaceFolder;
+      return;
     }
+
+    // Compare stored sourceMtime against oldest source file
+    let oldestSourceMtime = index.sourceMtime || Infinity;
+    for (const file of Object.keys(index.files)) {
+      try {
+        const filePath = path.join(workspaceFolder, file);
+        const stat = await fs.stat(filePath);
+        if (stat.mtimeMs > oldestSourceMtime) {
+          // Source file is newer than index — stale
+          await buildIndex(workspaceFolder);
+          _indexBuilt = true;
+          _indexBuiltFolder = workspaceFolder;
+          return;
+        }
+      } catch {}
+    }
+
+    // No source files are newer than index — cache is valid
     _indexBuilt = true;
     _indexBuiltFolder = workspaceFolder;
-    _indexBuildTs = new Date().toISOString();
   }
 
   pi.on("session_start", async (event) => {
