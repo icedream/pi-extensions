@@ -650,6 +650,7 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerTool("symbol_index_build", {
+    name: "symbol_index_build",
     label: "Build Symbol Index",
     description: "Scan the project directory and build/update the symbol index.",
     parameters: Type.Object({
@@ -663,6 +664,7 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerTool("symbol_index_info", {
+    name: "symbol_index_info",
     label: "Symbol Info",
     description: "Look up a symbol by exact name in the index. Returns file location, line range, type, usages, and call hierarchy.",
     parameters: Type.Object({
@@ -691,6 +693,7 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerTool("symbol_index_symbols", {
+    name: "symbol_index_symbols",
     label: "Project Symbols",
     description: "List all indexed symbols organized by file.",
     parameters: Type.Object({}),
@@ -711,6 +714,7 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerTool("symbol_index_replace_block", {
+    name: "symbol_index_replace_block",
     label: "Replace Code Block",
     description: 'Replace a code block by short hash prefix. No "oldText" required — the extension finds the block by hash. If the hash check fails (file was modified externally), the operation is refused to prevent desync.',
     parameters: Type.Object({
@@ -743,6 +747,7 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerTool("symbol_index_list_blocks", {
+    name: "symbol_index_list_blocks",
     label: "List Blocks",
     description: 'List all editable blocks in a file (or all files) with their short hash IDs.',
     parameters: Type.Object({
@@ -760,6 +765,7 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerTool("symbol_index_detect_duplicates", {
+    name: "symbol_index_detect_duplicates",
     label: "Detect Duplicate Code Blocks",
     description: 'Find code blocks that have identical full SHA256 hashes across the project — these are likely copied code.',
     parameters: Type.Object({
