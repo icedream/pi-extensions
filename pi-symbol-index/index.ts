@@ -649,7 +649,7 @@ export default function (pi: ExtensionAPI): void {
     default: "",
   });
 
-  pi.registerTool("pi_symbol_build", {
+  pi.registerTool("symbol_index_build", {
     label: "Build Symbol Index",
     description: "Scan the project directory and build/update the symbol index.",
     parameters: Type.Object({
@@ -662,7 +662,7 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerTool("pi_symbol_info", {
+  pi.registerTool("symbol_index_info", {
     label: "Symbol Info",
     description: "Look up a symbol by exact name in the index. Returns file location, line range, type, usages, and call hierarchy.",
     parameters: Type.Object({
@@ -673,7 +673,7 @@ export default function (pi: ExtensionAPI): void {
       const workspaceFolder = await getWorkspace();
       await ensureIndex(workspaceFolder);
       const index = await readIndex();
-      if (!index) throw new Error("No index found. Run pi_symbol_build first.");
+      if (!index) throw new Error("No index found. Run symbol_index_build first.");
       const found: IndexSymbol[] = [];
       for (const file of Object.keys(index.files)) {
         for (const sym of index.files[file].symbols) {
@@ -690,7 +690,7 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerTool("pi_project_symbols", {
+  pi.registerTool("symbol_index_symbols", {
     label: "Project Symbols",
     description: "List all indexed symbols organized by file.",
     parameters: Type.Object({}),
@@ -698,7 +698,7 @@ export default function (pi: ExtensionAPI): void {
       const workspaceFolder = await getWorkspace();
       await ensureIndex(workspaceFolder);
       const index = await readIndex();
-      if (!index) throw new Error("No index found. Run pi_symbol_build first.");
+      if (!index) throw new Error("No index found. Run symbol_index_build first.");
       const files = Object.keys(index.files);
       const result = files.map(f => ({
         file: f,
@@ -710,12 +710,12 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerTool("pi_replace_block", {
+  pi.registerTool("symbol_index_replace_block", {
     label: "Replace Code Block",
     description: 'Replace a code block by short hash prefix. No "oldText" required — the extension finds the block by hash. If the hash check fails (file was modified externally), the operation is refused to prevent desync.',
     parameters: Type.Object({
       file: Type.String({ description: "Filename of the file to replace." }),
-      shortId: Type.String({ description: "Short block ID (6 chars, base36 of CRC32) to locate the block. Use pi_list_blocks to get block IDs." }),
+      shortId: Type.String({ description: "Short block ID (6 chars, base36 of CRC32) to locate the block. Use symbol_index_list_blocks to get block IDs." }),
       newText: Type.String({ description: "The replacement text to insert." }),
     }),
     execute: async (_id, params) => {
@@ -723,7 +723,7 @@ export default function (pi: ExtensionAPI): void {
       const workspaceFolder = await getWorkspace();
       await ensureIndex(workspaceFolder);
       const index = await readIndex();
-      if (!index) throw new Error("No symbol index found. Run pi_symbol_build first.");
+      if (!index) throw new Error("No symbol index found. Run symbol_index_build first.");
       const block = index.blocks.find(b => b.file === params.file && b.shortId === params.shortId);
       if (!block) throw new Error(`Block shortId ${params.shortId} not found or file ${params.file} doesn't exist.`);
       // Security: validate resolved path stays within workspace
@@ -742,7 +742,7 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerTool("pi_list_blocks", {
+  pi.registerTool("symbol_index_list_blocks", {
     label: "List Blocks",
     description: 'List all editable blocks in a file (or all files) with their short hash IDs.',
     parameters: Type.Object({
@@ -752,14 +752,14 @@ export default function (pi: ExtensionAPI): void {
       const workspaceFolder = await getWorkspace();
       await ensureIndex(workspaceFolder);
       const index = await readIndex();
-      if (!index) throw new Error("No index found. Run pi_symbol_build first.");
+      if (!index) throw new Error("No index found. Run symbol_index_build first.");
       const blocks = params?.file ? index.blocks.filter(b => b.file === params.file) : index.blocks;
       const visible = blocks.map(b => ({ file: b.file, lineRange: `${b.startLine}-${b.endLine}`, shortId: b.shortId }));
       return { content: [{ type: "text", text: JSON.stringify(visible, null, 2) }] };
     },
   });
 
-  pi.registerTool("pi_detect_duplicates", {
+  pi.registerTool("symbol_index_detect_duplicates", {
     label: "Detect Duplicate Code Blocks",
     description: 'Find code blocks that have identical full SHA256 hashes across the project — these are likely copied code.',
     parameters: Type.Object({
@@ -769,7 +769,7 @@ export default function (pi: ExtensionAPI): void {
       const workspaceFolder = await getWorkspace();
       await ensureIndex(workspaceFolder);
       const index = await readIndex();
-      if (!index) throw new Error("No index found. Run pi_symbol_build first.");
+      if (!index) throw new Error("No index found. Run symbol_index_build first.");
       const blocks = params?.file ? index.blocks.filter(b => b.file === params.file) : index.blocks;
       // Group by full SHA256 hash for accurate duplicate detection
       const groups: Record<string, string[]> = {};

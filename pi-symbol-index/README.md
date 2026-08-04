@@ -13,7 +13,7 @@ Without this extension, the model has to read multiple source files, grep manual
 
 ## Registered tools
 
-### `pi_symbol_build(target?)`
+### `symbol_index_build(target?)`
 
 Builds the symbol index by:
 1. Detecting the project language (Go, TypeScript, Rust, Python, C/C++)
@@ -23,7 +23,7 @@ Builds the symbol index by:
 5. Querying `textDocument/references` for usages
 6. Writing the index to `.pi-index/symbols.json`
 
-### `pi_symbol_info(name)`
+### `symbol_index_info(name)`
 
 Looks up a symbol across the project. Returns:
 - File location
@@ -32,20 +32,20 @@ Looks up a symbol across the project. Returns:
 - Usages (where it's referenced)
 - Call hierarchy (incoming/outgoing calls)
 
-### `pi_project_symbols()`
+### `symbol_index_symbols()`
 
 Shows a high-level summary of:
 - Files scanned
 - Symbol counts by file
 - Types and functions found
 
-### `pi_replace_block(file, hash, newText)`
+### `symbol_index_replace_block(file, shortId, newText)`
 
-Replace a code block by hash. No `oldText` required — the extension finds the block by hash. If the hash check fails (file was modified externally), the operation is refused to prevent desync.
+Replace a code block by short hash ID. No `oldText` required — the extension finds the block by hash. If the hash check fails (file was modified externally), the operation is refused to prevent desync.
 
-### `pi_list_blocks(file?)`
+### `symbol_index_list_blocks(file?)`
 
-Lists all editable blocks in a file (or all files) with their hashes.
+Lists all editable blocks in a file (or all files) with their short hash IDs.
 
 ## Configuration
 
