@@ -302,6 +302,9 @@ async function main(): Promise<void> {
     assert('gopls' in config.languages || 'go' in config.languages, 'go config present');
   });
 
+  // -- Test 17: per-file mtime tracking --
+  await run('per-file mtime tracking', testPerFileMtime);
+
   // -- Tear down --
   await cleanup();
 
@@ -320,18 +323,14 @@ async function main(): Promise<void> {
   }
 }
 
-testPerFileMtime().catch(e => { console.error(e); process.exit(1); });
-
-main().catch((e) => { console.error(e); process.exit(1); });
+await main();
 
 // Test 17: per-file mtime tracking
 async function testPerFileMtime() {
-  const name = "per-file mtime tracking";
   const testDir = path.join(os.tmpdir(), "sym_test_mtime");
   await fs.rm(testDir, { recursive: true, force: true });
   await fs.mkdir(path.join(testDir, "src"), { recursive: true });
 
-  // Create a simple Go project
   await fs.writeFile(path.join(testDir, "go.mod"), "module test\n\ngo 1.21\n");
   await fs.writeFile(path.join(testDir, "src/main.go"), `package main
 
@@ -342,21 +341,9 @@ func Add(a, b int) int {
 
   await buildIndex(testDir, __dirname);
 
-  // Read the index and check buildMtimes
   const index = await readIndex(testDir);
-  if (!index) {
-    console.log(`✗ ${name}: no index`);
-    return;
-  }
-
-  const mtimes = index.buildMtimes;
-  const fileKeys = Object.keys(mtimes);
-  if (fileKeys.length === 0) {
-    console.log(`✗ ${name}: no buildMtimes`);
-    return;
-  }
-  console.log(`  buildMtimes: ${JSON.stringify(mtimes)}`);
-  console.log(`✓ ${name}: per-file mtime stored for ${fileKeys.length} file(s)`);
+  assert(index, "index exists");
+  assert(Object.keys(index.buildMtimes).length > 0, "buildMtimes populated");
 }
 
 

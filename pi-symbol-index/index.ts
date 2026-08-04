@@ -728,7 +728,7 @@ export default function (pi: ExtensionAPI): void {
       if (!block) throw new Error(`Block shortId ${params.shortId} not found or file ${params.file} doesn't exist.`);
       // Security: validate resolved path stays within workspace
       const resolvedPath = path.resolve(path.join(workspaceFolder, params.file));
-      if (!resolvedPath.startsWith(workspaceFolder)) throw new Error("File path escapes workspace directory.");
+      if (!resolvedPath.startsWith(workspaceFolder + path.sep)) throw new Error("File path escapes workspace directory.");
       let liveText: string;
       try { liveText = await fs.readFile(resolvedPath, "utf-8"); } catch (e) { throw new Error(`Failed to read ${params.file}: ${(e as any).message}`); }
       const liveLines = liveText.split("\n");
@@ -889,16 +889,21 @@ export default function (pi: ExtensionAPI): void {
       }
     }
 
-    // Merge into index
+    // Merge new/updated symbols into index
     for (const [file, data] of Object.entries(partialResult)) {
       index.files[file] = data;
     }
 
-    // Remove deleted files
-    const currentFiles = new Set(Object.keys(partialResult));
-    for (const file of Object.keys(index.files)) {
-      if (!currentFiles.has(file)) {
+    // Remove files that were tracked but no longer exist on disk
+    // (not files that were not in the changed set — those are unchanged)
+    for (const file of changedFiles) {
+      const filePath = path.join(workspaceFolder, file);
+      try {
+        await fs.stat(filePath);
+      } catch {
+        // File deleted — remove from index
         delete index.files[file];
+        delete index.buildMtimes[file];
       }
     }
 
