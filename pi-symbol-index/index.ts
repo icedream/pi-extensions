@@ -210,7 +210,7 @@ async function extractSymbolsFromLsp(
   symbolKindMap: Record<string, string>,
 ): Promise<Record<string, { status: string; symbols: IndexSymbol[] }>> {
   const result: Record<string, { status: string; symbols: IndexSymbol[] }> = {};
-  const slice = files.slice(0, 100);
+  const slice = files;
 
   client.connection.listen();
 
@@ -386,7 +386,7 @@ async function extractSymbolsFromTsProgram(
   symbolKindMap: Record<string, string>,
 ): Promise<Record<string, { status: string; symbols: IndexSymbol[] }>> {
   const result: Record<string, { status: string; symbols: IndexSymbol[] }> = {};
-  const slice = files.slice(0, 50);
+  const slice = files;
 
   try {
     let tsModule: any;
