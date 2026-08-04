@@ -77,6 +77,13 @@ interface LspClient {
   connection: import("vscode-jsonrpc").MessageConnection;
 }
 
+interface RebuildHooks {
+  onStart?: () => void;
+  onDone?: (stats: { files: number; symbols: number }) => void;
+  onPartialStart?: () => void;
+  onPartialDone?: (stats: { files: number; symbols: number }) => void;
+}
+
 // =========================================
 // Constants
 // =========================================
@@ -483,8 +490,9 @@ async function detectLanguage(workspaceFolder: string): Promise<LanguageConfig |
 // Build index
 // =========================================
 
-export async function buildIndex(target?: string, extPath?: string): Promise<void> {
+export async function buildIndex(target?: string, extPath?: string, hooks?: RebuildHooks): Promise<void> {
   if (extPath) extensionPath = extPath;
+  hooks?.onStart?.();
   const workspaceFolder = target || (await getWorkspace());
   const langConfig = await detectLanguage(workspaceFolder);
   if (!langConfig) {
@@ -556,6 +564,9 @@ export async function buildIndex(target?: string, extPath?: string): Promise<voi
       block.shortId = "";
     }
   }
+
+  // Report rebuild stats
+  hooks?.onDone?.({ files: Object.keys(symbols).length, symbols: totalSymbols });
 
   // Capture per-file mtimes for incremental staleness detection
   const buildMtimes: Record<string, number> = {};
@@ -649,31 +660,45 @@ export default function (pi: ExtensionAPI): void {
     default: "",
   });
 
-  pi.registerTool("symbol_index_build", {
+  pi.registerTool({
     name: "symbol_index_build",
     label: "Build Symbol Index",
     description: "Scan the project directory and build/update the symbol index.",
     parameters: Type.Object({
       target: Type.Optional(Type.String({ description: "Target directory to index. Defaults to current workspace." })),
     }),
-    execute: async (_id, params) => {
+    execute: async (_id, params, _signal, _onUpdate, ctx) => {
       const target = params?.target || undefined;
-      await buildIndex(target);
+      const hooks: RebuildHooks = {
+        onStart: () => ctx.ui.setStatus("symbol-index", "Rebuilding symbol index..."),
+        onDone: (stats) => {
+          ctx.ui.setStatus("symbol-index", undefined);
+          ctx.ui.notify(`Symbol index rebuilt: ${stats.symbols} symbols in ${stats.files} files`, "info");
+        },
+      };
+      await buildIndex(target, undefined, hooks);
       return { content: [{ type: "text", text: "Index built." }] };
     },
   });
 
-  pi.registerTool("symbol_index_info", {
+  pi.registerTool({
     name: "symbol_index_info",
     label: "Symbol Info",
     description: "Look up a symbol by exact name in the index. Returns file location, line range, type, usages, and call hierarchy.",
     parameters: Type.Object({
       name: Type.String({ description: "Exact symbol name to look up." }),
     }),
-    execute: async (_id, params) => {
+    execute: async (_id, params, _signal, _onUpdate, ctx) => {
       if (!params?.name) throw new Error("Missing name parameter.");
       const workspaceFolder = await getWorkspace();
-      await ensureIndex(workspaceFolder);
+      const hooks: RebuildHooks = {
+        onStart: () => ctx.ui.setStatus("symbol-index", "Rebuilding symbol index..."),
+        onDone: (stats) => {
+          ctx.ui.setStatus("symbol-index", undefined);
+          ctx.ui.notify(`Symbol index rebuilt: ${stats.symbols} symbols in ${stats.files} files`, "info");
+        },
+      };
+      await ensureIndex(workspaceFolder, hooks);
       const index = await readIndex();
       if (!index) throw new Error("No index found. Run symbol_index_build first.");
       const found: IndexSymbol[] = [];
@@ -692,14 +717,21 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerTool("symbol_index_symbols", {
+  pi.registerTool({
     name: "symbol_index_symbols",
     label: "Project Symbols",
     description: "List all indexed symbols organized by file.",
     parameters: Type.Object({}),
-    execute: async (_id, _params) => {
+    execute: async (_id, _params, _signal, _onUpdate, ctx) => {
       const workspaceFolder = await getWorkspace();
-      await ensureIndex(workspaceFolder);
+      const hooks: RebuildHooks = {
+        onStart: () => ctx.ui.setStatus("symbol-index", "Rebuilding symbol index..."),
+        onDone: (stats) => {
+          ctx.ui.setStatus("symbol-index", undefined);
+          ctx.ui.notify(`Symbol index rebuilt: ${stats.symbols} symbols in ${stats.files} files`, "info");
+        },
+      };
+      await ensureIndex(workspaceFolder, hooks);
       const index = await readIndex();
       if (!index) throw new Error("No index found. Run symbol_index_build first.");
       const files = Object.keys(index.files);
@@ -713,7 +745,7 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerTool("symbol_index_replace_block", {
+  pi.registerTool({
     name: "symbol_index_replace_block",
     label: "Replace Code Block",
     description: 'Replace a code block by short hash prefix. No "oldText" required — the extension finds the block by hash. If the hash check fails (file was modified externally), the operation is refused to prevent desync.',
@@ -722,10 +754,17 @@ export default function (pi: ExtensionAPI): void {
       shortId: Type.String({ description: "Short block ID (6 chars, base36 of CRC32) to locate the block. Use symbol_index_list_blocks to get block IDs." }),
       newText: Type.String({ description: "The replacement text to insert." }),
     }),
-    execute: async (_id, params) => {
+    execute: async (_id, params, _signal, _onUpdate, ctx) => {
       if (!params?.file || !params.shortId || typeof params.newText !== "string") throw new Error('Invalid parameters. Provide file, shortId, and newText as string fields.');
       const workspaceFolder = await getWorkspace();
-      await ensureIndex(workspaceFolder);
+      const hooks: RebuildHooks = {
+        onStart: () => ctx.ui.setStatus("symbol-index", "Rebuilding symbol index..."),
+        onDone: (stats) => {
+          ctx.ui.setStatus("symbol-index", undefined);
+          ctx.ui.notify(`Symbol index rebuilt: ${stats.symbols} symbols in ${stats.files} files`, "info");
+        },
+      };
+      await ensureIndex(workspaceFolder, hooks);
       const index = await readIndex();
       if (!index) throw new Error("No symbol index found. Run symbol_index_build first.");
       const block = index.blocks.find(b => b.file === params.file && b.shortId === params.shortId);
@@ -746,16 +785,23 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerTool("symbol_index_list_blocks", {
+  pi.registerTool({
     name: "symbol_index_list_blocks",
     label: "List Blocks",
     description: 'List all editable blocks in a file (or all files) with their short hash IDs.',
     parameters: Type.Object({
       file: Type.Optional(Type.String({ description: "Optional file path to filter blocks." })),
     }),
-    execute: async (_id, params) => {
+    execute: async (_id, params, _signal, _onUpdate, ctx) => {
       const workspaceFolder = await getWorkspace();
-      await ensureIndex(workspaceFolder);
+      const hooks: RebuildHooks = {
+        onStart: () => ctx.ui.setStatus("symbol-index", "Rebuilding symbol index..."),
+        onDone: (stats) => {
+          ctx.ui.setStatus("symbol-index", undefined);
+          ctx.ui.notify(`Symbol index rebuilt: ${stats.symbols} symbols in ${stats.files} files`, "info");
+        },
+      };
+      await ensureIndex(workspaceFolder, hooks);
       const index = await readIndex();
       if (!index) throw new Error("No index found. Run symbol_index_build first.");
       const blocks = params?.file ? index.blocks.filter(b => b.file === params.file) : index.blocks;
@@ -764,16 +810,23 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerTool("symbol_index_detect_duplicates", {
+  pi.registerTool({
     name: "symbol_index_detect_duplicates",
     label: "Detect Duplicate Code Blocks",
     description: 'Find code blocks that have identical full SHA256 hashes across the project — these are likely copied code.',
     parameters: Type.Object({
       file: Type.Optional(Type.String({ description: "Optional file path to limit search." })),
     }),
-    execute: async (_id, params) => {
+    execute: async (_id, params, _signal, _onUpdate, ctx) => {
       const workspaceFolder = await getWorkspace();
-      await ensureIndex(workspaceFolder);
+      const hooks: RebuildHooks = {
+        onStart: () => ctx.ui.setStatus("symbol-index", "Rebuilding symbol index..."),
+        onDone: (stats) => {
+          ctx.ui.setStatus("symbol-index", undefined);
+          ctx.ui.notify(`Symbol index rebuilt: ${stats.symbols} symbols in ${stats.files} files`, "info");
+        },
+      };
+      await ensureIndex(workspaceFolder, hooks);
       const index = await readIndex();
       if (!index) throw new Error("No index found. Run symbol_index_build first.");
       const blocks = params?.file ? index.blocks.filter(b => b.file === params.file) : index.blocks;
@@ -793,7 +846,7 @@ export default function (pi: ExtensionAPI): void {
   let _indexBuilt = false;
   let _indexBuiltFolder = "";
 
-  async function ensureIndex(workspaceFolder: string): Promise<void> {
+  async function ensureIndex(workspaceFolder: string, hooks?: RebuildHooks): Promise<void> {
     const indexPath = path.join(workspaceFolder, INDEX_DIR, INDEX_FILE);
 
     // Check if index exists
@@ -804,7 +857,7 @@ export default function (pi: ExtensionAPI): void {
       // Index file missing, build it
       const langConfig = await detectLanguage(workspaceFolder);
       if (langConfig) {
-        await buildIndex(workspaceFolder);
+        await buildIndex(workspaceFolder, undefined, hooks);
       }
       _indexBuilt = true;
       _indexBuiltFolder = workspaceFolder;
@@ -817,7 +870,7 @@ export default function (pi: ExtensionAPI): void {
       // Index file exists but is corrupt, rebuild
       const langConfig = await detectLanguage(workspaceFolder);
       if (langConfig) {
-        await buildIndex(workspaceFolder);
+        await buildIndex(workspaceFolder, undefined, hooks);
       }
       _indexBuilt = true;
       _indexBuiltFolder = workspaceFolder;
@@ -864,10 +917,10 @@ export default function (pi: ExtensionAPI): void {
     // Rebuild only changed files
     if (changedFiles.length === Object.keys(buildMtimes).length && changedFiles.length > 5) {
       // Most files changed — full rebuild is more efficient
-      await buildIndex(workspaceFolder);
+      await buildIndex(workspaceFolder, undefined, hooks);
     } else {
       // Partial rebuild — only re-extract symbols for changed files
-      await partialRebuild(workspaceFolder, langConfig, changedFiles);
+      await partialRebuild(workspaceFolder, langConfig, changedFiles, hooks);
     }
 
     _indexBuilt = true;
@@ -878,7 +931,9 @@ export default function (pi: ExtensionAPI): void {
     workspaceFolder: string,
     langConfig: LanguageConfig,
     changedFiles: string[],
+    hooks?: RebuildHooks,
   ): Promise<void> {
+    hooks?.onPartialStart?.();
     const index = await readIndex();
     if (!index) return;
 
@@ -948,7 +1003,48 @@ export default function (pi: ExtensionAPI): void {
     // Write updated index
     const indexPath = path.join(workspaceFolder, INDEX_DIR, INDEX_FILE);
     await fs.writeFile(indexPath, JSON.stringify(index, null, 2));
+
+    // Report partial rebuild stats
+    hooks?.onPartialDone?.({ files: Object.keys(index.files).length, symbols: index.blocks.length });
   }
+
+  // Custom command: /symbol-index
+  pi.registerCommand("symbol-index", {
+    description: "Show what's in the symbol index (files, symbols, kinds, build time)",
+    handler: async (_args, ctx) => {
+      const workspaceFolder = await getWorkspace();
+      const index = await readIndex(workspaceFolder);
+      if (!index) {
+        ctx.ui.notify("No symbol index found. Run symbol_index_build first.", "warning");
+        return;
+      }
+
+      const files = Object.keys(index.files);
+      const totalSymbols = files.reduce((sum, f) => sum + index.files[f].symbols.length, 0);
+      const kinds = new Map<string, number>();
+      for (const f of files) {
+        for (const s of index.files[f].symbols) {
+          kinds.set(s.kind, (kinds.get(s.kind) || 0) + 1);
+        }
+      }
+      const kindSummary = Array.from(kinds.entries())
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, c]) => `${c} ${k}`)
+        .join(", ");
+
+      const buildAge = Math.round((Date.now() - new Date(index.buildTs).getTime()) / 60000);
+      const ageStr = buildAge < 1 ? "just now" : `${buildAge}m ago`;
+      const summary = `Symbol index: ${totalSymbols} symbols across ${files.length} files (${kindSummary}). Built ${ageStr}.`;
+
+      // Show in TUI popup if available
+      if (ctx.hasUI) {
+        const fileOptions = files.map(f => `${index.files[f].symbols.length} × ${path.basename(f)} (${f})`);
+        await ctx.ui.select("Symbol Index", fileOptions);
+      } else {
+        ctx.ui.notify(summary, "info");
+      }
+    },
+  });
 
   pi.on("session_start", async (event) => {
     // Don't auto-build on session start (too slow for large projects)
