@@ -1,11 +1,11 @@
 # pi-symbol-index
 
-A Pi coding agent extension that builds and exposes a **symbol index** for Go projects. Uses `gopls` via the **LSP protocol** to accurately extract definitions and references.
+A Pi coding agent extension that builds and exposes a **symbol index** for Go, TypeScript, Rust, Python, C/C++, and other languages. Uses LSP servers or compiler APIs to extract code symbols.
 
 ## What it does
 
-When the model works on a Go project, it often needs to find:
-- Where a symbol is **defined** (function, struct, interface)
+When the model works on a project, it often needs to find:
+- Where a symbol is **defined** (function, class, struct, interface)
 - Where a symbol is **used** (call/reference locations)
 - A **high-level overview** of the project
 
@@ -13,14 +13,15 @@ Without this extension, the model has to read multiple source files, grep manual
 
 ## Registered tools
 
-### `pi_symbol_build`
+### `pi_symbol_build(target?)`
 
 Builds the symbol index by:
-1. Spawning `gopls serve` in the current project
-2. Scanning Go files
-3. Querying `textDocument/documentSymbol` for definitions
-4. Querying `textDocument/references` for usages
-5. Writing the index to `.pi-index/symbols.json`
+1. Detecting the project language (Go, TypeScript, Rust, Python, C/C++)
+2. Spawning the appropriate LSP server (gopls, rust-analyzer, etc.) or using compiler API
+3. Scanning project files
+4. Querying `textDocument/documentSymbol` for definitions
+5. Querying `textDocument/references` for usages
+6. Writing the index to `.pi-index/symbols.json`
 
 ### `pi_symbol_info(name)`
 
@@ -29,6 +30,7 @@ Looks up a symbol across the project. Returns:
 - Line range
 - Container type
 - Usages (where it's referenced)
+- Call hierarchy (incoming/outgoing calls)
 
 ### `pi_project_symbols()`
 
@@ -37,25 +39,79 @@ Shows a high-level summary of:
 - Symbol counts by file
 - Types and functions found
 
+### `pi_replace_block(file, hash, newText)`
+
+Replace a code block by hash. No `oldText` required — the extension finds the block by hash. If the hash check fails (file was modified externally), the operation is refused to prevent desync.
+
+### `pi_list_blocks(file?)`
+
+Lists all editable blocks in a file (or all files) with their hashes.
+
+## Configuration
+
+Language support is configured via `pi-symbol-index.json` in the extension directory:
+
+```json
+{
+  "languages": {
+    "go": {
+      "server": "gopls",
+      "args": ["serve"],
+      "env": { "GOFLAGS": "" },
+      "detect": ["go.mod"],
+      "extensions": [".go"],
+      "symbolKindMap": {
+        "function": "function",
+        "method": "method",
+        "struct": "struct",
+        "interface": "interface"
+      }
+    },
+    "rust": {
+      "server": "rust-analyzer",
+      "args": ["--stdio"],
+      "detect": ["Cargo.toml"],
+      "extensions": [".rs"],
+      "symbolKindMap": { ... }
+    }
+  }
+}
+```
+
+Each language entry specifies:
+- `server`: LSP server binary name
+- `args`: Arguments to pass to the server
+- `env`: Environment variables to set
+- `detect`: Files that indicate this language is present
+- `extensions`: File extensions to scan
+- `symbolKindMap`: Mapping of LSP SymbolKind to display names
+
+To add a new language, just add an entry to the config file — no code changes needed.
+
 ## Architecture
 
 ```
-Extension → vscode-jsonrpc → gopls serve (LSP)
-                      ↘ index.ts/symbols.json (persisted)
+Extension → LSP server (gopls, rust-analyzer, etc.)
+            ↘ Compiler API (TypeScript)
+            ↘ index.ts/symbols.json (persisted)
 ```
 
 - Uses `vscode-jsonrpc` for stdio transport (no raw protocol)
 - Uses `vscode-languageserver-types` for LSP data structures
-- gopls `serve` spawns a new subprocess per build
-- `TextDocument/documentSymbol` + `textDocument/references` are the two key LSP methods used
-- Error-tolerant: gopls responses like "no identifier found" are handled silently
+- LSP server spawns a subprocess per build
+- `textDocument/documentSymbol` + `textDocument/references` are the key LSP methods
+- Error-tolerant: server responses like "no identifier found" are handled silently
+
+### TypeScript Support
+
+TypeScript uses the compiler API (`ts.createProgram`) instead of LSP, because `typescript-language-server` requires a `tsserver` binary which Linux TypeScript packages don't ship.
 
 ## Dependencies
 
 | Package | Version | Role |
 |---------|---------|------|
-| `vscode-jsonrpc` | ^9.0.1 | LSP JSON-RPC over stdio (StreamMessageReader/Writer) |
-| `vscode-languageserver-types` | ^3.18.0 | LSP type definitions (DocumentSymbol, Location) |
+| `vscode-jsonrpc` | ^9.0.1 | LSP JSON-RPC over stdio |
+| `vscode-languageserver-types` | ^3.18.0 | LSP type definitions |
 | `@sinclair/typebox` | ^0.34.4 | Tool parameter schemas |
 | `@earendil-works/pi-coding-agent` | ^0.1.0 | `ExtensionAPI` type |
 
@@ -73,15 +129,24 @@ cd /path/to/go-project
 timeout 90 pi -p 'Run pi_symbol_build. Then run pi_project_symbols.'
 ```
 
-## Limitations / known issues
+## Tests
 
-- `session_start` event has no `cwd`, so auto-build on session start doesn't work without a `go.mod` detection
-- References may fail for symbols gopls doesn't fully resolve yet
-- Only built for Go — TypeScript would need a similar typescript-language-server integration
+16 unit tests covering:
+- Index build/read (Go and TypeScript)
+- Symbol extraction (functions, classes, structs, interfaces)
+- Line ranges and usages
+- Call hierarchy
+- Block hashing (SHA256)
+- Config-driven detection
+- Hash mismatch detection
 
-## Future work (Phase 2)
+## Known issues
 
-- [ ] TypeScript/JavaScript support via `typescript-language-server`
-- [ ] Add `pi_replace_block` tool (the replacement that removes the `oldText` requirement)
-- [ ] Add duplicate detection / hash-based identification of code blocks
-- [ ] Add session-keepalive (reuse gopls connection across multiple sessions)
+- References may fail for symbols LSP servers don't fully resolve
+- Call hierarchy may not be supported by all LSP servers
+
+## Future work
+
+- [ ] Add more LSP servers (pyright, clangd, etc.)
+- [ ] Incremental index rebuild (only re-index changed files)
+- [ ] Session keepalive (reuse LSP connection across multiple sessions)
