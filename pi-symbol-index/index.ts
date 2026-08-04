@@ -91,7 +91,6 @@ let config: Config | null = null;
 let extensionPath: string = "";
 
 async function loadConfig(extPath: string): Promise<Config> {
-  console.log(`[DEBUG] loadConfig called with extPath=${extPath}`);
   if (config) return config;
   const configPath = path.join(extPath, "pi-symbol-index.json");
   try {
@@ -222,7 +221,6 @@ async function extractSymbolsFromLsp(
       capabilities: { textDocument: { documentSymbol: {}, references: {}, callHierarchy: {} }, workspace: { symbol: {} } },
     }) as any;
   } catch (e: any) {
-    console.log(`[pi_symbol_index] initialize: ${e.message}`);
   }
 
   client.connection.sendNotification("initialized", {});
@@ -246,11 +244,8 @@ async function extractSymbolsFromLsp(
           const loc = s.location || s;
           const range = loc.range || loc;
           if (range.start?.line != null) {
-            console.log(`[DEBUG] extractSymbolsFromLsp: ${s.name} kind=${s.kind} (type=${typeof s.kind})`);
-            console.log(`[DEBUG] extractSymbolsFromLsp: symbolKindMap keys=${JSON.stringify(Object.keys(symbolKindMap))}`);
             // Reverse lookup: find the string key for the numeric SymbolKind value
             const kindKey = Object.keys(SymbolKind).find(k => SymbolKind[k] === s.kind) || String(s.kind);
-            console.log(`[DEBUG] extractSymbolsFromLsp: kindKey=${kindKey}, mapped=${symbolKindMap[kindKey.toLowerCase()]}`);
             fileSymbols.push({
               name: s.name,
               kind: symbolKindMap[kindKey.toLowerCase()] ?? symbolKindMap[kindKey] ?? "unknown",
@@ -332,10 +327,8 @@ async function extractSymbolsFromLsp(
         } catch {}
       }
 
-      console.log(`[DEBUG] extractSymbolsFromLsp: file=${file}, fileSymbols.length=${fileSymbols.length}`);
       result[file] = { status: "ok", symbols: fileSymbols };
     } catch (e: any) {
-      console.log(`[pi_symbol_index] Error processing ${file}: ${e.message}`);
       result[file] = { status: "broken", symbols: [] };
     }
   }
@@ -471,24 +464,17 @@ async function extractSymbolsFromTsProgram(
 // =========================================
 
 async function detectLanguage(workspaceFolder: string): Promise<LanguageConfig | null> {
-  console.log(`[DEBUG] detectLanguage: extPath=${extensionPath}, workspace=${workspaceFolder}`);
   const cfg = await loadConfig(extensionPath);
-  console.log(`[DEBUG] detectLanguage: cfg.languages=${JSON.stringify(Object.keys(cfg.languages))}`);
   for (const [name, lang] of Object.entries(cfg.languages)) {
-    console.log(`[DEBUG] detectLanguage: name=${name}, detect=[${lang.detect.join(', ')}]`);
     try {
       for (const f of lang.detect) {
         const fp = path.join(workspaceFolder, f);
-        console.log(`[DEBUG] detectLanguage: trying access(${fp})`);
         await fs.access(fp);
-        console.log(`[DEBUG] detectLanguage: FOUND ${name}`);
         return lang;
       }
     } catch (e) {
-      console.log(`[DEBUG] detectLanguage: access failed for ${name}: ${e.message}`);
     }
   }
-  console.log(`[DEBUG] detectLanguage: no language found, returning null`);
   return null;
 }
 
@@ -501,7 +487,6 @@ export async function buildIndex(target?: string, extPath?: string): Promise<voi
   const workspaceFolder = target || (await getWorkspace());
   const langConfig = await detectLanguage(workspaceFolder);
   if (!langConfig) {
-    console.log("[pi_symbol_index] No supported language detected");
     return;
   }
 
@@ -510,43 +495,32 @@ export async function buildIndex(target?: string, extPath?: string): Promise<voi
 
   // Try LSP server first
   try {
-    console.log(`[DEBUG] buildIndex: server=${langConfig.server}`);
     const serverPath = await findServer(langConfig.server, workspaceFolder);
-    console.log(`[DEBUG] buildIndex: serverPath=${serverPath}`);
     if (serverPath) {
       // Find files
       let files: string[] = [];
       for (const ext of langConfig.extensions) {
         files = files.concat(await findFilesByExt(workspaceFolder, ext));
       }
-      console.log(`[DEBUG] buildIndex: files=[${files.join(', ')}]`);
       if (files.length > 0) {
-        console.log(`[pi_symbol_index] Indexing for ${langConfig.server} in ${workspaceFolder}`);
-        console.log(`[pi_symbol_index] Found ${files.length} files`);
         const client = await buildLspClient(serverPath, langConfig.args, workspaceFolder, langConfig.env || {});
         symbols = await extractSymbolsFromLsp(client, workspaceFolder, files, langConfig.symbolKindMap);
         symbolKindMap = langConfig.symbolKindMap;
       }
     }
   } catch (e: any) {
-    console.log(`[pi_symbol_index] LSP failed: ${e.message}`);
   }
 
   // Fallback to compiler API
-  console.log(`[DEBUG] buildIndex: symbols=${JSON.stringify(Object.keys(symbols || {}))}`);
   if (!symbols || Object.keys(symbols).length === 0) {
-    console.log(`[DEBUG] buildIndex: entering fallback`);
     if (langConfig.server === "typescript-language-server") {
-      console.log(`[DEBUG] buildIndex: falling back to TS compiler API`);
       const tsFiles = await listTsFiles(workspaceFolder);
-      console.log(`[DEBUG] buildIndex: TS files=[${tsFiles.join(', ')}]`);
       symbols = await extractSymbolsFromTsProgram(workspaceFolder, tsFiles, langConfig.symbolKindMap);
       symbolKindMap = langConfig.symbolKindMap;
     }
   }
 
   if (!symbols || Object.keys(symbols).length === 0) {
-    console.log("[pi_symbol_index] No symbols extracted");
     return;
   }
 
@@ -554,9 +528,7 @@ export async function buildIndex(target?: string, extPath?: string): Promise<voi
   let totalSymbols = 0;
   for (const key of Object.keys(symbols)) {
     totalSymbols += symbols[key].symbols.length;
-    console.log(`[DEBUG] buildIndex: ${key} has ${symbols[key].symbols.length} symbols`);
   }
-  console.log(`[DEBUG] buildIndex: total symbols=${totalSymbols}`);
 
   // Build block index and detect duplicates
   const blocks: BlockIndex[] = [];
@@ -598,7 +570,6 @@ export async function buildIndex(target?: string, extPath?: string): Promise<voi
   const indexDirPath = path.join(workspaceFolder, INDEX_DIR);
   if (!await fs.access(indexDirPath).catch(() => false)) await fs.mkdir(indexDirPath, { recursive: true });
   await fs.writeFile(indexPath, JSON.stringify(index, null, 2));
-  console.log(`[pi_symbol_index] Wrote ${INDEX_DIR}/${INDEX_FILE}`);
 }
 
 async function findServer(serverName: string, workspaceFolder: string): Promise<string | null> {
@@ -778,7 +749,7 @@ export default function (pi: ExtensionAPI): void {
 
   pi.registerTool("pi_detect_duplicates", {
     label: "Detect Duplicate Code Blocks",
-    description: 'Find code blocks that have identical hashes across the project.',
+    description: 'Find code blocks that have identical full SHA256 hashes across the project — these are likely copied code.',
     parameters: Type.Object({
       file: Type.Optional(Type.String({ description: "Optional file path to limit search." })),
     }),
@@ -788,12 +759,12 @@ export default function (pi: ExtensionAPI): void {
       const index = await readIndex();
       if (!index) throw new Error("No index found. Run pi_symbol_build first.");
       const blocks = params?.file ? index.blocks.filter(b => b.file === params.file) : index.blocks;
-      // Group by shortId
+      // Group by full SHA256 hash for accurate duplicate detection
       const groups: Record<string, string[]> = {};
       for (const b of blocks) {
-        if (!b.shortId) continue;
-        if (!groups[b.shortId]) groups[b.shortId] = [];
-        groups[b.shortId].push(`${b.file}:${b.startLine}-${b.endLine}`);
+        if (!b.hash) continue;
+        if (!groups[b.hash]) groups[b.hash] = [];
+        groups[b.hash].push(`${b.file}:${b.startLine}-${b.endLine}`);
       }
       const duplicates = Object.entries(groups).filter(([_, locs]) => locs.length > 1);
       return { content: [{ type: "text", text: JSON.stringify(duplicates, null, 2) }] };
