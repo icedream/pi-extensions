@@ -140,8 +140,7 @@ let resolvedCwd: string = "";
 
 async function getWorkspace(): Promise<string> {
   if (resolvedCwd) return resolvedCwd;
-  const { execSync } = await import("node:child_process");
-  resolvedCwd = execSync("pwd").toString().trim();
+  resolvedCwd = process.cwd();
   return resolvedCwd;
 }
 
@@ -342,6 +341,8 @@ async function extractSymbolsFromLsp(
   }
 
   try { client.connection.dispose(); } catch {}
+  // Also terminate the subprocess in case dispose didn't clean it up
+  try { client.proc.kill(); } catch {}
   return result;
 }
 
@@ -422,7 +423,10 @@ async function extractSymbolsFromTsProgram(
     const allFiles = program.getSourceFiles().filter((f: any) => !f.isDeclarationFile);
     const walk = (node: any, parent: any = null) => {
       try {
-        if (node.name && (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node) || ts.isClassDeclaration(node) || ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node) || ts.isEnumDeclaration(node))) {
+        const isNamed = node.name && (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node) || ts.isClassDeclaration(node) || ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node) || ts.isEnumDeclaration(node));
+        // Also capture arrow functions and function expressions
+        const isExpr = (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) && node.name === undefined;
+        if (isNamed || isExpr) {
           const sourceFile = node.getSourceFile();
           if (!sourceFile) return;
           const fileName = path.relative(workspaceFolder, sourceFile.fileName);
@@ -438,9 +442,10 @@ async function extractSymbolsFromTsProgram(
             if (p.name && p.name.text) { container = p.name.text; break; }
             p = (p as any)._parent;
           }
+          const name = isExpr ? "<anonymous>" : node.name.text;
           result[fileName].symbols.push({
-            name: node.name.text,
-            kind: symbolKindMap[String(ts.SyntaxKind[node.kind])] ?? "unknown",
+            name,
+            kind: isExpr ? "function" : symbolKindMap[String(ts.SyntaxKind[node.kind])] ?? "unknown",
             file: fileName,
             lineRange: [startLine, endLine],
             container,
@@ -604,11 +609,11 @@ async function findServer(serverName: string, workspaceFolder: string): Promise<
   try { await fs.access(localBinWin); return localBinWin; } catch {}
   // Then check PATH
   try {
-    const { exec } = await import("node:child_process");
+    const { execFile } = await import("node:child_process");
     return new Promise((resolve) => {
-      exec(`which ${serverName}`, { timeout: 5000 }, (err, stdout) => {
+      execFile("which", [serverName], { timeout: 5000 }, (err, stdout) => {
         if (err) resolve(null);
-        else resolve(stdout.trim());
+        else resolve(stdout.toString().trim());
       });
     });
   } catch {
@@ -738,15 +743,18 @@ export default function (pi: ExtensionAPI): void {
       if (!index) throw new Error("No symbol index found. Run pi_symbol_build first.");
       const block = index.blocks.find(b => b.file === params.file && b.shortId === params.shortId);
       if (!block) throw new Error(`Block shortId ${params.shortId} not found or file ${params.file} doesn't exist.`);
+      // Security: validate resolved path stays within workspace
+      const resolvedPath = path.resolve(path.join(workspaceFolder, params.file));
+      if (!resolvedPath.startsWith(workspaceFolder)) throw new Error("File path escapes workspace directory.");
       let liveText: string;
-      try { liveText = await fs.readFile(path.join(await getWorkspace(), params.file), "utf-8"); } catch (e) { throw new Error(`Failed to read ${params.file}: ${(e as any).message}`); }
+      try { liveText = await fs.readFile(resolvedPath, "utf-8"); } catch (e) { throw new Error(`Failed to read ${params.file}: ${(e as any).message}`); }
       const liveLines = liveText.split("\n");
       const currentBlockText = liveLines.slice(block.startLine - 1, block.endLine).join("\n") + "\n";
       const currentHash = sha256(currentBlockText);
       if (currentHash !== block.hash) throw new Error(`Block hash mismatch (file changed externally). Expected ${block.hash.slice(0, 8)}, got ${currentHash.slice(0, 8)}.`);
       const newLines = params.newText.split("\n");
       const newFileContent = [...liveLines.slice(0, block.startLine - 1), ...newLines, ...liveLines.slice(block.endLine)].join("\n");
-      await fs.writeFile(path.join(await getWorkspace(), params.file), newFileContent);
+      await fs.writeFile(resolvedPath, newFileContent);
       return { content: [{ type: "text", text: `Block replaced at ${params.file}:${block.startLine}-${block.endLine}` }] };
     },
   });
