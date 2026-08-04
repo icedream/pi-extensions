@@ -90,30 +90,17 @@ To add a new language, just add an entry to the config file — no code changes 
 
 ## Architecture
 
+```mermaid
+graph LR
+    A[Extension] --> B[LSP Server\ngopls/rust-analyzer/...]
+    A --> C[TS Compiler API]
+    B --> D[symbols.json]
+    C --> D
 ```
-Extension → LSP server (gopls, rust-analyzer, etc.)
-            ↘ Compiler API (TypeScript)
-            ↘ index.ts/symbols.json (persisted)
-```
-
-- Uses `vscode-jsonrpc` for stdio transport (no raw protocol)
-- Uses `vscode-languageserver-types` for LSP data structures
-- LSP server spawns a subprocess per build
-- `textDocument/documentSymbol` + `textDocument/references` are the key LSP methods
-- Error-tolerant: server responses like "no identifier found" are handled silently
 
 ### TypeScript Support
 
 TypeScript uses the compiler API (`ts.createProgram`) instead of LSP, because `typescript-language-server` requires a `tsserver` binary which Linux TypeScript packages don't ship.
-
-## Dependencies
-
-| Package | Version | Role |
-|---------|---------|------|
-| `vscode-jsonrpc` | ^9.0.1 | LSP JSON-RPC over stdio |
-| `vscode-languageserver-types` | ^3.18.0 | LSP type definitions |
-| `@sinclair/typebox` | ^0.34.4 | Tool parameter schemas |
-| `@earendil-works/pi-coding-agent` | ^0.1.0 | `ExtensionAPI` type |
 
 ## Development
 
@@ -131,7 +118,7 @@ timeout 90 pi -p 'Run pi_symbol_build. Then run pi_project_symbols.'
 
 ## Tests
 
-16 unit tests covering:
+17 unit tests covering:
 - Index build/read (Go and TypeScript)
 - Symbol extraction (functions, classes, structs, interfaces)
 - Line ranges and usages
@@ -148,5 +135,4 @@ timeout 90 pi -p 'Run pi_symbol_build. Then run pi_project_symbols.'
 ## Future work
 
 - [ ] Add more LSP servers (pyright, clangd, etc.)
-- [ ] Incremental index rebuild (only re-index changed files)
 - [ ] Session keepalive (reuse LSP connection across multiple sessions)
