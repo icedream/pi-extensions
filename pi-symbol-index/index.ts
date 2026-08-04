@@ -347,6 +347,111 @@ async function extractSymbolsFromLsp(
   return result;
 }
 
+// Per-file LSP extraction
+async function extractSymbolsFromLspForFile(
+  client: LspClient,
+  workspaceFolder: string,
+  filePath: string,
+  symbolKindMap: Record<string, string>,
+): Promise<IndexSymbol[]> {
+  const fullFilePath = path.join(workspaceFolder, filePath);
+  const fileUri = `file://${fullFilePath}`;
+  try {
+    const text = await fs.readFile(fullFilePath, "utf-8");
+    client.connection.sendNotification("textDocument/didOpen", {
+      textDocument: { uri: fileUri, languageId: getLangId(filePath), version: 1, text },
+    });
+
+    const symbols: any = await client.connection.sendRequest("textDocument/documentSymbol", {
+      textDocument: { uri: fileUri },
+    });
+
+    const result: IndexSymbol[] = [];
+    if (Array.isArray(symbols)) {
+      for (const s of symbols) {
+        const loc = s.location || s;
+        const range = loc.range || loc;
+        if (range.start?.line != null) {
+          const kindKey = Object.keys(SymbolKind).find(k => SymbolKind[k] === s.kind) || String(s.kind);
+          result.push({
+            name: s.name,
+            kind: symbolKindMap[kindKey.toLowerCase()] ?? symbolKindMap[kindKey] ?? "unknown",
+            file: filePath,
+            lineRange: [range.start.line + 1, range.end.line + 1],
+            container: s.containerName || undefined,
+            usages: [],
+            incomingCalls: [],
+            outgoingCalls: [],
+          });
+        }
+      }
+    }
+    return result;
+  } catch {
+    return [];
+  }
+}
+
+// =========================================
+// Per-file TypeScript extraction (no tree walk)
+// =========================================
+
+async function extractSymbolsFromTsFile(workspaceFolder: string, filePath: string, symbolKindMap: Record<string, string>): Promise<IndexSymbol[]> {
+  const fullFilePath = path.join(workspaceFolder, filePath);
+  try {
+    const text = await fs.readFile(fullFilePath, "utf-8");
+  } catch {
+    return [];
+  }
+
+  let tsModule: any;
+  try {
+    tsModule = await import(path.join(workspaceFolder, "node_modules", "typescript"));
+  } catch {
+    tsModule = await import("typescript");
+  }
+  if (!tsModule || !tsModule.createProgram) return [];
+  const ts = tsModule.default || tsModule;
+
+  const program = ts.createProgram({
+    rootNames: [fullFilePath],
+    options: { allowJs: true, skipLibCheck: true, noEmit: true },
+    host: ts.createCompilerHost({ allowJs: true, skipLibCheck: true }, true),
+  });
+
+  const sf = program.getSourceFile(fullFilePath);
+  if (!sf) return [];
+
+  const symbols: IndexSymbol[] = [];
+  const walk = (node: any) => {
+    try {
+      if (!node || !node.getStart) return;
+      const isNamed = node.name && (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node) || ts.isClassDeclaration(node) || ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node) || ts.isEnumDeclaration(node));
+      const isExpr = (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) && node.name === undefined;
+      if (isNamed || isExpr) {
+        const start = node.getStart(sf);
+        const end = node.getEnd();
+        const startLine = sf.getLineAndCharacterOfPosition(start).line + 1;
+        const endLine = sf.getLineAndCharacterOfPosition(end).line + 1;
+        let kind = "unknown";
+        if (ts.isFunctionDeclaration(node)) kind = "function";
+        else if (ts.isMethodDeclaration(node)) kind = "method";
+        else if (ts.isClassDeclaration(node)) kind = "class";
+        else if (ts.isInterfaceDeclaration(node)) kind = "interface";
+        else if (ts.isTypeAliasDeclaration(node)) kind = "type";
+        else if (ts.isEnumDeclaration(node)) kind = "enum";
+        else if (isExpr) kind = "function";
+        const name = node.name?.text || "<anonymous>";
+        symbols.push({ name, kind, file: filePath, lineRange: [startLine, endLine], container: undefined, usages: [], incomingCalls: [], outgoingCalls: [] });
+      }
+    } catch {}
+    try { for (const child of node.getChildren()) walk(child); } catch {}
+  };
+
+  walk(sf);
+  return symbols;
+}
+
 // =========================================
 // TypeScript compiler API extraction
 // =========================================
@@ -364,7 +469,7 @@ function getLangId(file: string): string {
 function findTsFilesInDir(dir: string, files: string[], seen: Set<string>): void {
   if (seen.has(dir)) return;
   seen.add(dir);
-  const skip = ["node_modules", "out", "dist", "_test", ".pi-index"];
+  const skip = ["node_modules", "out", "dist", "_test", ".pi-index", ".git"];
   try {
     const entries = fsSync.readdirSync(dir, { withFileTypes: true });
     for (const entry of entries) {
@@ -386,6 +491,53 @@ async function listTsFiles(workspaceFolder: string): Promise<string[]> {
   const seen = new Set<string>();
   findTsFilesInDir(workspaceFolder, files, seen);
   return files;
+}
+
+// Per-directory config detection — find configs in subdirectories and extract symbols
+interface DirConfig {
+  dir: string;
+  config: LanguageConfig;
+  files: string[];
+}
+
+async function findDirConfigs(workspaceFolder: string, langConfig: LanguageConfig): Promise<DirConfig[]> {
+  const results: DirConfig[] = [];
+  const skip = ["node_modules", "out", "dist", "_test", ".pi-index", ".git"];
+  const walk = (dir: string) => {
+    try {
+      const entries = fsSync.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (skip.includes(entry.name)) continue;
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          // Check for config file in this directory
+          for (const f of langConfig.detect) {
+            try {
+              fsSync.accessSync(path.join(fullPath, f));
+              // Found config — collect files in this directory
+              const files: string[] = [];
+              const collectFiles = (d: string) => {
+                try {
+                  const subEntries = fsSync.readdirSync(d, { withFileTypes: true });
+                  for (const se of subEntries) {
+                    if (se.isFile() && langConfig.extensions.some(ext => se.name.endsWith(ext))) {
+                      files.push(path.relative(workspaceFolder, path.join(d, se.name)));
+                    }
+                  }
+                } catch {}
+              };
+              collectFiles(fullPath);
+              results.push({ dir: fullPath, config: langConfig, files });
+              break;
+            } catch {}
+          }
+          walk(fullPath);
+        }
+      }
+    } catch {}
+  };
+  walk(workspaceFolder);
+  return results;
 }
 
 async function extractSymbolsFromTsProgram(
@@ -520,10 +672,12 @@ export async function buildIndex(target?: string, extPath?: string, hooks?: Rebu
   } catch (e: any) {
   }
 
-  // Fallback to compiler API
+  // Fallback to compiler API for TS
   if (!symbols || Object.keys(symbols).length === 0) {
     if (langConfig.server === "typescript-language-server") {
-      const tsFiles = await listTsFiles(workspaceFolder);
+      const tsFiles: string[] = [];
+      const seenSet = new Set<string>();
+      findTsFilesInDir(workspaceFolder, tsFiles, seenSet);
       symbols = await extractSymbolsFromTsProgram(workspaceFolder, tsFiles, langConfig.symbolKindMap);
       symbolKindMap = langConfig.symbolKindMap;
     }
@@ -687,6 +841,7 @@ export default function (pi: ExtensionAPI): void {
     description: "Look up a symbol by exact name in the index. Returns file location, line range, type, usages, and call hierarchy.",
     parameters: Type.Object({
       name: Type.String({ description: "Exact symbol name to look up." }),
+      file: Type.Optional(Type.String({ description: "Optional file path to extract symbols for on-demand." })),
     }),
     execute: async (_id, params, _signal, _onUpdate, ctx) => {
       if (!params?.name) throw new Error("Missing name parameter.");
@@ -698,7 +853,11 @@ export default function (pi: ExtensionAPI): void {
           ctx.ui.notify(`Symbol index rebuilt: ${stats.symbols} symbols in ${stats.files} files`, "info");
         },
       };
-      await ensureIndex(workspaceFolder, hooks);
+      if (params.file) {
+        await ensureIndex(workspaceFolder, hooks, params.file);
+      } else {
+        await ensureIndex(workspaceFolder, hooks);
+      }
       const index = await readIndex();
       if (!index) throw new Error("No index found. Run symbol_index_build first.");
       const found: IndexSymbol[] = [];
@@ -846,8 +1005,73 @@ export default function (pi: ExtensionAPI): void {
   let _indexBuilt = false;
   let _indexBuiltFolder = "";
 
-  async function ensureIndex(workspaceFolder: string, hooks?: RebuildHooks): Promise<void> {
+  async function ensureIndex(workspaceFolder: string, hooks?: RebuildHooks, targetFile?: string): Promise<void> {
     const indexPath = path.join(workspaceFolder, INDEX_DIR, INDEX_FILE);
+
+    // If a specific file is targeted, extract its symbols on-demand
+    if (targetFile) {
+      const index = await readIndex(workspaceFolder);
+      if (index?.files[targetFile]) {
+        // Check staleness
+        const storedMtime = index.buildMtimes?.[targetFile];
+        if (storedMtime) {
+          try {
+            const stat = await fs.stat(path.join(workspaceFolder, targetFile));
+            if (stat.mtimeMs <= storedMtime) {
+              _indexBuilt = true;
+              _indexBuiltFolder = workspaceFolder;
+              return; // Up to date
+            }
+          } catch {}
+        }
+      }
+      // Extract symbols for this file
+      const langConfig = await detectLanguage(workspaceFolder);
+      if (langConfig) {
+        hooks?.onStart?.();
+        if (langConfig.server === "typescript-language-server") {
+          const symbols = await extractSymbolsFromTsFile(workspaceFolder, targetFile, langConfig.symbolKindMap);
+          if (!index) {
+            await buildIndex(workspaceFolder, undefined, hooks);
+          }
+          const updatedIndex = await readIndex(workspaceFolder);
+          if (updatedIndex) {
+            updatedIndex.files[targetFile] = { status: symbols.length > 0 ? "ok" : "broken", symbols };
+            // Update mtime
+            try {
+              const stat = await fs.stat(path.join(workspaceFolder, targetFile));
+              updatedIndex.buildMtimes[targetFile] = stat.mtimeMs;
+            } catch {}
+            await fs.writeFile(indexPath, JSON.stringify(updatedIndex, null, 2));
+          }
+          hooks?.onDone?.({ files: Object.keys(updatedIndex?.files || {}).length, symbols: updatedIndex?.blocks?.length || 0 });
+        } else {
+          const serverPath = await findServer(langConfig.server, workspaceFolder);
+          if (serverPath) {
+            const client = await buildLspClient(serverPath, langConfig.args, workspaceFolder, langConfig.env || {});
+            const symbols = await extractSymbolsFromLspForFile(client, workspaceFolder, targetFile, langConfig.symbolKindMap);
+            if (!index) {
+              await buildIndex(workspaceFolder, undefined, hooks);
+            }
+            const updatedIndex = await readIndex(workspaceFolder);
+            if (updatedIndex) {
+              updatedIndex.files[targetFile] = { status: symbols.length > 0 ? "ok" : "broken", symbols };
+              try {
+                const stat = await fs.stat(path.join(workspaceFolder, targetFile));
+                updatedIndex.buildMtimes[targetFile] = stat.mtimeMs;
+              } catch {}
+              await fs.writeFile(indexPath, JSON.stringify(updatedIndex, null, 2));
+            }
+            hooks?.onDone?.({ files: Object.keys(updatedIndex?.files || {}).length, symbols: updatedIndex?.blocks?.length || 0 });
+          } else {
+            hooks?.onDone?.({ files: 0, symbols: 0 });
+          }
+        }
+      }
+      _indexBuilt = true;
+      _indexBuiltFolder = workspaceFolder;
+      return;
+    }
 
     // Check if index exists
     let indexStat: fsSync.Stats;
@@ -865,7 +1089,7 @@ export default function (pi: ExtensionAPI): void {
     }
 
     // Read index to check staleness
-    const index = await readIndex();
+    const index = await readIndex(workspaceFolder);
     if (!index) {
       // Index file exists but is corrupt, rebuild
       const langConfig = await detectLanguage(workspaceFolder);
