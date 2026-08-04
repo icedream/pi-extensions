@@ -1,0 +1,94 @@
+{
+  "languages": {
+    "go": {
+      "server": "gopls",
+      "args": ["serve"],
+      "env": { "GOFLAGS": "" },
+      "detect": ["go.mod"],
+      "extensions": [".go"],
+      "symbolKindMap": {
+        "function": "function",
+        "method": "method",
+        "interface": "interface",
+        "struct": "struct",
+        "type": "type",
+        "package": "package",
+        "const": "constant",
+        "var": "variable",
+        "field": "field",
+        "label": "label"
+      }
+    },
+    "rust": {
+      "server": "rust-analyzer",
+      "args": ["--stdio"],
+      "detect": ["Cargo.toml"],
+      "extensions": [".rs"],
+      "symbolKindMap": {
+        "function": "function",
+        "method": "method",
+        "struct": "struct",
+        "enum": "enum",
+        "enum_variant": "enum_variant",
+        "constant": "constant",
+        "trait": "interface",
+        "module": "module",
+        "type_parameter": "type_parameter",
+        "macro_rules": "macro"
+      }
+    },
+    "python": {
+      "server": "pyright",
+      "args": ["--stdio"],
+      "detect": ["pyproject.toml", "setup.py", "setup.cfg", "Pipfile"],
+      "extensions": [".py", ".pyi"],
+      "symbolKindMap": {
+        "function": "function",
+        "method": "method",
+        "class": "class",
+        "module": "module",
+        "constant": "constant",
+        "variable": "variable",
+        "parameter": "parameter",
+        "property": "property"
+      }
+    },
+    "c_cpp": {
+      "server": "clangd",
+      "args": [],
+      "detect": ["compile_commands.json", "Makefile", "CMakeLists.txt"],
+      "extensions": [".c", ".cpp", ".h", ".hpp", ".cc", ".cxx", ".hh", ".hxx", ".c++", ".hpp++", ".tcc"],
+      "symbolKindMap": {
+        "function": "function",
+        "method": "method",
+        "struct": "struct",
+        "class": "class",
+        "enum": "enum",
+        "typedef": "type",
+        "macro": "macro",
+        "namespace": "namespace",
+        "variable": "variable"
+      }
+    },
+    "typescript": {
+      "server": "typescript-language-server",
+      "args": ["--stdio"],
+      "detect": ["package.json", "tsconfig.json"],
+      "extensions": [".ts", ".tsx", ".js", ".jsx", ".mjs", ".mts"],
+      "symbolKindMap": {
+        "function": "function",
+        "method": "method",
+        "class": "class",
+        "interface": "interface",
+        "type": "type",
+        "enum": "enum",
+        "const": "constant",
+        "variable": "variable",
+        "parameter": "parameter",
+        "property": "property",
+        "module": "module",
+        "namespace": "namespace"
+      }
+    }
+  }
+}
