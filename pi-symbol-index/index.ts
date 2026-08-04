@@ -230,9 +230,12 @@ async function extractSymbolsFromLsp(
           if (range.start?.line != null) {
             console.log(`[DEBUG] extractSymbolsFromLsp: ${s.name} kind=${s.kind} (type=${typeof s.kind})`);
             console.log(`[DEBUG] extractSymbolsFromLsp: symbolKindMap keys=${JSON.stringify(Object.keys(symbolKindMap))}`);
+            // Reverse lookup: find the string key for the numeric SymbolKind value
+            const kindKey = Object.keys(SymbolKind).find(k => SymbolKind[k] === s.kind) || String(s.kind);
+            console.log(`[DEBUG] extractSymbolsFromLsp: kindKey=${kindKey}, mapped=${symbolKindMap[kindKey.toLowerCase()]}`);
             fileSymbols.push({
               name: s.name,
-              kind: symbolKindMap[String(s.kind)] ?? "unknown",
+              kind: symbolKindMap[kindKey.toLowerCase()] ?? symbolKindMap[kindKey] ?? "unknown",
               file,
               lineRange: [range.start.line + 1, range.end.line + 1],
               container: s.containerName || undefined,
@@ -284,7 +287,7 @@ async function extractSymbolsFromLsp(
                           .filter((c) => c?.from?.uri)
                           .map((c) => ({
                             name: c.from.name,
-                            kind: symbolKindMap[String(c.from.kind)] ?? "unknown",
+                            kind: symbolKindMap[SymbolKind[c.from.kind]?.toLowerCase() || String(c.from.kind)] ?? "unknown",
                             file: c.from.uri!.replace(/^file:\/\//, ""),
                             lineRange: [c.from.range.start.line + 1, c.from.range.end.line + 1],
                           }));
@@ -298,7 +301,7 @@ async function extractSymbolsFromLsp(
                           .filter((c) => c.to?.uri)
                           .map((c) => ({
                             name: c.to.name,
-                            kind: symbolKindMap[String(c.to.kind)] ?? "unknown",
+                            kind: symbolKindMap[SymbolKind[c.to.kind]?.toLowerCase() || String(c.to.kind)] ?? "unknown",
                             file: c.to.uri!.replace(/^file:\/\//, ""),
                             lineRange: [c.to.range.start.line + 1, c.to.range.end.line + 1],
                           }));
@@ -312,6 +315,7 @@ async function extractSymbolsFromLsp(
         } catch {}
       }
 
+      console.log(`[DEBUG] extractSymbolsFromLsp: file=${file}, fileSymbols.length=${fileSymbols.length}`);
       result[file] = { status: "ok", symbols: fileSymbols };
     } catch (e: any) {
       console.log(`[pi_symbol_index] Error processing ${file}: ${e.message}`);
@@ -572,6 +576,7 @@ export async function buildIndex(target?: string, extPath?: string): Promise<voi
   let totalSymbols = 0;
   for (const key of Object.keys(symbols)) {
     totalSymbols += symbols[key].symbols.length;
+    console.log(`[DEBUG] buildIndex: ${key} has ${symbols[key].symbols.length} symbols: ${symbols[key].symbols.map(s => s.name).join(', ')}`);
   }
   console.log(`[pi_symbol_index] Indexed ${totalSymbols} symbols across ${Object.keys(symbols).length} files`);
 

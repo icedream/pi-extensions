@@ -289,6 +289,15 @@ async function main(): Promise<void> {
     assertEq(tsIndex!.languages, ['typescript-language-server'], 'TS detected via config');
   });
 
+  // -- Test 16: config file exists in extension directory --
+  await run('config file exists in extension directory', async () => {
+    const configPath = path.join(__dirname, 'pi-symbol-index.json');
+    assert(await fs.access(configPath).then(() => true), 'pi-symbol-index.json exists');
+    const config = JSON.parse(await fs.readFile(configPath, 'utf-8'));
+    assert(Object.keys(config.languages).length >= 5, 'config has at least 5 languages');
+    assert('gopls' in config.languages || 'go' in config.languages, 'go config present');
+  });
+
   // -- Tear down --
   await cleanup();
 
