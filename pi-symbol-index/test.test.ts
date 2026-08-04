@@ -6,6 +6,7 @@
 // and a temporary TypeScript project.
 
 import { buildIndex, readIndex, INDEX_DIR } from './index.ts';
+import { crc32, toBase36 } from './index.ts';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -201,6 +202,9 @@ async function main(): Promise<void> {
       assert(block.hash.length >= 64, `${block.file}: hash is SHA256`);
       assertEq(typeof block.startLine, 'number', `${block.file}: startLine is number`);
       assertEq(typeof block.endLine, 'number', `${block.file}: endLine is number`);
+      assertEq(typeof block.shortId, 'string', `${block.file}: shortId is string`);
+      assert(block.shortId.length === 6, `${block.file}: shortId is 6 chars`);
+      assert(/^[0-9a-z]{6}$/.test(block.shortId), `${block.file}: shortId is lowercase alphanumeric (may have leading zeros)`);
       const textLines = (await fs.readFile(path.join(TEST_ROOT, block.file), 'utf-8')).split('\n');
       const blockText = textLines.slice(block.startLine - 1, block.endLine).join('\n') + '\n';
       const currentHash = sha256(blockText);

@@ -67,7 +67,8 @@ interface BlockIndex {
   file: string;
   startLine: number;
   endLine: number;
-  hash: string;
+  hash: string;          // Full SHA256 for internal desync detection
+  shortId: string;       // Base36 CRC32 (6 chars) for model use
 }
 
 interface LspClient {
@@ -150,6 +151,24 @@ async function getWorkspace(): Promise<string> {
 
 function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
+}
+
+export function crc32(text: string): number {
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < text.length; i++) {
+    crc ^= text.charCodeAt(i);
+    for (let j = 0; j < 8; j++) {
+      crc = (crc >>> 1) ^ (0xEDB88320 & (crc & 1) * 0xEDB88320);
+    }
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+export function toBase36(n: number): string {
+  // Mask to 30 bits (max 36^6 - 1 = 2,176,782,335) to guarantee 6 chars
+  n = n & 0x3FFFFFF;
+  const s = n.toString(36);
+  return s.padStart(6, '0');
 }
 
 // =========================================
@@ -553,7 +572,7 @@ export async function buildIndex(target?: string, extPath?: string): Promise<voi
       const textLines = (await fs.readFile(path.join(workspaceFolder, block.file), "utf-8")).split("\n");
       const blockText = textLines.slice(block.startLine - 1, block.endLine).join("\n") + "\n";
       block.hash = sha256(blockText);
-      block.shortId = block.hash.slice(0, 8);
+      block.shortId = toBase36(crc32(blockText));
     } catch {
       block.hash = "";
       block.shortId = "";
@@ -708,7 +727,7 @@ export default function (pi: ExtensionAPI): void {
     description: 'Replace a code block by short hash prefix. No "oldText" required — the extension finds the block by hash. If the hash check fails (file was modified externally), the operation is refused to prevent desync.',
     parameters: Type.Object({
       file: Type.String({ description: "Filename of the file to replace." }),
-      shortId: Type.String({ description: "Short block hash prefix (8 chars) to locate the block. Use pi_list_blocks to get block IDs." }),
+      shortId: Type.String({ description: "Short block ID (6 chars, base36 of CRC32) to locate the block. Use pi_list_blocks to get block IDs." }),
       newText: Type.String({ description: "The replacement text to insert." }),
     }),
     execute: async (_id, params) => {
