@@ -9,6 +9,59 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { createHash } from "node:crypto";
+
+// Lazy-import pi-coding-agent utilities (not available during local tests)
+let _withFileMutationQueue: typeof import("@earendil-works/pi-coding-agent")["withFileMutationQueue"] | null = null;
+let _generateDiffString: typeof import("@earendil-works/pi-coding-agent")["generateDiffString"] | null = null;
+let _generateUnifiedPatch: typeof import("@earendil-works/pi-coding-agent")["generateUnifiedPatch"] | null = null;
+
+async function getPiUtils() {
+  if (_withFileMutationQueue === null) {
+    try {
+      const pi = await import("@earendil-works/pi-coding-agent");
+      _withFileMutationQueue = pi.withFileMutationQueue;
+      _generateDiffString = pi.generateDiffString;
+      _generateUnifiedPatch = pi.generateUnifiedPatch;
+    } catch {
+      // Not in Pi environment — use fallbacks
+    }
+  }
+  return { withFileMutationQueue: _withFileMutationQueue, generateDiffString: _generateDiffString, generateUnifiedPatch: _generateUnifiedPatch };
+}
+
+// Simple local diff fallback (unified format)
+function simpleGenerateDiffString(oldStr: string, newStr: string): { diff: string; firstChangedLine: number } {
+  const oldLines = oldStr.split("\n");
+  const newLines = newStr.split("\n");
+  const diff: string[] = [];
+  let firstChangedLine = 1;
+  let foundChange = false;
+  let i = 0, j = 0;
+  while (i < oldLines.length || j < newLines.length) {
+    if (i < oldLines.length && j < newLines.length && oldLines[i] === newLines[j]) {
+      diff.push(" " + oldLines[i]);
+      i++;
+      j++;
+    } else {
+      if (!foundChange) { firstChangedLine = i + 1; foundChange = true; }
+      if (i < oldLines.length) {
+        diff.push("-" + oldLines[i]);
+        i++;
+      }
+      if (j < newLines.length) {
+        diff.push("+" + newLines[j]);
+        j++;
+      }
+    }
+  }
+  return { diff: diff.join("\n"), firstChangedLine };
+}
+
+function simpleGenerateUnifiedPatch(fileName: string, oldStr: string, newStr: string): string {
+  const diff = simpleGenerateDiffString(oldStr, newStr);
+  return `--- a/${fileName}\n+++ b/${fileName}\n${diff.diff}`;
+}
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
@@ -20,7 +73,6 @@ import {
 } from "vscode-jsonrpc/node";
 import type { Location } from "vscode-languageserver-types/node";
 import { SymbolKind } from "vscode-languageserver-types";
-import { createHash } from "node:crypto";
 
 // =========================================
 // Config types
@@ -949,16 +1001,61 @@ export default function (pi: ExtensionAPI): void {
       // Security: validate resolved path stays within workspace
       const resolvedPath = path.resolve(path.join(workspaceFolder, params.file));
       if (!resolvedPath.startsWith(workspaceFolder + path.sep)) throw new Error("File path escapes workspace directory.");
+
+      // Read current file for hash check and diff
       let liveText: string;
       try { liveText = await fs.readFile(resolvedPath, "utf-8"); } catch (e) { throw new Error(`Failed to read ${params.file}: ${(e as any).message}`); }
       const liveLines = liveText.split("\n");
       const currentBlockText = liveLines.slice(block.startLine - 1, block.endLine).join("\n") + "\n";
       const currentHash = sha256(currentBlockText);
       if (currentHash !== block.hash) throw new Error(`Block hash mismatch (file changed externally). Expected ${block.hash.slice(0, 8)}, got ${currentHash.slice(0, 8)}.`);
+
       const newLines = params.newText.split("\n");
       const newFileContent = [...liveLines.slice(0, block.startLine - 1), ...newLines, ...liveLines.slice(block.endLine)].join("\n");
-      await fs.writeFile(resolvedPath, newFileContent);
-      return { content: [{ type: "text", text: `Block replaced at ${params.file}:${block.startLine}-${block.endLine}` }] };
+
+      // Compute diff before writing (so the AI sees a colored diff)
+      const utils = await getPiUtils();
+      const diffFn = utils.generateDiffString || simpleGenerateDiffString;
+      const patchFn = utils.generateUnifiedPatch || simpleGenerateUnifiedPatch;
+      const diffResult = diffFn(liveText, newFileContent);
+      const patch = patchFn(params.file, liveText, newFileContent);
+
+      // Compute new hash/shortId for the replaced block
+      const newBlockHash = sha256(params.newText + "\n");
+      const newShortId = toBase36(crc32(params.newText + "\n"));
+
+      // Use mutation queue to safely write the file and update the index
+      const mqFn = utils.withFileMutationQueue;
+      if (mqFn) {
+        return mqFn(resolvedPath, async () => {
+          await fs.writeFile(resolvedPath, newFileContent);
+          // Update block hashes in the index for this file
+          const newIndex = await readIndex(workspaceFolder);
+          if (newIndex) {
+            const fileBlocks = newIndex.blocks.filter(b => b.file === params.file);
+            const newFileText = await fs.readFile(resolvedPath, "utf-8");
+            const newFileLines = newFileText.split("\n");
+            for (const fb of fileBlocks) {
+              const blockText = newFileLines.slice(fb.startLine - 1, fb.endLine).join("\n") + "\n";
+              fb.hash = sha256(blockText);
+              fb.shortId = toBase36(crc32(blockText));
+            }
+            const indexPath = path.join(workspaceFolder, INDEX_DIR, INDEX_FILE);
+            await fs.writeFile(indexPath, JSON.stringify(newIndex, null, 2));
+          }
+          return {
+            content: [{ type: "text", text: `Block replaced at ${params.file}:${block.startLine}-${block.endLine}. New shortId: ${newShortId}` }],
+            details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },
+          };
+        });
+      } else {
+        // Fallback without mutation queue (e.g. during tests)
+        await fs.writeFile(resolvedPath, newFileContent);
+        return {
+          content: [{ type: "text", text: `Block replaced at ${params.file}:${block.startLine}-${block.endLine}. New shortId: ${newShortId}` }],
+          details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },
+        };
+      }
     },
   });
 
