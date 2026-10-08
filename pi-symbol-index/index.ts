@@ -878,7 +878,11 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "symbol_index_build",
     label: "Build Symbol Index",
-    description: "Scan the project directory and build/update the symbol index.",
+    promptSnippet: "Force a full rebuild of the symbol index (optional; the other symbol_index tools refresh stale files themselves)",
+    promptGuidelines: [
+      "Only call symbol_index_build to force a full rebuild. The other symbol_index tools refresh stale files on their own, so do not call it before them.",
+    ],
+    description: "Force a full rebuild of the project symbol index. Optional: symbol_index_info, symbol_index_symbols, symbol_index_list_blocks, symbol_index_replace_block, and symbol_index_detect_duplicates already refresh stale files before they run.",
     parameters: Type.Object({
       target: Type.Optional(Type.String({ description: "Target directory to index. Defaults to current workspace." })),
     }),
@@ -899,11 +903,14 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "symbol_index_info",
     label: "Symbol Info",
-    description: "Look up a symbol by exact name in the index. Returns file location, line range, type, usages, and call hierarchy.\n\nBefore using this tool, call symbol_index_build first to ensure the index is up-to-date. If you're working with a specific file that isn't indexed yet, pass its path as the 'file' parameter to extract it on-demand.",
+    promptSnippet: "Find where a function, method, type, or struct is defined, with its body, usages, and callers, by exact name. Prefer this over grep for symbol definitions.",
+    description: "Look up a code symbol by exact name in the symbol index. Returns every match with file, line range, container, functionBody, usages, and incoming/outgoing calls. Use this instead of grep to find where a function, method, struct, class, or interface is defined, or what calls it. Pass 'file' to index one file on demand.",
     promptGuidelines: [
-      "Always run symbol_index_build first before using symbol_index_info, symbol_index_replace_block, or symbol_index_list_blocks.",
-      "Use symbol_index_info to look up a symbol's location before editing it.",
-      "If the index is stale or a file isn't indexed, pass the file path to symbol_index_info to extract it on-demand.",
+      "To find where a function, method, or type is defined or called, call symbol_index_info before grep or reading whole files. Use grep only for non-symbol text such as strings, comments, and config keys.",
+      "Read a symbol's code from the functionBody field of symbol_index_info results instead of reading the whole file.",
+      "Pass the name exactly as the index stores it: Go methods are stored with their receiver, e.g. '(*Calculator).Run'. If a lookup returns [], check the stored name with symbol_index_symbols, then fall back to grep.",
+      "Before changing a function or method, call symbol_index_info for its exact line range and usages. Usages can be incomplete, so grep for references before renaming or changing a signature.",
+      "If symbol_index_info reports no index, the language may be unsupported or its language server missing. Use grep and read instead.",
     ],
     parameters: Type.Object({
       name: Type.String({ description: "Exact symbol name to look up." }),
@@ -945,7 +952,11 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "symbol_index_symbols",
     label: "Project Symbols",
-    description: "List all indexed symbols organized by file.",
+    promptSnippet: "Overview of indexed type and function names, grouped by file (names only, no line numbers)",
+    promptGuidelines: [
+      "Use symbol_index_symbols for a project overview, or to find which file holds a feature, before opening files. It lists names only, so use symbol_index_info for locations.",
+    ],
+    description: "List the project's indexed symbols grouped by file: type and struct names, and function and method names, per file. Use it for an overview of unfamiliar code or to find which file holds a feature. It has no line numbers; use symbol_index_info for locations and bodies.",
     parameters: Type.Object({}),
     execute: async (_id, _params, _signal, _onUpdate, ctx) => {
       const workspaceFolder = await getWorkspace();
@@ -973,10 +984,11 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "symbol_index_replace_block",
     label: "Replace Code Block",
-    description: 'Replace a code block by short hash prefix. No "oldText" required — the extension finds the block by hash. If the hash check fails (file was modified externally), the operation is refused to prevent desync.\n\nBefore using this tool, call symbol_index_build first to ensure the block hashes are in the index.',
+    promptSnippet: "Replace one indexed code block by its shortId (hash-checked). Get shortIds from symbol_index_list_blocks.",
+    description: 'Replace a code block by short hash prefix. No "oldText" required — the extension finds the block by hash. If the hash check fails (file was modified externally), the operation is refused to prevent desync.\n\nThe index refreshes itself before the replacement, so no build step is needed. Get shortIds from symbol_index_list_blocks.',
     promptGuidelines: [
-      "Always run symbol_index_build first before using symbol_index_replace_block.",
-      "Use symbol_index_list_blocks to find the shortId of a block you want to replace.",
+      "Use symbol_index_list_blocks to get the shortId of the block to replace. Use symbol_index_replace_block when the change covers a whole symbol block. For small edits inside a block, use the edit tool.",
+      "A block is one symbol's full line range, so newText must be the complete replacement for that symbol, including its signature and closing lines.",
     ],
     parameters: Type.Object({
       file: Type.String({ description: "Filename of the file to replace." }),
@@ -1062,10 +1074,11 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "symbol_index_list_blocks",
     label: "List Blocks",
-    description: 'List all editable blocks in a file (or all files) with their short hash IDs.\n\nBefore using this tool, call symbol_index_build first.',
+    promptSnippet: "List editable code blocks (symbols) in a file with their shortIds, the input for symbol_index_replace_block",
     promptGuidelines: [
-      "Always run symbol_index_build first before using symbol_index_list_blocks.",
+      "Pass a file to symbol_index_list_blocks to get that file's shortIds instead of listing every block in the project.",
     ],
+    description: 'List all editable code blocks (symbols) in a file, or in all files, with their line ranges and short hash IDs. Use it to get the shortId for symbol_index_replace_block. The index refreshes itself, so no build step is needed.',
     parameters: Type.Object({
       file: Type.Optional(Type.String({ description: "Optional file path to filter blocks." })),
     }),
@@ -1090,10 +1103,8 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "symbol_index_detect_duplicates",
     label: "Detect Duplicate Code Blocks",
-    description: 'Find code blocks that have identical full SHA256 hashes across the project — these are likely copied code.\n\nBefore using this tool, call symbol_index_build first.',
-    promptGuidelines: [
-      "Always run symbol_index_build first before using symbol_index_detect_duplicates.",
-    ],
+    promptSnippet: "Find identical code blocks across the project (likely copy-pasted code)",
+    description: 'Find code blocks that have identical full SHA256 hashes across the project. These are likely copied code. The index refreshes itself, so no build step is needed.',
     parameters: Type.Object({
       file: Type.Optional(Type.String({ description: "Optional file path to limit search." })),
     }),
