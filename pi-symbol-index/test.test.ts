@@ -6,7 +6,7 @@
 // and a temporary TypeScript project.
 
 import { buildIndex, readIndex, INDEX_DIR } from './index.ts';
-import { crc32, toBase36, symbolNameMatches } from './index.ts';
+import { crc32, toBase36, symbolNameMatches, findIdentifierColumn } from './index.ts';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -305,6 +305,7 @@ async function main(): Promise<void> {
   // -- Test 17: per-file mtime tracking --
   await run('per-file mtime tracking', testPerFileMtime);
   await run('symbol name lookup matches Go receiver names', testSymbolNameMatches);
+  await run('identifier column skips longer words and receivers', testFindIdentifierColumn);
 
   // -- Tear down --
   await cleanup();
@@ -357,6 +358,14 @@ async function testSymbolNameMatches() {
   assert(!symbolNameMatches('(*Calculator).Run', 'Ru'), 'partial name does not match');
   assert(!symbolNameMatches('RunAll', 'Run'), 'longer name does not match');
   assert(!symbolNameMatches('(*Runner).Run', 'Calculator.Run'), 'other receiver does not match');
+}
+
+// Test 19: reference position must point at the identifier, not the start of the line
+async function testFindIdentifierColumn() {
+  assertEq(findIdentifierColumn('func (r *Runner) Run(x int) int {', 'Run'), 17, 'method name after receiver');
+  assertEq(findIdentifierColumn('func Run() {', 'Run'), 5, 'plain function name');
+  assertEq(findIdentifierColumn('func RunAll() {', 'Run'), -1, 'longer word is not a match');
+  assertEq(findIdentifierColumn('func (r *Runner) Stop() {', 'Run'), -1, 'receiver prefix is not a match');
 }
 
 

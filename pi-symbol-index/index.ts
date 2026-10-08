@@ -326,10 +326,12 @@ async function extractSymbolsFromLsp(
         try {
           // Use the LSP-provided position from documentSymbol
           const lineContent = (await fs.readFile(filePath, "utf-8")).split("\n")[sym.lineRange[0] - 1] || "";
-          const charIdx = lineContent.indexOf(sym.name);
+          // Go method names carry their receiver ("(*T).Run"); locate the bare identifier.
+          const charIdx = findIdentifierColumn(lineContent, receiverFreeName(sym.name));
+          const col = charIdx >= 0 ? charIdx : 0;
           const refs: Location[] = await client.connection.sendRequest("textDocument/references", {
             textDocument: { uri: fileUri },
-            position: { line: sym.lineRange[0] - 1, character: charIdx >= 0 ? charIdx : 0 },
+            position: { line: sym.lineRange[0] - 1, character: col },
             context: { includeDeclaration: false },
           }) as unknown as Location[];
           if (Array.isArray(refs)) {
@@ -344,7 +346,7 @@ async function extractSymbolsFromLsp(
             try {
               const chItems: any[] = await client.connection.sendRequest(
                 "textDocument/prepareCallHierarchy",
-                { textDocument: { uri: fileUri }, position: { line: sym.lineRange[0] - 1, character: charIdx } },
+                { textDocument: { uri: fileUri }, position: { line: sym.lineRange[0] - 1, character: col } },
               ) as any[];
               if (Array.isArray(chItems)) {
                 for (const item of chItems) {
@@ -875,6 +877,19 @@ export function symbolNameMatches(stored: string, query: string): boolean {
   if (receiverFreeName(stored) === query) return true;
   const m = stored.match(/^\(\*?([^)]+)\)\.(.+)$/);
   return m !== null && `${m[1]}.${m[2]}` === query;
+}
+
+// Column of `identifier` as a whole word in `line`, or -1. Skips longer words that contain it.
+export function findIdentifierColumn(line: string, identifier: string): number {
+  if (!identifier) return -1;
+  let idx = line.indexOf(identifier);
+  while (idx >= 0) {
+    const before = line[idx - 1] ?? "";
+    const after = line[idx + identifier.length] ?? "";
+    if (!/\w/.test(before) && !/\w/.test(after)) return idx;
+    idx = line.indexOf(identifier, idx + 1);
+  }
+  return -1;
 }
 
 // =========================================
