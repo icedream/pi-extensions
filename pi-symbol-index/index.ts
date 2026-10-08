@@ -8,7 +8,7 @@
 // just add a config entry and ensure the LSP server is installed.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 import { createHash } from "node:crypto";
 
 // Lazy-import pi-coding-agent utilities (not available during local tests)
