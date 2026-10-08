@@ -6,7 +6,7 @@
 // and a temporary TypeScript project.
 
 import { buildIndex, readIndex, INDEX_DIR } from './index.ts';
-import { crc32, toBase36 } from './index.ts';
+import { crc32, toBase36, symbolNameMatches } from './index.ts';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -304,6 +304,7 @@ async function main(): Promise<void> {
 
   // -- Test 17: per-file mtime tracking --
   await run('per-file mtime tracking', testPerFileMtime);
+  await run('symbol name lookup matches Go receiver names', testSymbolNameMatches);
 
   // -- Tear down --
   await cleanup();
@@ -344,6 +345,18 @@ func Add(a, b int) int {
   const index = await readIndex(testDir);
   assert(index, "index exists");
   assert(Object.keys(index.buildMtimes).length > 0, "buildMtimes populated");
+}
+
+// Test 18: Go methods are stored as "(*Recv).Name"; queries may use the bare name or "Recv.Name"
+async function testSymbolNameMatches() {
+  assert(symbolNameMatches('(*Calculator).Run', 'Run'), 'bare name matches method');
+  assert(symbolNameMatches('(*Calculator).Run', 'Calculator.Run'), 'Recv.Name matches method');
+  assert(symbolNameMatches('(*Calculator).Run', '(*Calculator).Run'), 'stored name matches itself');
+  assert(symbolNameMatches('Run', 'Run'), 'plain function matches');
+  assert(!symbolNameMatches('(*Calculator).Run', 'Calculator'), 'receiver alone does not match method');
+  assert(!symbolNameMatches('(*Calculator).Run', 'Ru'), 'partial name does not match');
+  assert(!symbolNameMatches('RunAll', 'Run'), 'longer name does not match');
+  assert(!symbolNameMatches('(*Runner).Run', 'Calculator.Run'), 'other receiver does not match');
 }
 
 

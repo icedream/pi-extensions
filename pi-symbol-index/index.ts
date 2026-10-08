@@ -864,6 +864,19 @@ export async function readIndex(target?: string): Promise<PiIndex | null> {
   }
 }
 
+// Go methods are stored with their receiver, e.g. "(*Calculator).Run".
+// A query matches the stored name, the receiver-free name ("Run"), or "Calculator.Run".
+export function receiverFreeName(name: string): string {
+  return name.replace(/^\([^)]*\)\./, "");
+}
+
+export function symbolNameMatches(stored: string, query: string): boolean {
+  if (stored === query) return true;
+  if (receiverFreeName(stored) === query) return true;
+  const m = stored.match(/^\(\*?([^)]+)\)\.(.+)$/);
+  return m !== null && `${m[1]}.${m[2]}` === query;
+}
+
 // =========================================
 // Pi tool registration
 // =========================================
@@ -936,7 +949,7 @@ export default function (pi: ExtensionAPI): void {
       const found: IndexSymbol[] = [];
       for (const file of Object.keys(index.files)) {
         for (const sym of index.files[file].symbols) {
-          if (sym.name === params.name) {
+          if (symbolNameMatches(sym.name, params.name)) {
             // Read function body if available
             const fullText = await fs.readFile(path.join(await getWorkspace(), file), "utf-8");
             const lines = fullText.split("\n");
