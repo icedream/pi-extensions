@@ -1,0 +1,16 @@
+{
+  "provider": "github-copilot",
+  "monthlyCapUsd": 150,
+  "thresholds": {
+    "nudge": 0.7,
+    "warn": 0.8,
+    "prepare": 0.95,
+    "divert": 1.0
+  },
+  "localModel": {
+    "provider": "<your-local-provider-name>",
+    "modelId": "<model-id>",
+    "subagentRef": "<provider>/<model-id as the subagent tool expects>"
+  },
+  "localSubagents": ["scout", "delegate", "Plan", "Explore"]
+}

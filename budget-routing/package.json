@@ -1,0 +1,20 @@
+{
+  "name": "pi-budget-routing",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Pi extension: monthly spend cap for one provider; nudges, prepares, and diverts to a local model",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test budget.test.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.1.0",
+    "@types/node": "^26.1.1",
+    "typescript": "^6.0.3"
+  }
+}

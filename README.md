@@ -9,4 +9,5 @@ While I personally use these, I only currently maintain them as I need to work w
 | Extension | Description |
 |-----------|-------------|
 | [pi-symbol-index](pi-symbol-index/) | Builds and exposes a symbol index for Go projects via `gopls` |
+| [budget-routing](budget-routing/) | Monthly spend cap for one provider: nudges, prepares, and diverts light subagents to a local model |
 
