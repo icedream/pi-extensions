@@ -53,6 +53,17 @@ test("spendSince sums only in-window assistant messages from the given provider"
 	assert.equal(await spendSince(dir, "github-copilot", since), 3.75);
 });
 
+test("spendSince skips subagent transcripts that duplicate child sessions", async () => {
+	const dir = await tmpSessions();
+	const now = Date.now();
+	await fs.mkdir(path.join(dir, "proj", "run-0"), { recursive: true });
+	await fs.mkdir(path.join(dir, "subagent-artifacts"));
+	// The same child message appears in the child session and in its transcript.
+	await fs.writeFile(path.join(dir, "proj", "run-0", "session.jsonl"), line("github-copilot", "assistant", now, 2));
+	await fs.writeFile(path.join(dir, "subagent-artifacts", "x_transcript.jsonl"), line("github-copilot", "assistant", now, 2));
+	assert.equal(await spendSince(dir, "github-copilot", monthStartMs()), 2);
+});
+
 test("spendSince returns 0 for a missing sessions directory", async () => {
 	assert.equal(await spendSince(path.join(os.tmpdir(), "does-not-exist-budget"), "github-copilot", 0), 0);
 });

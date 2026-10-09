@@ -91,8 +91,10 @@ async function* jsonlFiles(dir: string): AsyncGenerator<string> {
 	}
 	for (const e of entries) {
 		const p = join(dir, e.name);
-		if (e.isDirectory()) yield* jsonlFiles(p);
-		else if (e.isFile() && e.name.endsWith(".jsonl")) yield p;
+		if (e.isDirectory()) {
+			// Transcripts duplicate child sessions (run-0/session.jsonl); counting both doubles subagent spend.
+			if (e.name !== "subagent-artifacts") yield* jsonlFiles(p);
+		} else if (e.isFile() && e.name.endsWith(".jsonl")) yield p;
 	}
 }
 

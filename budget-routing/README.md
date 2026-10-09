@@ -42,7 +42,7 @@ npm run typecheck              # after npm install
 ## Limitations
 
 - Spend is Pi's estimate at API list prices, not the invoice. Calibrate against your billing page. The estimate can run a few percent off.
-- Subagent child sessions may not appear in the session logs, so the meter can undercount.
+- Subagent child sessions are counted from their own session files. Transcripts under `subagent-artifacts/` are skipped because they duplicate those files.
 - Divert sees top-level `subagent` launches and `tasks` arrays only. Launches inside workflow scripts are not rewritten.
 - `prepare` runs between agent runs. A single long run can jump from below `prepare` to `divert` without compacting first.
 - Local models have a smaller context window and cold-start slowly. Switching mid-task is risky.
