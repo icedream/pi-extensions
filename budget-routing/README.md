@@ -30,6 +30,7 @@ Path: `~/.pi/agent/budget-routing.json`, or the file in `PI_BUDGET_ROUTING_CONFI
 | `thresholds` | Fractions of the cap for `nudge`, `warn`, `prepare`, `divert`. Must not decrease |
 | `localModel` | `provider` and `modelId` for the main-session switch, plus `subagentRef`, the id the subagent tool accepts |
 | `localSubagents` | Agent names that may run locally at divert |
+| `observed` | Optional. The seat figure from the GitHub Copilot usage page: `creditsUsed` (as shown), `asOf` (ISO time you read it), and `usdPerCredit` (default `0.01`, i.e. 15,000 credits = $150). When `asOf` is in the current month, it replaces the meter as the baseline, and Pi spend since `asOf` is added on top. Update it whenever you check the page. An observation from another month is ignored with a warning. |
 
 ## Tests
 
@@ -41,7 +42,7 @@ npm run typecheck              # after npm install
 
 ## Limitations
 
-- Spend is Pi's estimate at API list prices, not the invoice. Calibrate against your billing page. The estimate can run a few percent off.
+- Spend is Pi's estimate at API list prices, not the invoice. Without `observed`, the meter sees only this machine's logs, so usage on other machines or in the IDE is missed and the estimate can read low. Recording the seat figure in `observed` closes that gap at each update.
 - Subagent child sessions are counted from their own session files. Transcripts under `subagent-artifacts/` are skipped because they duplicate those files.
 - Divert sees top-level `subagent` launches and `tasks` arrays only. Launches inside workflow scripts are not rewritten.
 - `prepare` runs between agent runs. A single long run can jump from below `prepare` to `divert` without compacting first.

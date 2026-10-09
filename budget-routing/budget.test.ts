@@ -8,6 +8,7 @@ import { utimes } from "node:fs/promises";
 import {
 	applyDivert,
 	DEFAULT_THRESHOLDS,
+	monthSpend,
 	monthStartMs,
 	parseConfig,
 	spendSince,
@@ -123,4 +124,40 @@ test("parseConfig rejects bad values with a clear message", () => {
 	assert.throws(() => parseConfig({ ...validRaw, localSubagents: [] }), /localSubagents/);
 	assert.throws(() => parseConfig({ ...validRaw, localModel: undefined }), /localModel is required/);
 	assert.throws(() => parseConfig(null), /JSON object/);
+});
+
+test("parseConfig validates the observed calibration and defaults usdPerCredit", () => {
+	const ok = parseConfig({ ...validRaw, observed: { creditsUsed: 8216, asOf: "2026-10-01T00:00:00Z" } });
+	assert.equal(ok.observed?.usdPerCredit, 0.01);
+	assert.equal(ok.observed?.asOfMs, Date.parse("2026-10-01T00:00:00Z"));
+	assert.throws(() => parseConfig({ ...validRaw, observed: { creditsUsed: -1, asOf: "2026-10-01T00:00:00Z" } }), /creditsUsed must be >= 0/);
+	assert.throws(() => parseConfig({ ...validRaw, observed: { creditsUsed: 1, asOf: "not a date" } }), /asOf must be an ISO date/);
+	assert.throws(() => parseConfig({ ...validRaw, observed: { creditsUsed: 1, usdPerCredit: 0, asOf: "2026-10-01T00:00:00Z" } }), /usdPerCredit must be positive/);
+});
+
+test("monthSpend: calibrated baseline plus Pi spend since asOf only", async () => {
+	const dir = await tmpSessions();
+	const now = new Date();
+	const asOf = Math.max(monthStartMs(now) + 1000, now.getTime() - 3_600_000);
+	await fs.mkdir(path.join(dir, "proj"));
+	await fs.writeFile(
+		path.join(dir, "proj", "s.jsonl"),
+		[
+			line("github-copilot", "assistant", asOf - 1000, 50), // before asOf: already in the seat figure
+			line("github-copilot", "assistant", now.getTime(), 1.5), // after asOf: added on top
+		].join("\n"),
+	);
+	const cfg = parseConfig({ ...validRaw, observed: { creditsUsed: 8216, asOf: new Date(asOf).toISOString() } });
+	const r = await monthSpend(cfg, dir, now);
+	assert.equal(r.source, "calibrated");
+	assert.equal(r.observationIgnored, false);
+	assert.ok(Math.abs(r.spend - (82.16 + 1.5)) < 1e-9, `got ${r.spend}`);
+});
+
+test("monthSpend: ignores an observation from a previous month", async () => {
+	const dir = await tmpSessions();
+	const cfg = parseConfig({ ...validRaw, observed: { creditsUsed: 8216, asOf: "2000-01-01T00:00:00Z" } });
+	const r = await monthSpend(cfg, dir, new Date());
+	assert.equal(r.source, "meter");
+	assert.equal(r.observationIgnored, true);
 });

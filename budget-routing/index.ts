@@ -15,7 +15,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { applyDivert, loadConfig, monthStartMs, spendSince, tierFor, type BudgetConfig, type Tier } from "./budget.ts";
+import { applyDivert, loadConfig, monthSpend, tierFor, type BudgetConfig, type MonthSpend, type Tier } from "./budget.ts";
 
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 const SESSIONS_DIR = join(AGENT_DIR, "sessions");
@@ -27,24 +27,26 @@ interface State {
 	pct: number;
 	spend: number;
 	cfg: BudgetConfig;
+	observationIgnored: boolean;
 }
 
-let cache: { at: number; provider: string; spend: number } | undefined;
+let cache: { at: number; key: string; result: MonthSpend } | undefined;
 
-async function cachedSpend(provider: string): Promise<number> {
-	if (cache && cache.provider === provider && Date.now() - cache.at < CACHE_MS) return cache.spend;
-	const spend = await spendSince(SESSIONS_DIR, provider, monthStartMs());
-	cache = { at: Date.now(), provider, spend };
-	return spend;
+async function cachedSpend(cfg: BudgetConfig): Promise<MonthSpend> {
+	const key = JSON.stringify([cfg.provider, cfg.observed ?? null]);
+	if (cache && cache.key === key && Date.now() - cache.at < CACHE_MS) return cache.result;
+	const result = await monthSpend(cfg, SESSIONS_DIR);
+	cache = { at: Date.now(), key, result };
+	return result;
 }
 
 /** undefined when no config file exists. Throws when the config is invalid or logs cannot be read. */
 async function currentState(): Promise<State | undefined> {
 	if (!existsSync(CONFIG_PATH)) return undefined;
 	const cfg = await loadConfig(CONFIG_PATH);
-	const spend = await cachedSpend(cfg.provider);
-	const frac = spend / cfg.monthlyCapUsd;
-	return { tier: tierFor(frac, cfg.thresholds), pct: Math.round(frac * 100), spend, cfg };
+	const m = await cachedSpend(cfg);
+	const frac = m.spend / cfg.monthlyCapUsd;
+	return { tier: tierFor(frac, cfg.thresholds), pct: Math.round(frac * 100), spend: m.spend, cfg, observationIgnored: m.observationIgnored };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -71,6 +73,10 @@ export default function (pi: ExtensionAPI) {
 	// Nudge the model and notify. At divert, offer the main-session switch.
 	pi.on("before_agent_start", async (event, ctx) => {
 		const st = await safeState(ctx);
+		if (st?.observationIgnored && !announced.has("stale-observation")) {
+			announced.add("stale-observation");
+			ctx.ui.notify("budget-routing: the observed seat figure is from another month. Update observed.asOf.", "warning");
+		}
 		if (!st || st.tier === "ok") return;
 
 		const t = st.cfg.localModel;

@@ -19,6 +19,11 @@ export interface BudgetConfig {
 	localModel: { provider: string; modelId: string; subagentRef: string };
 	/** Agent names whose launches are rewritten to the local model at divert. */
 	localSubagents: string[];
+	/**
+	 * Manual calibration from the GitHub seat page (copy creditsUsed and the time you read it).
+	 * asOfMs is epoch ms. When it falls in the current month, it replaces the meter as the baseline.
+	 */
+	observed?: { creditsUsed: number; usdPerCredit: number; asOfMs: number };
 }
 
 export const DEFAULT_THRESHOLDS: Thresholds = { nudge: 0.7, warn: 0.8, prepare: 0.95, divert: 1 };
@@ -64,7 +69,20 @@ export function parseConfig(raw: unknown): BudgetConfig {
 		throw new Error("budget config: localSubagents must be a non-empty array of agent names");
 	}
 
-	return { provider: str(r.provider, "provider"), monthlyCapUsd, thresholds, localModel, localSubagents: ls as string[] };
+	let observed: BudgetConfig["observed"];
+	if (r.observed !== undefined) {
+		const o = r.observed as Record<string, unknown>;
+		if (typeof o !== "object" || o === null) throw new Error("budget config: observed must be an object");
+		const creditsUsed = num(o.creditsUsed, "observed.creditsUsed");
+		if (creditsUsed < 0) throw new Error("budget config: observed.creditsUsed must be >= 0");
+		const usdPerCredit = o.usdPerCredit === undefined ? 0.01 : num(o.usdPerCredit, "observed.usdPerCredit");
+		if (usdPerCredit <= 0) throw new Error("budget config: observed.usdPerCredit must be positive");
+		const asOfMs = Date.parse(str(o.asOf, "observed.asOf"));
+		if (Number.isNaN(asOfMs)) throw new Error("budget config: observed.asOf must be an ISO date");
+		observed = { creditsUsed, usdPerCredit, asOfMs };
+	}
+
+	return { provider: str(r.provider, "provider"), monthlyCapUsd, thresholds, localModel, localSubagents: ls as string[], observed };
 }
 
 export async function loadConfig(path: string): Promise<BudgetConfig> {
@@ -125,6 +143,27 @@ export async function spendSince(sessionsDir: string, provider: string, sinceMs:
 		}
 	}
 	return total;
+}
+
+export interface MonthSpend {
+	spend: number;
+	source: "meter" | "calibrated";
+	/** An observation exists but is from another month (or in the future), so it was not used. */
+	observationIgnored: boolean;
+}
+
+/**
+ * Month-to-date spend in USD. When a calibration was observed this month, the baseline is the seat figure
+ * at asOf (it already includes Pi and non-Pi usage up to then) plus Pi-logged spend since asOf.
+ */
+export async function monthSpend(cfg: BudgetConfig, sessionsDir: string, now: Date = new Date()): Promise<MonthSpend> {
+	const start = monthStartMs(now);
+	const o = cfg.observed;
+	if (o && o.asOfMs >= start && o.asOfMs <= now.getTime()) {
+		const local = await spendSince(sessionsDir, cfg.provider, o.asOfMs);
+		return { spend: o.creditsUsed * o.usdPerCredit + local, source: "calibrated", observationIgnored: false };
+	}
+	return { spend: await spendSince(sessionsDir, cfg.provider, start), source: "meter", observationIgnored: o !== undefined };
 }
 
 export function tierFor(frac: number, t: Thresholds): Tier {
