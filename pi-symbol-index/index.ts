@@ -307,7 +307,7 @@ async function extractSymbolsFromLsp(
           const range = loc.range || loc;
           if (range.start?.line != null) {
             // Reverse lookup: find the string key for the numeric SymbolKind value
-            const kindKey = Object.keys(SymbolKind).find(k => SymbolKind[k] === s.kind) || String(s.kind);
+            const kindKey = Object.keys(SymbolKind).find(k => (SymbolKind as unknown as Record<string, number>)[k] === s.kind) || String(s.kind);
             fileSymbols.push({
               name: s.name,
               kind: symbolKindMap[kindKey.toLowerCase()] ?? symbolKindMap[kindKey] ?? "unknown",
@@ -363,7 +363,7 @@ async function extractSymbolsFromLsp(
                           .filter((c) => c?.from?.uri)
                           .map((c) => ({
                             name: c.from.name,
-                            kind: symbolKindMap[SymbolKind[c.from.kind]?.toLowerCase() || String(c.from.kind)] ?? "unknown",
+                            kind: symbolKindMap[(SymbolKind as unknown as Record<string, string>)[c.from.kind]?.toLowerCase() || String(c.from.kind)] ?? "unknown",
                             file: c.from.uri!.replace(/^file:\/\//, ""),
                             lineRange: [c.from.range.start.line + 1, c.from.range.end.line + 1],
                           }));
@@ -377,7 +377,7 @@ async function extractSymbolsFromLsp(
                           .filter((c) => c.to?.uri)
                           .map((c) => ({
                             name: c.to.name,
-                            kind: symbolKindMap[SymbolKind[c.to.kind]?.toLowerCase() || String(c.to.kind)] ?? "unknown",
+                            kind: symbolKindMap[(SymbolKind as unknown as Record<string, string>)[c.to.kind]?.toLowerCase() || String(c.to.kind)] ?? "unknown",
                             file: c.to.uri!.replace(/^file:\/\//, ""),
                             lineRange: [c.to.range.start.line + 1, c.to.range.end.line + 1],
                           }));
@@ -428,7 +428,7 @@ async function extractSymbolsFromLspForFile(
         const loc = s.location || s;
         const range = loc.range || loc;
         if (range.start?.line != null) {
-          const kindKey = Object.keys(SymbolKind).find(k => SymbolKind[k] === s.kind) || String(s.kind);
+          const kindKey = Object.keys(SymbolKind).find(k => (SymbolKind as unknown as Record<string, number>)[k] === s.kind) || String(s.kind);
           result.push({
             name: s.name,
             kind: symbolKindMap[kindKey.toLowerCase()] ?? symbolKindMap[kindKey] ?? "unknown",
