@@ -1,0 +1,71 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  budget-routing:
+    name: budget-routing
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: budget-routing
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: budget-routing/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  pi-model-context:
+    name: pi-model-context
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pi-model-context
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: pi-model-context/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  pi-symbol-index:
+    name: pi-symbol-index
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pi-symbol-index
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: pi-symbol-index/package-lock.json
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: Install gopls
+        run: |
+          go install golang.org/x/tools/gopls@v0.23.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
