@@ -106,13 +106,15 @@ interface IndexSymbol {
   outgoingCalls: Array<{ name: string; kind: string; file: string; lineRange: [number, number] }>;
 }
 
+type IndexFileStatus = "ok" | "partial" | "broken";
+
 interface PiIndex {
   version: number;
   projectRoot: string;
   languages: string[];
   buildTs: string;
   buildMtimes: Record<string, number>; // per-file mtime at build time
-  files: Record<string, { status: "ok" | "partial" | "broken"; symbols: IndexSymbol[] }>;
+  files: Record<string, { status: IndexFileStatus; symbols: IndexSymbol[] }>;
   blocks: BlockIndex[];
 }
 
@@ -270,8 +272,8 @@ async function extractSymbolsFromLsp(
   workspaceFolder: string,
   files: string[],
   symbolKindMap: Record<string, string>,
-): Promise<Record<string, { status: string; symbols: IndexSymbol[] }>> {
-  const result: Record<string, { status: string; symbols: IndexSymbol[] }> = {};
+): Promise<Record<string, { status: IndexFileStatus; symbols: IndexSymbol[] }>> {
+  const result: Record<string, { status: IndexFileStatus; symbols: IndexSymbol[] }> = {};
   const slice = files;
 
   client.connection.listen();
@@ -600,8 +602,8 @@ async function extractSymbolsFromTsProgram(
   workspaceFolder: string,
   files: string[],
   symbolKindMap: Record<string, string>,
-): Promise<Record<string, { status: string; symbols: IndexSymbol[] }>> {
-  const result: Record<string, { status: string; symbols: IndexSymbol[] }> = {};
+): Promise<Record<string, { status: IndexFileStatus; symbols: IndexSymbol[] }>> {
+  const result: Record<string, { status: IndexFileStatus; symbols: IndexSymbol[] }> = {};
   const slice = files;
 
   try {
@@ -717,7 +719,7 @@ export async function buildIndex(target?: string, extPath?: string, hooks?: Rebu
   if (!langConfig) return;
 
   let symbolKindMap: Record<string, string>;
-  let symbols: Record<string, { status: string; symbols: IndexSymbol[] }> = {};
+  let symbols: Record<string, { status: IndexFileStatus; symbols: IndexSymbol[] }> = {};
 
   // Try LSP server first
   try {
@@ -1324,7 +1326,7 @@ export default function (pi: ExtensionAPI): void {
     if (!index) return;
 
     // Re-extract symbols for changed files
-    let partialResult: Record<string, { status: string; symbols: IndexSymbol[] }> = {};
+    let partialResult: Record<string, { status: IndexFileStatus; symbols: IndexSymbol[] }> = {};
 
     if (langConfig.server === "typescript-language-server") {
       partialResult = await extractSymbolsFromTsProgram(workspaceFolder, changedFiles, langConfig.symbolKindMap);
