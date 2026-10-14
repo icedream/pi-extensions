@@ -24,22 +24,46 @@ export interface BudgetConfig {
 	 * asOfMs is epoch ms. When it falls in the current month, it replaces the meter as the baseline.
 	 */
 	observed?: { creditsUsed: number; usdPerCredit: number; asOfMs: number };
+	/**
+	 * Fetches the seat figure from GitHub and uses it as the month-to-date baseline, in memory only.
+	 * Absent means the extension never contacts GitHub and relies on the hand-written `observed`.
+	 */
+	seat?: SeatConfig;
+}
+
+export const CREDENTIAL_SOURCES = ["auto", "pi", "gh"] as const;
+export type CredentialSource = (typeof CREDENTIAL_SOURCES)[number];
+
+export interface SeatConfig {
+	/** Minimum minutes between seat fetches. */
+	refreshMinutes: number;
+	/** "auto" tries Pi's own Copilot credential, then the gh CLI. */
+	credential: CredentialSource;
 }
 
 export const DEFAULT_THRESHOLDS: Thresholds = { nudge: 0.7, warn: 0.8, prepare: 0.95, divert: 1 };
 
+export const DEFAULT_SEAT: SeatConfig = { refreshMinutes: 15, credential: "auto" };
+
+function str(v: unknown, name: string): string {
+	if (typeof v !== "string" || v.length === 0) throw new Error(`budget config: ${name} must be a non-empty string`);
+	return v;
+}
+
+function num(v: unknown, name: string): number {
+	if (typeof v !== "number" || !Number.isFinite(v)) throw new Error(`budget config: ${name} must be a number`);
+	return v;
+}
+
+function credentialSource(v: unknown, name: string): CredentialSource {
+	if (v === undefined) return DEFAULT_SEAT.credential;
+	if (typeof v === "string" && (CREDENTIAL_SOURCES as readonly string[]).includes(v)) return v as CredentialSource;
+	throw new Error(`budget config: ${name} must be one of ${CREDENTIAL_SOURCES.join(", ")}`);
+}
+
 export function parseConfig(raw: unknown): BudgetConfig {
 	if (typeof raw !== "object" || raw === null) throw new Error("budget config must be a JSON object");
 	const r = raw as Record<string, unknown>;
-
-	const str = (v: unknown, name: string): string => {
-		if (typeof v !== "string" || v.length === 0) throw new Error(`budget config: ${name} must be a non-empty string`);
-		return v;
-	};
-	const num = (v: unknown, name: string): number => {
-		if (typeof v !== "number" || !Number.isFinite(v)) throw new Error(`budget config: ${name} must be a number`);
-		return v;
-	};
 
 	const monthlyCapUsd = num(r.monthlyCapUsd, "monthlyCapUsd");
 	if (monthlyCapUsd <= 0) throw new Error("budget config: monthlyCapUsd must be positive");
@@ -82,7 +106,19 @@ export function parseConfig(raw: unknown): BudgetConfig {
 		observed = { creditsUsed, usdPerCredit, asOfMs };
 	}
 
-	return { provider: str(r.provider, "provider"), monthlyCapUsd, thresholds, localModel, localSubagents: ls as string[], observed };
+	let seat: SeatConfig | undefined;
+	if (r.seat !== undefined) {
+		const s = r.seat as Record<string, unknown>;
+		if (typeof s !== "object" || s === null) throw new Error("budget config: seat must be an object");
+		const refreshMinutes = s.refreshMinutes === undefined ? DEFAULT_SEAT.refreshMinutes : num(s.refreshMinutes, "seat.refreshMinutes");
+		if (refreshMinutes < 1) throw new Error("budget config: seat.refreshMinutes must be >= 1");
+		seat = {
+			refreshMinutes,
+			credential: credentialSource(s.credential, "seat.credential"),
+		};
+	}
+
+	return { provider: str(r.provider, "provider"), monthlyCapUsd, thresholds, localModel, localSubagents: ls as string[], observed, seat };
 }
 
 export async function loadConfig(path: string): Promise<BudgetConfig> {
@@ -93,6 +129,53 @@ export async function loadConfig(path: string): Promise<BudgetConfig> {
 		throw new Error(`budget config not found: ${path}`);
 	}
 	return parseConfig(JSON.parse(text));
+}
+
+/** The seat figure behind github.com/settings/copilot/features. */
+export interface SeatFigure {
+	login: string;
+	/** AI credits spent this month, as the settings page shows them. */
+	creditsUsed: number;
+	/** Credit allowance for the month. entitlement * usdPerCredit is the USD cap. */
+	entitlement: number;
+	remaining: number;
+	/** When GitHub took the snapshot (premium_interactions.timestamp_utc). */
+	asOfMs: number;
+	/** Quota reset instant, 0 when absent. */
+	resetDateMs: number;
+	tokenBasedBilling: boolean;
+}
+
+/**
+ * Reads the copilot_internal/user payload. Throws when the payload is not the expected shape, so a
+ * GitHub-side change surfaces as a notification instead of a silently wrong budget.
+ */
+export function parseSeatFigure(raw: unknown): SeatFigure {
+	if (typeof raw !== "object" || raw === null) throw new Error("seat payload must be a JSON object");
+	const r = raw as Record<string, unknown>;
+	const snaps = r.quota_snapshots;
+	const pi = typeof snaps === "object" && snaps !== null ? (snaps as Record<string, unknown>).premium_interactions : undefined;
+	if (typeof pi !== "object" || pi === null) throw new Error("seat payload has no quota_snapshots.premium_interactions");
+	const p = pi as Record<string, unknown>;
+
+	const creditsUsed = num(p.credits_used, "premium_interactions.credits_used");
+	if (creditsUsed < 0) throw new Error("budget: premium_interactions.credits_used must be >= 0");
+	const entitlement = num(p.entitlement, "premium_interactions.entitlement");
+	if (entitlement <= 0) throw new Error("premium_interactions.entitlement is not positive: this seat is not on credit-based billing");
+
+	const asOfMs = Date.parse(typeof p.timestamp_utc === "string" ? p.timestamp_utc : "");
+	if (Number.isNaN(asOfMs)) throw new Error("premium_interactions.timestamp_utc is not a date");
+	const resetDateMs = Date.parse(typeof r.quota_reset_date_utc === "string" ? r.quota_reset_date_utc : "");
+
+	return {
+		login: typeof r.login === "string" ? r.login : "",
+		creditsUsed,
+		entitlement,
+		remaining: typeof p.remaining === "number" && Number.isFinite(p.remaining) ? p.remaining : 0,
+		asOfMs,
+		resetDateMs: Number.isNaN(resetDateMs) ? 0 : resetDateMs,
+		tokenBasedBilling: r.token_based_billing === true,
+	};
 }
 
 /** Local midnight on the first day of the month containing `now`, in epoch ms. */
@@ -147,21 +230,31 @@ export async function spendSince(sessionsDir: string, provider: string, sinceMs:
 
 export interface MonthSpend {
 	spend: number;
-	source: "meter" | "calibrated";
+	/** "live" = fetched seat figure, "calibrated" = hand-written observed, "meter" = Pi logs only. */
+	source: "meter" | "calibrated" | "live";
 	/** An observation exists but is from another month (or in the future), so it was not used. */
 	observationIgnored: boolean;
 }
 
 /**
- * Month-to-date spend in USD. When a calibration was observed this month, the baseline is the seat figure
- * at asOf (it already includes Pi and non-Pi usage up to then) plus Pi-logged spend since asOf.
+ * Month-to-date spend in USD. A live seat figure fetched from GitHub wins over the hand-written
+ * `observed`. Either one, when it falls in the current month, is the baseline: it already counts Pi
+ * and non-Pi usage up to its timestamp, and Pi-logged spend since then is added on top.
  */
-export async function monthSpend(cfg: BudgetConfig, sessionsDir: string, now: Date = new Date()): Promise<MonthSpend> {
+export async function monthSpend(
+	cfg: BudgetConfig,
+	sessionsDir: string,
+	now: Date = new Date(),
+	live?: SeatFigure,
+): Promise<MonthSpend> {
 	const start = monthStartMs(now);
-	const o = cfg.observed;
+	const o = live
+		? { creditsUsed: live.creditsUsed, usdPerCredit: cfg.observed?.usdPerCredit ?? 0.01, asOfMs: live.asOfMs }
+		: cfg.observed;
 	if (o && o.asOfMs >= start && o.asOfMs <= now.getTime()) {
 		const local = await spendSince(sessionsDir, cfg.provider, o.asOfMs);
-		return { spend: o.creditsUsed * o.usdPerCredit + local, source: "calibrated", observationIgnored: false };
+		const source = live ? "live" : "calibrated";
+		return { spend: o.creditsUsed * o.usdPerCredit + local, source, observationIgnored: false };
 	}
 	return { spend: await spendSince(sessionsDir, cfg.provider, start), source: "meter", observationIgnored: o !== undefined };
 }

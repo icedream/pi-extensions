@@ -15,7 +15,20 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { applyDivert, loadConfig, monthSpend, tierFor, type BudgetConfig, type MonthSpend, type Tier } from "./budget.ts";
+import {
+	applyDivert,
+	DEFAULT_SEAT,
+	loadConfig,
+	monthSpend,
+	tierFor,
+	type BudgetConfig,
+	type CredentialSource,
+	type MonthSpend,
+	type SeatFigure,
+	type Tier,
+} from "./budget.ts";
+import { fetchCopilotSeat, isCopilotProvider } from "./seat.ts";
+import { resolveGitHubToken } from "./credential.ts";
 
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 const SESSIONS_DIR = join(AGENT_DIR, "sessions");
@@ -28,14 +41,26 @@ interface State {
 	spend: number;
 	cfg: BudgetConfig;
 	observationIgnored: boolean;
+	source: MonthSpend["source"];
+}
+
+interface SeatResult {
+	ok: boolean;
+	figure?: SeatFigure;
+	source?: Exclude<CredentialSource, "auto">;
+	note: string;
 }
 
 let cache: { at: number; key: string; result: MonthSpend } | undefined;
 
+/** Last figure fetched from GitHub. In memory only: the config file is never written. */
+let seatFigure: SeatFigure | undefined;
+let seatFetchMs = 0;
+
 async function cachedSpend(cfg: BudgetConfig): Promise<MonthSpend> {
-	const key = JSON.stringify([cfg.provider, cfg.observed ?? null]);
+	const key = JSON.stringify([cfg.provider, cfg.observed ?? null, seatFigure ?? null]);
 	if (cache && cache.key === key && Date.now() - cache.at < CACHE_MS) return cache.result;
-	const result = await monthSpend(cfg, SESSIONS_DIR);
+	const result = await monthSpend(cfg, SESSIONS_DIR, new Date(), seatFigure);
 	cache = { at: Date.now(), key, result };
 	return result;
 }
@@ -46,12 +71,93 @@ async function currentState(): Promise<State | undefined> {
 	const cfg = await loadConfig(CONFIG_PATH);
 	const m = await cachedSpend(cfg);
 	const frac = m.spend / cfg.monthlyCapUsd;
-	return { tier: tierFor(frac, cfg.thresholds), pct: Math.round(frac * 100), spend: m.spend, cfg, observationIgnored: m.observationIgnored };
+	return {
+		tier: tierFor(frac, cfg.thresholds),
+		pct: Math.round(frac * 100),
+		spend: m.spend,
+		cfg,
+		observationIgnored: m.observationIgnored,
+		source: m.source,
+	};
 }
 
 export default function (pi: ExtensionAPI) {
 	const announced = new Set<string>();
 	let compactedThisCrossing = false;
+	let seatInFlight: Promise<SeatResult> | undefined;
+
+	function notifyOnce(ctx: ExtensionContext, key: string, message: string, severity: "info" | "warning" | "error" = "warning") {
+		if (announced.has(key)) return;
+		announced.add(key);
+		ctx.ui.notify(`budget-routing: ${message}`, severity);
+	}
+
+	/** Fetch at most once at a time; a second caller joins the run already in flight. */
+	function refreshSeat(ctx: ExtensionContext, force = false): Promise<SeatResult> {
+		if (seatInFlight) return seatInFlight;
+		seatInFlight = doRefreshSeat(ctx, force).finally(() => {
+			seatInFlight = undefined;
+		});
+		return seatInFlight;
+	}
+
+	/**
+	 * Fetches the seat figure and, when the config's `seat` block allows it, writes it into that file
+	 * and commits. Never throws: it runs off the agent path, so every failure resolves with ok:false
+	 * and a note. GitHub is contacted only while the configured provider is github-copilot.
+	 */
+	async function doRefreshSeat(ctx: ExtensionContext, force: boolean): Promise<SeatResult> {
+		if (!existsSync(CONFIG_PATH)) return { ok: false, note: "no config file" };
+		let cfg: BudgetConfig;
+		try {
+			cfg = await loadConfig(CONFIG_PATH);
+		} catch (err) {
+			return { ok: false, note: (err as Error).message };
+		}
+		if (!isCopilotProvider(cfg.provider)) {
+			return { ok: false, note: `provider is ${cfg.provider}, so the GitHub credential is not used` };
+		}
+		if (!cfg.seat && !force) return { ok: false, note: "no seat block in the config: automatic refresh is off" };
+		const seat = cfg.seat ?? DEFAULT_SEAT;
+		if (!force && Date.now() - seatFetchMs < seat.refreshMinutes * 60_000) return { ok: true, note: "figure is fresh" };
+
+		let token: string;
+		let source: Exclude<CredentialSource, "auto">;
+		try {
+			({ token, source } = await resolveGitHubToken(AGENT_DIR, seat.credential, cfg.provider));
+		} catch (err) {
+			notifyOnce(ctx, "seat-credential", `seat refresh skipped: ${(err as Error).message}`);
+			return { ok: false, note: (err as Error).message };
+		}
+
+		let fig: SeatFigure;
+		try {
+			fig = await fetchCopilotSeat(token);
+		} catch (err) {
+			notifyOnce(ctx, "seat-fetch", `seat refresh failed: ${(err as Error).message}`);
+			return { ok: false, note: (err as Error).message };
+		}
+		seatFetchMs = Date.now();
+		seatFigure = fig;
+
+		const usdPerCredit = cfg.observed?.usdPerCredit ?? 0.01;
+		const capFromSeat = fig.entitlement * usdPerCredit;
+		if (Math.abs(capFromSeat - cfg.monthlyCapUsd) > 0.005) {
+			notifyOnce(
+				ctx,
+				"seat-cap-drift",
+				`seat entitlement is ${fig.entitlement} credits ($${capFromSeat.toFixed(2)}) but monthlyCapUsd is $${cfg.monthlyCapUsd}. Align monthlyCapUsd with the seat if you want the cap to track it.`,
+			);
+		}
+
+		const pct = Math.round((fig.creditsUsed / fig.entitlement) * 100);
+		return {
+			ok: true,
+			figure: fig,
+			source,
+			note: `${fig.login}: ${fig.creditsUsed}/${fig.entitlement} credits (${pct}%), ${fig.remaining} left, as of ${new Date(fig.asOfMs).toISOString()}, credential from ${source}`,
+		};
+	}
 
 	async function safeState(ctx: ExtensionContext): Promise<State | undefined> {
 		try {
@@ -65,9 +171,18 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	pi.on("session_start", async () => {
+	pi.on("session_start", async (_event, ctx) => {
 		announced.clear();
 		compactedThisCrossing = false;
+		void refreshSeat(ctx);
+	});
+
+	pi.registerCommand("budget-seat", {
+		description: "Fetch the GitHub Copilot seat figure now and report it",
+		handler: async (_args, ctx) => {
+			const r = await refreshSeat(ctx, true);
+			ctx.ui.notify(`Copilot seat: ${r.note}`, r.ok ? "info" : "warning");
+		},
 	});
 
 	// Nudge the model and notify. At divert, offer the main-session switch.
@@ -82,7 +197,7 @@ export default function (pi: ExtensionAPI) {
 		const t = st.cfg.localModel;
 		event.systemPromptOptions.appendSystemPrompt +=
 			`\n\n## Budget (automatic, advisory)\n` +
-			`${st.cfg.provider} spend is ${st.pct}% of the monthly cap (state: ${st.tier}). ` +
+			`${st.cfg.provider} spend is ${st.pct}% of the monthly cap (state: ${st.tier}, figure: ${st.source}). ` +
 			`Prefer the local model (${t.subagentRef}) for ${st.cfg.localSubagents.join(", ")}. ` +
 			`Avoid unnecessary ${st.cfg.provider} subagent launches.`;
 
@@ -125,6 +240,12 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`Pre-switch compaction failed: ${err.message}`, "error");
 			},
 		});
+	});
+
+	// Keep the seat figure current between runs. Off the critical path: the next turn sees it because
+	// currentState() re-reads the config file.
+	pi.on("agent_settled", async (_event, ctx) => {
+		void refreshSeat(ctx);
 	});
 
 	// At divert: light subagent launches run locally; other launches are blocked.

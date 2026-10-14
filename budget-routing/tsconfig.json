@@ -9,5 +9,5 @@
     "noEmit": true,
     "allowImportingTsExtensions": true
   },
-  "include": ["index.ts", "budget.ts"]
+  "include": ["index.ts", "budget.ts", "seat.ts", "credential.ts"]
 }

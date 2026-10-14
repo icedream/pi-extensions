@@ -7,13 +7,16 @@ import path from "node:path";
 import { utimes } from "node:fs/promises";
 import {
 	applyDivert,
+	DEFAULT_SEAT,
 	DEFAULT_THRESHOLDS,
 	monthSpend,
 	monthStartMs,
 	parseConfig,
+	parseSeatFigure,
 	spendSince,
 	tierFor,
 } from "./budget.ts";
+import { pickGitHubToken } from "./credential.ts";
 
 const line = (provider: string, role: string, timestamp: number, cost: number) =>
 	JSON.stringify({ type: "message", message: { role, provider, timestamp, usage: { cost: { total: cost } } } });
@@ -160,4 +163,115 @@ test("monthSpend: ignores an observation from a previous month", async () => {
 	const r = await monthSpend(cfg, dir, new Date());
 	assert.equal(r.source, "meter");
 	assert.equal(r.observationIgnored, true);
+});
+
+// Trimmed from a real copilot_internal/user response.
+const seatPayload = {
+	login: "icedream",
+	quota_reset_date_utc: "2026-11-01T00:00:00.000Z",
+	token_based_billing: true,
+	quota_snapshots: {
+		chat: { credits_used: 0, unlimited: true },
+		completions: { credits_used: 0, unlimited: true },
+		premium_interactions: {
+			credits_used: 15640,
+			entitlement: 17000,
+			remaining: 1361,
+			percent_remaining: 8,
+			timestamp_utc: "2026-10-14T08:04:32.173-07:00",
+			token_based_billing: true,
+		},
+	},
+};
+
+test("parseSeatFigure reads the premium_interactions snapshot", () => {
+	const f = parseSeatFigure(seatPayload);
+	assert.equal(f.login, "icedream");
+	assert.equal(f.creditsUsed, 15640);
+	assert.equal(f.entitlement, 17000);
+	assert.equal(f.remaining, 1361);
+	assert.equal(f.resetDateMs, Date.parse("2026-11-01T00:00:00.000Z"));
+	assert.equal(f.tokenBasedBilling, true);
+	// the UTC offset in the payload must survive
+	assert.equal(new Date(f.asOfMs).toISOString(), "2026-10-14T15:04:32.173Z");
+});
+
+test("parseSeatFigure rejects payloads that are not the seat shape", () => {
+	assert.throws(() => parseSeatFigure(null), /must be a JSON object/);
+	assert.throws(() => parseSeatFigure({}), /no quota_snapshots.premium_interactions/);
+	assert.throws(() => parseSeatFigure({ quota_snapshots: { chat: {} } }), /no quota_snapshots.premium_interactions/);
+	assert.throws(
+		() => parseSeatFigure({ quota_snapshots: { premium_interactions: { entitlement: 17000 } } }),
+		/credits_used/,
+	);
+	assert.throws(
+		() => parseSeatFigure({ quota_snapshots: { premium_interactions: { credits_used: 1, entitlement: 0 } } }),
+		/not on credit-based billing/,
+	);
+	assert.throws(
+		() => parseSeatFigure({ quota_snapshots: { premium_interactions: { credits_used: 1, entitlement: 100 } } }),
+		/timestamp_utc is not a date/,
+	);
+});
+
+test("pickGitHubToken uses a GitHub token and never the Copilot proxy token", () => {
+	assert.equal(pickGitHubToken({ access: "tid=abc123", refresh: "ghu_B6bwEXAMPLE" }), "ghu_B6bwEXAMPLE");
+	assert.equal(pickGitHubToken({ access: "gho_plain", refresh: "ghu_other" }), "gho_plain");
+	assert.equal(pickGitHubToken({ access: "github_pat_11ABCDEFG" }), "github_pat_11ABCDEFG");
+	assert.equal(pickGitHubToken({ access: "tid=abc" }), undefined);
+	assert.equal(pickGitHubToken({ refresh: "ghr_notabearer" }), undefined);
+	assert.equal(pickGitHubToken(undefined), undefined);
+	assert.equal(pickGitHubToken("nope"), undefined);
+});
+
+test("parseConfig leaves seat off by default and validates the block", () => {
+	assert.equal(parseConfig(validRaw).seat, undefined);
+	assert.deepEqual(parseConfig({ ...validRaw, seat: {} }).seat, DEFAULT_SEAT);
+	assert.deepEqual(parseConfig({ ...validRaw, seat: { refreshMinutes: 60, credential: "gh" } }).seat, {
+		refreshMinutes: 60,
+		credential: "gh",
+	});
+	assert.throws(() => parseConfig({ ...validRaw, seat: { refreshMinutes: 0 } }), /refreshMinutes must be >= 1/);
+	assert.throws(() => parseConfig({ ...validRaw, seat: { credential: "browser" } }), /credential must be one of/);
+	assert.throws(() => parseConfig({ ...validRaw, seat: 5 }), /seat must be an object/);
+});
+
+test("monthSpend: a live seat figure wins over the hand-written observed", async () => {
+	const dir = await tmpSessions();
+	await fs.writeFile(path.join(dir, "s.jsonl"), [line("github-copilot", "assistant", Date.now(), 2.5)].join("\n") + "\n");
+	const now = new Date();
+	const cfg = parseConfig({ ...validRaw, observed: { creditsUsed: 999_999, asOf: new Date(now).toISOString() } });
+	const live = { ...parseSeatFigure(seatPayload), asOfMs: now.getTime() - 60_000 };
+
+	const r = await monthSpend(cfg, dir, now, live);
+	assert.equal(r.source, "live");
+	assert.equal(r.observationIgnored, false);
+	// 15640 credits at the default 0.01, plus the 2.50 logged after the snapshot
+	assert.ok(Math.abs(r.spend - (156.4 + 2.5)) < 1e-9, `got ${r.spend}`);
+});
+
+test("monthSpend: live figure adds Pi spend since the snapshot, and usdPerCredit still applies", async () => {
+	const dir = await tmpSessions();
+	const now = new Date();
+	await fs.writeFile(path.join(dir, "s.jsonl"), [
+		line("github-copilot", "assistant", now.getTime() - 10 * 60_000, 3), // before the snapshot: excluded
+		line("github-copilot", "assistant", now.getTime() - 60_000, 1.5), // after it: counted
+	].join("\n") + "\n");
+	const cfg = parseConfig({ ...validRaw, observed: { creditsUsed: 1, asOf: new Date(now).toISOString(), usdPerCredit: 0.02 } });
+	const live = { ...parseSeatFigure(seatPayload), asOfMs: now.getTime() - 5 * 60_000 };
+
+	const r = await monthSpend(cfg, dir, now, live);
+	assert.equal(r.source, "live");
+	assert.ok(Math.abs(r.spend - (15640 * 0.02 + 1.5)) < 1e-9, `got ${r.spend}`);
+});
+
+test("monthSpend: a live figure from another month falls back to the meter", async () => {
+	const dir = await tmpSessions();
+	await fs.writeFile(path.join(dir, "s.jsonl"), [line("github-copilot", "assistant", Date.now(), 4)].join("\n") + "\n");
+	const cfg = parseConfig(validRaw);
+	const stale = { ...parseSeatFigure(seatPayload), asOfMs: new Date(2000, 0, 1).getTime() };
+	const r = await monthSpend(cfg, dir, new Date(), stale);
+	assert.equal(r.source, "meter");
+	assert.equal(r.observationIgnored, true);
+	assert.ok(Math.abs(r.spend - 4) < 1e-9, `got ${r.spend}`);
 });

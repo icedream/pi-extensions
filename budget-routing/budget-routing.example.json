@@ -12,5 +12,6 @@
     "modelId": "<model-id>",
     "subagentRef": "<provider>/<model-id as the subagent tool expects>"
   },
-  "localSubagents": ["scout", "delegate", "Plan", "Explore"]
+  "localSubagents": ["scout", "delegate", "Plan", "Explore"],
+  "seat": { "refreshMinutes": 15, "credential": "auto" }
 }
