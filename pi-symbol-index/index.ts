@@ -924,7 +924,7 @@ export default function (pi: ExtensionAPI): void {
         },
       };
       await buildIndex(target, undefined, hooks);
-      return { content: [{ type: "text", text: "Index built." }] };
+      return { content: [{ type: "text", text: "Index built." }], details: undefined };
     },
   });
 
@@ -973,7 +973,7 @@ export default function (pi: ExtensionAPI): void {
           }
         }
       }
-      return { content: [{ type: "text", text: JSON.stringify(found, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(found, null, 2) }], details: undefined };
     },
   });
 
@@ -1005,7 +1005,7 @@ export default function (pi: ExtensionAPI): void {
         types: index.files[f].symbols.filter(s => s.kind === "type" || s.kind === "struct").map(s => s.name),
         functions: index.files[f].symbols.filter(s => s.kind === "function" || s.kind === "method").map(s => s.name),
       }));
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details: undefined };
     },
   });
 
@@ -1124,7 +1124,7 @@ export default function (pi: ExtensionAPI): void {
       if (!index) throw new Error("No index found. Run symbol_index_build first.");
       const blocks = params?.file ? index.blocks.filter(b => b.file === params.file) : index.blocks;
       const visible = blocks.map(b => ({ file: b.file, lineRange: `${b.startLine}-${b.endLine}`, shortId: b.shortId }));
-      return { content: [{ type: "text", text: JSON.stringify(visible, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(visible, null, 2) }], details: undefined };
     },
   });
 
@@ -1157,7 +1157,7 @@ export default function (pi: ExtensionAPI): void {
         groups[b.hash].push(`${b.file}:${b.startLine}-${b.endLine}`);
       }
       const duplicates = Object.entries(groups).filter(([_, locs]) => locs.length > 1);
-      return { content: [{ type: "text", text: JSON.stringify(duplicates, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(duplicates, null, 2) }], details: undefined };
     },
   });
 
