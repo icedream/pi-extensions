@@ -71,7 +71,7 @@ import {
   StreamMessageWriter,
   createMessageConnection,
 } from "vscode-jsonrpc/node";
-import type { Location } from "vscode-languageserver-types/node";
+import type { Location } from "vscode-languageserver-types";
 import { SymbolKind } from "vscode-languageserver-types";
 
 // =========================================
