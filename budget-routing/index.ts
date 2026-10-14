@@ -20,7 +20,7 @@ import {
 	DEFAULT_SEAT,
 	loadConfig,
 	monthSpend,
-	needsPreSwitchCompaction,
+	preSwitchCompactionStep,
 	statusLabel,
 	tierFor,
 	type BudgetConfig,
@@ -246,12 +246,9 @@ export default function (pi: ExtensionAPI) {
 	// Compact while the provider still works, before the cap blocks calls. Runs between agent runs.
 	pi.on("agent_end", async (_event, ctx) => {
 		const st = await safeState(ctx);
-		if (!st || (st.tier !== "prepare" && st.tier !== "divert")) {
-			compactedThisCrossing = false;
-			return;
-		}
-		if (!needsPreSwitchCompaction(st.tier, ctx.model?.provider, st.cfg.provider, compactedThisCrossing)) return;
-		compactedThisCrossing = true;
+		const step = preSwitchCompactionStep(st?.tier, ctx.model?.provider, st?.cfg.provider, compactedThisCrossing);
+		compactedThisCrossing = step.compacted;
+		if (!step.compact || !st) return;
 		ctx.ui.notify(`${st.cfg.provider} at ${st.pct}%: compacting before any local switch`, "warning");
 		ctx.compact({
 			customInstructions: "Keep the current task, decisions, file paths, and open todos. Be compact.",

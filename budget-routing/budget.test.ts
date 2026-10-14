@@ -11,12 +11,13 @@ import {
 	DEFAULT_THRESHOLDS,
 	monthSpend,
 	monthStartMs,
-	needsPreSwitchCompaction,
 	parseConfig,
 	parseSeatFigure,
+	preSwitchCompactionStep,
 	spendSince,
 	statusLabel,
 	tierFor,
+	type Tier,
 } from "./budget.ts";
 import { pickGitHubToken } from "./credential.ts";
 
@@ -85,23 +86,46 @@ test("tierFor maps fractions to tiers at the threshold boundaries", () => {
 	assert.equal(tierFor(1.2, t), "divert");
 });
 
-test("needsPreSwitchCompaction is true only at prepare/divert on the budget provider", () => {
-	assert.equal(needsPreSwitchCompaction("prepare", "github-copilot", "github-copilot", false), true);
-	assert.equal(needsPreSwitchCompaction("divert", "github-copilot", "github-copilot", false), true);
-	for (const tier of ["ok", "nudge", "warn"] as const) {
-		assert.equal(needsPreSwitchCompaction(tier, "github-copilot", "github-copilot", false), false);
+const COPILOT = "github-copilot";
+const LOCAL = "llama-server=http://icedream-homepc:11180/qwen3.8-27b";
+
+// Simulate one crossing: each agent_end feeds its returned flag back in, exactly like index.ts.
+function crossing(steps: Array<[Tier | undefined, string | undefined]>): boolean[] {
+	let compacted = false;
+	const compact: boolean[] = [];
+	for (const [tier, sessionProvider] of steps) {
+		const step = preSwitchCompactionStep(tier, sessionProvider, COPILOT, compacted);
+		compacted = step.compacted;
+		compact.push(step.compact);
 	}
+	return compact;
+}
+
+test("preSwitchCompactionStep compacts only at prepare/divert while on the budget provider", () => {
+	assert.deepEqual(preSwitchCompactionStep("prepare", COPILOT, COPILOT, false), { compact: true, compacted: true });
+	assert.deepEqual(preSwitchCompactionStep("divert", COPILOT, COPILOT, false), { compact: true, compacted: true });
+	for (const tier of ["ok", "nudge", "warn"] as const) {
+		assert.deepEqual(preSwitchCompactionStep(tier, COPILOT, COPILOT, false), { compact: false, compacted: false });
+	}
+	assert.deepEqual(preSwitchCompactionStep(undefined, COPILOT, COPILOT, false), { compact: false, compacted: false });
+	assert.deepEqual(preSwitchCompactionStep("prepare", COPILOT, undefined, false), { compact: false, compacted: false });
 });
 
-test("needsPreSwitchCompaction skips local models, an unknown session model, and repeat crossings", () => {
-	assert.equal(
-		needsPreSwitchCompaction("prepare", "llama-server=http://icedream-homepc:11180/qwen3.8-27b", "github-copilot", false),
-		false,
-	);
-	assert.equal(needsPreSwitchCompaction("divert", "llama-server=http://icedream-homepc:11180/qwen3.8-27b", "github-copilot", false), false);
-	assert.equal(needsPreSwitchCompaction("prepare", undefined, "github-copilot", false), false);
-	assert.equal(needsPreSwitchCompaction("prepare", "github-copilot", "github-copilot", true), false);
-	assert.equal(needsPreSwitchCompaction("divert", "github-copilot", "github-copilot", true), false);
+test("preSwitchCompactionStep skips a local session model without consuming the once-per-crossing flag", () => {
+	assert.deepEqual(preSwitchCompactionStep("prepare", LOCAL, COPILOT, false), { compact: false, compacted: false });
+	assert.deepEqual(preSwitchCompactionStep("prepare", LOCAL, COPILOT, true), { compact: false, compacted: true });
+});
+
+test("a local-model agent_end does not block a later Copilot compaction in the same crossing", () => {
+	assert.deepEqual(crossing([["prepare", LOCAL], ["prepare", COPILOT], ["prepare", COPILOT]]), [false, true, false]);
+});
+
+test("dropping below prepare resets the flag so the next crossing compacts again", () => {
+	assert.deepEqual(crossing([["prepare", COPILOT], ["warn", COPILOT], ["prepare", COPILOT]]), [true, false, true]);
+});
+
+test("divert does not compact again after prepare already compacted in the same crossing", () => {
+	assert.deepEqual(crossing([["prepare", COPILOT], ["divert", COPILOT]]), [true, false]);
 });
 
 test("applyDivert rewrites local-eligible launches and blocks the rest", () => {

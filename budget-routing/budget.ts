@@ -267,19 +267,29 @@ export function tierFor(frac: number, t: Thresholds): Tier {
 	return "ok";
 }
 
+export interface CompactionStep {
+	/** Whether agent_end should call ctx.compact() now. */
+	compact: boolean;
+	/** New value for the once-per-crossing flag. */
+	compacted: boolean;
+}
+
 /**
- * Whether agent_end should compact before a possible switch to the local model. ctx.compact() summarizes
- * with the session's current model, so compacting on a local model wastes the crossing's one attempt and
- * leaves the later return to the budget provider uncompacted.
+ * The whole pre-switch compaction decision, including the once-per-crossing flag. ctx.compact()
+ * summarizes with the session's current model, so compacting on a local model would waste the
+ * crossing's one attempt and leave the later return to the budget provider uncompacted: a session
+ * that is not on the budget provider neither compacts nor consumes the flag.
  */
-export function needsPreSwitchCompaction(
-	tier: Tier,
+export function preSwitchCompactionStep(
+	tier: Tier | undefined,
 	sessionProvider: string | undefined,
-	budgetProvider: string,
-	alreadyCompacted: boolean,
-): boolean {
-	if (tier !== "prepare" && tier !== "divert") return false;
-	return sessionProvider === budgetProvider && !alreadyCompacted;
+	budgetProvider: string | undefined,
+	compacted: boolean,
+): CompactionStep {
+	if (!tier || !budgetProvider || (tier !== "prepare" && tier !== "divert")) return { compact: false, compacted: false };
+	if (sessionProvider !== budgetProvider) return { compact: false, compacted };
+	if (compacted) return { compact: false, compacted: true };
+	return { compact: true, compacted: true };
 }
 
 export const STATUS_COLORS: Record<Tier, "dim" | "accent" | "warning" | "error"> = {
