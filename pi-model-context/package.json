@@ -1,0 +1,20 @@
+{
+	"name": "pi-model-context",
+	"type": "module",
+	"version": "0.1.0",
+	"description": "Pi extension: discover models with the context window and input modalities the endpoint actually reports (meta.n_ctx for llama.cpp and Strata)",
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"scripts": {
+		"test": "node --test discovery.test.ts",
+		"typecheck": "tsc -p tsconfig.json"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^1.1.0",
+		"@types/node": "^26.1.1",
+		"typescript": "^6.0.3"
+	}
+}
