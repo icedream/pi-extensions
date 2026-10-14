@@ -11,6 +11,7 @@ import {
 	DEFAULT_THRESHOLDS,
 	monthSpend,
 	monthStartMs,
+	needsPreSwitchCompaction,
 	parseConfig,
 	parseSeatFigure,
 	spendSince,
@@ -82,6 +83,25 @@ test("tierFor maps fractions to tiers at the threshold boundaries", () => {
 	assert.equal(tierFor(0.999, t), "prepare");
 	assert.equal(tierFor(1, t), "divert");
 	assert.equal(tierFor(1.2, t), "divert");
+});
+
+test("needsPreSwitchCompaction is true only at prepare/divert on the budget provider", () => {
+	assert.equal(needsPreSwitchCompaction("prepare", "github-copilot", "github-copilot", false), true);
+	assert.equal(needsPreSwitchCompaction("divert", "github-copilot", "github-copilot", false), true);
+	for (const tier of ["ok", "nudge", "warn"] as const) {
+		assert.equal(needsPreSwitchCompaction(tier, "github-copilot", "github-copilot", false), false);
+	}
+});
+
+test("needsPreSwitchCompaction skips local models, an unknown session model, and repeat crossings", () => {
+	assert.equal(
+		needsPreSwitchCompaction("prepare", "llama-server=http://icedream-homepc:11180/qwen3.8-27b", "github-copilot", false),
+		false,
+	);
+	assert.equal(needsPreSwitchCompaction("divert", "llama-server=http://icedream-homepc:11180/qwen3.8-27b", "github-copilot", false), false);
+	assert.equal(needsPreSwitchCompaction("prepare", undefined, "github-copilot", false), false);
+	assert.equal(needsPreSwitchCompaction("prepare", "github-copilot", "github-copilot", true), false);
+	assert.equal(needsPreSwitchCompaction("divert", "github-copilot", "github-copilot", true), false);
 });
 
 test("applyDivert rewrites local-eligible launches and blocks the rest", () => {

@@ -20,6 +20,7 @@ import {
 	DEFAULT_SEAT,
 	loadConfig,
 	monthSpend,
+	needsPreSwitchCompaction,
 	statusLabel,
 	tierFor,
 	type BudgetConfig,
@@ -249,7 +250,7 @@ export default function (pi: ExtensionAPI) {
 			compactedThisCrossing = false;
 			return;
 		}
-		if (compactedThisCrossing) return;
+		if (!needsPreSwitchCompaction(st.tier, ctx.model?.provider, st.cfg.provider, compactedThisCrossing)) return;
 		compactedThisCrossing = true;
 		ctx.ui.notify(`${st.cfg.provider} at ${st.pct}%: compacting before any local switch`, "warning");
 		ctx.compact({

@@ -267,6 +267,21 @@ export function tierFor(frac: number, t: Thresholds): Tier {
 	return "ok";
 }
 
+/**
+ * Whether agent_end should compact before a possible switch to the local model. ctx.compact() summarizes
+ * with the session's current model, so compacting on a local model wastes the crossing's one attempt and
+ * leaves the later return to the budget provider uncompacted.
+ */
+export function needsPreSwitchCompaction(
+	tier: Tier,
+	sessionProvider: string | undefined,
+	budgetProvider: string,
+	alreadyCompacted: boolean,
+): boolean {
+	if (tier !== "prepare" && tier !== "divert") return false;
+	return sessionProvider === budgetProvider && !alreadyCompacted;
+}
+
 export const STATUS_COLORS: Record<Tier, "dim" | "accent" | "warning" | "error"> = {
 	ok: "dim",
 	nudge: "accent",
