@@ -717,7 +717,7 @@ export async function buildIndex(target?: string, extPath?: string, hooks?: Rebu
   if (!langConfig) return;
 
   let symbolKindMap: Record<string, string>;
-  let symbols: Record<string, { status: string; symbols: IndexSymbol[] }>;
+  let symbols: Record<string, { status: string; symbols: IndexSymbol[] }> = {};
 
   // Try LSP server first
   try {
