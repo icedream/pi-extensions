@@ -708,6 +708,13 @@ async function detectLanguage(workspaceFolder: string): Promise<LanguageConfig |
   return null;
 }
 
+// detectLanguage returns null when no project marker (e.g. go.mod) is present.
+// Paths asked to build or refresh an index must fail with this error instead of
+// returning silently or dereferencing the null language config.
+function noLanguageError(workspaceFolder: string): Error {
+  return new Error(`No supported language detected in ${workspaceFolder}: the symbol index cannot be built or refreshed. Restore the project markers (e.g. go.mod) or run from a supported project.`);
+}
+
 // =========================================
 // Build index
 // =========================================
@@ -928,6 +935,8 @@ export default function (pi: ExtensionAPI): void {
           ctx.ui.notify(`Symbol index rebuilt: ${stats.symbols} symbols in ${stats.files} files`, "info");
         },
       };
+      const workspaceFolder = target || (await getWorkspace());
+      if (!(await detectLanguage(workspaceFolder))) throw noLanguageError(workspaceFolder);
       await buildIndex(target, undefined, hooks);
       return { content: [{ type: "text", text: "Index built." }], details: undefined };
     },
@@ -1303,13 +1312,16 @@ export default function (pi: ExtensionAPI): void {
       return;
     }
 
+    // Stale index but no language markers left: fail instead of dereferencing null below
+    if (!langConfig) throw noLanguageError(workspaceFolder);
+
     // Rebuild only changed files
     if (changedFiles.length === Object.keys(buildMtimes).length && changedFiles.length > 5) {
       // Most files changed — full rebuild is more efficient
       await buildIndex(workspaceFolder, undefined, hooks);
     } else {
       // Partial rebuild — only re-extract symbols for changed files
-      await partialRebuild(workspaceFolder, langConfig!, changedFiles, hooks);
+      await partialRebuild(workspaceFolder, langConfig, changedFiles, hooks);
     }
 
     _indexBuilt = true;
