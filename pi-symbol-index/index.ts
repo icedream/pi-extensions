@@ -153,12 +153,13 @@ let extensionPath: string = "";
 async function loadConfig(extPath: string): Promise<Config> {
   if (config) return config;
   const configPath = path.join(extPath, "pi-symbol-index.json");
+  let loaded: Config;
   try {
     const raw = await fs.readFile(configPath, "utf-8");
-    config = JSON.parse(raw);
+    loaded = JSON.parse(raw);
   } catch {
     // Fallback: use built-in defaults
-    config = {
+    loaded = {
       languages: {
         go: {
           server: "gopls", args: ["serve"], env: { GOFLAGS: "" },
@@ -188,7 +189,8 @@ async function loadConfig(extPath: string): Promise<Config> {
       }
     };
   }
-  return config;
+  config = loaded;
+  return loaded;
 }
 
 // =========================================
@@ -1304,7 +1306,7 @@ export default function (pi: ExtensionAPI): void {
       await buildIndex(workspaceFolder, undefined, hooks);
     } else {
       // Partial rebuild — only re-extract symbols for changed files
-      await partialRebuild(workspaceFolder, langConfig, changedFiles, hooks);
+      await partialRebuild(workspaceFolder, langConfig!, changedFiles, hooks);
     }
 
     _indexBuilt = true;
