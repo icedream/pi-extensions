@@ -5,7 +5,7 @@
 // Tests exercise buildIndex and readIndex against a temporary Go project
 // and a temporary TypeScript project.
 
-import { buildIndex, readIndex, INDEX_DIR } from './index.ts';
+import extensionDefault, { buildIndex, readIndex, INDEX_DIR } from './index.ts';
 import { crc32, toBase36, symbolNameMatches, findIdentifierColumn } from './index.ts';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -74,6 +74,36 @@ function assert(cond: boolean, msg: string): void {
 function assertEq(actual: unknown, expected: unknown, msg: string): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     throw new Error(`Assertion failed: ${msg}\n  expected: ${JSON.stringify(expected)}\n  actual: ${JSON.stringify(actual)}`);
+  }
+}
+
+// Registers the extension against a fake pi object: registerTool stores the tool
+// definition by name, every other pi API call is a no-op.
+function registerTools(): Record<string, any> {
+  const tools: Record<string, any> = {};
+  const noop = () => {};
+  const pi = new Proxy({} as any, {
+    get: (_target, prop) =>
+      prop === 'registerTool' ? (def: any) => { tools[def.name] = def; } : noop,
+  });
+  extensionDefault(pi);
+  return tools;
+}
+
+// Minimal ToolCallContext for the tools exercised here (only ui.setStatus/ui.notify are used).
+const toolCtx = {
+  hasUI: false,
+  ui: { setStatus: () => {}, notify: () => {}, select: async () => undefined },
+} as any;
+
+// Calls a registered tool and reports whether it rejected, and with what.
+async function callTool(name: string, params: unknown): Promise<{ error?: any; result?: any }> {
+  const tools = registerTools();
+  try {
+    const result = await tools[name].execute('test-call', params, new AbortController().signal, async () => {}, toolCtx);
+    return { result };
+  } catch (error: any) {
+    return { error }
   }
 }
 
@@ -306,6 +336,8 @@ async function main(): Promise<void> {
   await run('per-file mtime tracking', testPerFileMtime);
   await run('symbol name lookup matches Go receiver names', testSymbolNameMatches);
   await run('identifier column skips longer words and receivers', testFindIdentifierColumn);
+  await run('symbol_index_build rejects a directory with no language markers', testBuildRejectsNoLanguage);
+  await run('stale index refresh rejects when language markers were removed', testRefreshRejectsWhenMarkersGone);
 
   // -- Tear down --
   await cleanup();
@@ -366,6 +398,52 @@ async function testFindIdentifierColumn() {
   assertEq(findIdentifierColumn('func Run() {', 'Run'), 5, 'plain function name');
   assertEq(findIdentifierColumn('func RunAll() {', 'Run'), -1, 'longer word is not a match');
   assertEq(findIdentifierColumn('func (r *Runner) Stop() {', 'Run'), -1, 'receiver prefix is not a match');
+}
+
+// Test 20: an explicit build of an unsupported directory must not report success
+async function testBuildRejectsNoLanguage() {
+  const emptyDir = path.join(os.tmpdir(), 'sym_test_nolang_build');
+  await fs.rm(emptyDir, { recursive: true, force: true });
+  await fs.mkdir(path.join(emptyDir, 'src'), { recursive: true });
+  try {
+    const { error, result } = await callTool('symbol_index_build', { target: emptyDir });
+    assert(error !== undefined, `symbol_index_build should reject, got: ${JSON.stringify(result?.content)}`);
+    assert(/No supported language detected/.test(error.message), `clear message, got: ${error.message}`);
+    assert(error.message.includes(emptyDir), `message names the directory, got: ${error.message}`);
+    assert(!(error instanceof TypeError), `Error, not ${error.constructor.name}: ${error.message}`);
+  } finally {
+    await fs.rm(emptyDir, { recursive: true, force: true });
+  }
+}
+
+// Test 21: refreshing an index whose project markers vanished must not dereference a null language config
+async function testRefreshRejectsWhenMarkersGone() {
+  const dir = path.join(os.tmpdir(), 'sym_test_nolang_refresh');
+  await fs.rm(dir, { recursive: true, force: true });
+  await fs.mkdir(path.join(dir, 'src'), { recursive: true });
+  await fs.writeFile(path.join(dir, 'go.mod'), 'module nolang-test\n\ngo 1.21\n');
+  await fs.writeFile(path.join(dir, 'src/main.go'), 'package main\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n');
+
+  await buildIndex(dir, __dirname);
+  assert(await readIndex(dir), 'index built while go.mod exists');
+
+  // Make src/main.go newer than the index, then remove the only language marker.
+  const future = new Date(Date.now() + 60_000);
+  await fs.utimes(path.join(dir, 'src/main.go'), future, future);
+  await fs.rm(path.join(dir, 'go.mod'));
+
+  // getWorkspace() resolves from process.cwd(), so run the tool from the temp project.
+  const prevCwd = process.cwd();
+  process.chdir(dir);
+  try {
+    const { error } = await callTool('symbol_index_symbols', {});
+    assert(error !== undefined, 'symbol_index_symbols should reject when the markers are gone');
+    assert(/No supported language detected/.test(error.message), `clear message, got: ${error.message}`);
+    assert(!(error instanceof TypeError), `Error, not ${error.constructor.name}: ${error.message}`);
+  } finally {
+    process.chdir(prevCwd);
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 }
 
 
