@@ -101,6 +101,7 @@ interface IndexSymbol {
   file: string;
   lineRange: [number, number];
   container?: string;
+  functionBody?: string;   // Filled in by symbol_index_info only; not stored in the index file
   usages: Array<{ file: string; range: [number, number] }>;
   incomingCalls: Array<{ name: string; kind: string; file: string; lineRange: [number, number] }>;
   outgoingCalls: Array<{ name: string; kind: string; file: string; lineRange: [number, number] }>;
