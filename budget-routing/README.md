@@ -1,6 +1,9 @@
 # budget-routing
 
-Pi extension for a monthly spend cap on one provider (default: GitHub Copilot). It reads Pi's own session logs, estimates month-to-date cost, and changes behavior by tier as the cap fills.
+Pi extension for a monthly spend cap on one provider (default: GitHub Copilot). It takes the
+month-to-date figure from the provider's own usage API when a [`seat`](#seat-figure) block is
+configured, falls back to estimating from Pi's session logs, and changes behavior by tier as the cap
+fills.
 
 | Tier | Default | What happens |
 |------|---------|--------------|
@@ -8,6 +11,10 @@ Pi extension for a monthly spend cap on one provider (default: GitHub Copilot). 
 | warn | 80% | Notification |
 | prepare | 95% | Compacts the main session while the provider still works, between agent runs |
 | divert | 100% | Rewrites launches of `localSubagents` to the local model. Blocks other launches for the provider. Offers to switch the main session to the local model (confirmation required) |
+
+The footer also carries a compact indicator next to the session cost — `copilot 92%`, coloured by
+tier. A leading `~` means the figure is estimated from Pi's own logs rather than the provider's seat
+figure; `!` and `over` mark the prepare and divert tiers.
 
 ## Install
 

@@ -14,6 +14,7 @@ import {
 	parseConfig,
 	parseSeatFigure,
 	spendSince,
+	statusLabel,
 	tierFor,
 } from "./budget.ts";
 import { pickGitHubToken } from "./credential.ts";
@@ -274,4 +275,12 @@ test("monthSpend: a live figure from another month falls back to the meter", asy
 	assert.equal(r.source, "meter");
 	assert.equal(r.observationIgnored, true);
 	assert.ok(Math.abs(r.spend - 4) < 1e-9, `got ${r.spend}`);
+});
+
+test("statusLabel is compact, coloured by tier, and marks estimates", () => {
+	assert.deepEqual(statusLabel("github-copilot", 42, "ok", "live"), { text: "copilot 42%", color: "dim" });
+	assert.deepEqual(statusLabel("github-copilot", 74, "nudge", "calibrated"), { text: "copilot 74%", color: "accent" });
+	assert.deepEqual(statusLabel("github-copilot", 96, "prepare", "live"), { text: "copilot 96% !", color: "warning" });
+	assert.deepEqual(statusLabel("github-copilot", 103, "divert", "live"), { text: "copilot 103% over", color: "error" });
+	assert.deepEqual(statusLabel("litellm", 70, "warn", "meter"), { text: "litellm ~70%", color: "warning" });
 });

@@ -20,6 +20,7 @@ import {
 	DEFAULT_SEAT,
 	loadConfig,
 	monthSpend,
+	statusLabel,
 	tierFor,
 	type BudgetConfig,
 	type CredentialSource,
@@ -34,6 +35,7 @@ const AGENT_DIR = join(homedir(), ".pi", "agent");
 const SESSIONS_DIR = join(AGENT_DIR, "sessions");
 const CONFIG_PATH = process.env.PI_BUDGET_ROUTING_CONFIG ?? join(AGENT_DIR, "budget-routing.json");
 const CACHE_MS = 120_000;
+const STATUS_KEY = "budget-routing";
 
 interface State {
 	tier: Tier;
@@ -90,6 +92,20 @@ export default function (pi: ExtensionAPI) {
 		if (announced.has(key)) return;
 		announced.add(key);
 		ctx.ui.notify(`budget-routing: ${message}`, severity);
+	}
+
+	/** Footer indicator next to the session cost, coloured by tier. Cleared when there is no config. */
+	function updateStatus(ctx: ExtensionContext, st: State | undefined): void {
+		if (!st) {
+			ctx.ui.setStatus(STATUS_KEY, undefined);
+			return;
+		}
+		const label = statusLabel(st.cfg.provider, st.pct, st.tier, st.source);
+		ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg(label.color, label.text));
+	}
+
+	function refreshStatus(ctx: ExtensionContext): Promise<void> {
+		return safeState(ctx).then((st) => updateStatus(ctx, st));
 	}
 
 	/** Fetch at most once at a time; a second caller joins the run already in flight. */
@@ -174,7 +190,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		announced.clear();
 		compactedThisCrossing = false;
-		void refreshSeat(ctx);
+		void refreshSeat(ctx).then(() => refreshStatus(ctx));
 	});
 
 	pi.registerCommand("budget-seat", {
@@ -188,9 +204,13 @@ export default function (pi: ExtensionAPI) {
 	// Nudge the model and notify. At divert, offer the main-session switch.
 	pi.on("before_agent_start", async (event, ctx) => {
 		const st = await safeState(ctx);
+		updateStatus(ctx, st);
 		if (st?.observationIgnored && !announced.has("stale-observation")) {
 			announced.add("stale-observation");
-			ctx.ui.notify("budget-routing: the observed seat figure is from another month. Update observed.asOf.", "warning");
+			ctx.ui.notify(
+				"budget-routing: the seat figure is from another month and was ignored. Fix the seat fetch, or update observed.asOf.",
+				"warning",
+			);
 		}
 		if (!st || st.tier === "ok") return;
 
@@ -245,7 +265,7 @@ export default function (pi: ExtensionAPI) {
 	// Keep the seat figure current between runs. Off the critical path: the next turn sees it because
 	// currentState() re-reads the config file.
 	pi.on("agent_settled", async (_event, ctx) => {
-		void refreshSeat(ctx);
+		void refreshSeat(ctx).then(() => refreshStatus(ctx));
 	});
 
 	// At divert: light subagent launches run locally; other launches are blocked.

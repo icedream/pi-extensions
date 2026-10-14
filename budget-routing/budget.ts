@@ -267,6 +267,30 @@ export function tierFor(frac: number, t: Thresholds): Tier {
 	return "ok";
 }
 
+export const STATUS_COLORS: Record<Tier, "dim" | "accent" | "warning" | "error"> = {
+	ok: "dim",
+	nudge: "accent",
+	warn: "warning",
+	prepare: "warning",
+	divert: "error",
+};
+
+/**
+ * Compact footer indicator, e.g. "copilot 92%". A leading ~ marks an estimate from Pi's own logs
+ * rather than the seat figure; the trailing marker names the tier once it matters.
+ */
+export function statusLabel(
+	provider: string,
+	pct: number,
+	tier: Tier,
+	source: MonthSpend["source"],
+): { text: string; color: "dim" | "accent" | "warning" | "error" } {
+	const name = provider === "github-copilot" ? "copilot" : provider;
+	const estimate = source === "meter" ? "~" : "";
+	const mark = tier === "prepare" ? " !" : tier === "divert" ? " over" : "";
+	return { text: `${name} ${estimate}${pct}%${mark}`, color: STATUS_COLORS[tier] };
+}
+
 export interface DivertResult {
 	/** Launches whose model was rewritten to the local subagent reference. */
 	rewritten: number;
