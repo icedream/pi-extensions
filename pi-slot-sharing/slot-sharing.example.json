@@ -1,0 +1,5 @@
+{
+	"baseUrl": "http://127.0.0.1:11182",
+	"ramFloorMib": 1024,
+	"marginMib": 256
+}

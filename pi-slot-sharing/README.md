@@ -1,0 +1,187 @@
+# pi-slot-sharing
+
+Lets several Pi sessions take turns on a server that holds **one** conversation at a time.
+
+Works with Strata and with llama.cpp. The save/restore API is llama.cpp's own, and Strata implements it
+(`serve/server.py`: *"llama-server's POST /slots/{id}?action=save|restore"*), so "slot" is the word both
+servers use for the thing being shared. See [Backends](#backends) for what they share and where they
+differ.
+
+A server started with a slot save path can write the conversation the engine is holding out to a file and
+read it back (`POST /slots/0?action=save|restore`). Reading it back is much cheaper than re-prefilling
+it. Measured on Qwen3.8-Flash-Next IQ3_S, int8 KV, 393,216 position context:
+
+| | 107,695 tokens |
+|---|---|
+| save | 561 ms |
+| restore | 6,804 ms |
+| re-prefill instead | 64,500 ms |
+| next request after restore | 107,690 of 107,695 prompt tokens reused |
+
+So the extension saves this session's conversation when it gives up the slot and restores it before the
+next request, and arbitrates through a lock file so concurrent Pi processes do not decide against each
+other. When a conversation is too large to bring back, it says so and lets the request re-prefill — the
+session still works, it just pays what it would have paid anyway.
+
+The same round trip on llama.cpp b10920 with a 260K test model, after a different prompt had evicted the
+slot: save 377 tokens, restore 377 tokens, and the next identical request reported `cache_n 373,
+prompt_n 1`.
+
+Every figure quoted in this file comes from **one reference machine**: RX 7900 XTX (gfx1100), 62 GiB of
+system RAM, Qwen3.8-Flash-Next IQ3_S at int8 KV with a 393,216 position context. They are worked examples
+of the arithmetic, not constants — `/slot-sharing` prints the figures for the server you are actually
+running, and the extension learns them from that server rather than assuming them.
+
+## Install
+
+From the repository root:
+
+```sh
+pi install $(pwd)/pi-slot-sharing
+```
+
+Then create `~/.pi/agent/slot-sharing.json` (see below) and run `/reload`. Without a config file the
+extension does nothing.
+
+## Server side
+
+Two things have to be true of the server; the extension checks both and stays quiet if either fails.
+
+- **A slot save path must be configured.** On Strata it is a top-level key in the server config, not an
+  engine argument: `"slot_save_path": "/data/sessions"`. Passing `--slot-save-path` to the Strata engine
+  makes the engine refuse to start. On llama.cpp it is the other way round: the `--slot-save-path PATH`
+  engine flag.
+- **One slot.** With several live slots the server is already serving sessions concurrently and there is
+  nothing to take turns over, so the extension stands down. On Strata that means no `--batch` /
+  `--slots` (the server answers 501 for save/restore under parallel requests). On llama.cpp it means
+  `-np, --parallel N` must be 1 — see [Backends](#backends).
+
+## Backends
+
+The backend is detected from `/props` (`build_info` reads `"Strata 0.1.44"` on one, `"b10920-eafe15a5e"`
+on the other), or stated with `"backend": "strata" | "llama.cpp"`.
+
+| | Strata | llama.cpp |
+|---|---|---|
+| save/restore endpoint | `POST /slots/0?action=save\|restore` | same — it is llama.cpp's API |
+| response fields | `n_saved`/`n_written`, `n_restored`/`n_read` | identical |
+| feature off | 501 | 501 (`ERROR_TYPE_NOT_SUPPORTED` → `format_error_response` → 501) |
+| capability probe | works | works — `post_slots` checks `slot_save_path.empty()` before the action, verified against a live server started without the flag |
+| context, model, version | `/v1/status`, `/metrics` | `/props` |
+| KV type | `/metrics` `engine.kv` | not reported over HTTP |
+| engine start time | `/v1/status` `started` | not reported — a restart cannot be noticed, failures are handled instead |
+| server RAM | `/v1/status` `machine.ram` | not reported |
+| refuses a restore it cannot hold | **yes** — the gate applies | **no** — no admission check exists, so the restore is attempted and the failure handled |
+| several slots at once | refuses save/restore with `--batch` | `-np N`, and per-request `id_slot` |
+
+llama.cpp with `-np N` is the better answer to "three sessions on one server" when the VRAM fits N
+contexts — no extension involved. b10920 also has `--kv-unified-per-slot N`, which sizes a shared KV pool
+to `n_parallel*N` with a per-slot limit. This extension is for the case where there is only room for one.
+
+## Config
+
+Path: `~/.pi/agent/slot-sharing.json`, or the file in `PI_SLOT_SHARING_CONFIG`. Start from
+[slot-sharing.example.json](slot-sharing.example.json).
+
+The rule for this file: **if the server can be asked, the extension asks.** What is left in here is only
+what the server does not report.
+
+| Key | Required | Meaning |
+|-----|----------|---------|
+| `baseUrl` | yes | The server, e.g. `http://127.0.0.1:11182`. Sessions whose model does not point here are ignored |
+| `backend` | no | `"auto"` (default), `"strata"` or `"llama.cpp"`. Auto reads `/props`; set it only if auto-detection refuses |
+| `apiKey` | no | Sent as `Authorization: Bearer`. Falls back to `SLOT_SHARING_API_KEY` |
+| `ramFloorMib` | no | The engine's `--conversation-cache-min-free-mib`. **Not reported by the server**, so it has to be stated. Default 2560, which is Strata's own default. Strata backend only |
+| `marginMib` | no | Extra headroom beyond the floor. Default 256. Covers our own allocations and the gap between `MemAvailable` and the `used/total` pair the server reports |
+| `provider` | no | Only act for this model provider. Usually unnecessary: the model's `baseUrl` already has to match |
+| `bytesPerTokenFallback` | no | Assumed bytes/token until a save reports `n_written` / `n_saved`. Default 16896 (int8 KV). Only used for reporting, never to decide a restore |
+| `maxRestoreTokens` | no | Hard cap below what the gate allows. Default: whatever the gate allows |
+| `saveEveryTurns` | no | Save after every N agent runs. Default 1 |
+| `lockStaleMs` | no | A lock older than this, held by a process that is gone, is taken over. Default 120000 |
+| `enabled` | no | Master switch. Default true |
+
+State (index, owner record, lock) lives in `~/.pi/agent/slot-sharing/`, override with
+`PI_SLOT_SHARING_STATE`. The session files themselves live on the server.
+
+## What is read from the server
+| Value | Source |
+|-------|--------|
+| Context size | `/v1/status` `context.max_positions`, `/metrics` `engine.max_context` |
+| Model, engine version, KV type | `/metrics` `engine.model`, `.version`, `.kv` |
+| Slot count | `/props` `total_slots` |
+| Engine start time (restart = slot state lost) | `/v1/status` `started` |
+| Server RAM | `/v1/status` `machine.ram.used_gib` / `total_gib` |
+| Whether save/restore is switched on | probed: `POST /slots/0?action=capability` answers 501 when off, 400 when on. No file is written either way |
+| Bytes per token of a session file | learned from the first save's `n_written` / `n_saved` |
+
+When the server is on the loopback interface, free RAM is read from `/proc/meminfo` `MemAvailable` —
+the exact number the engine's own guard reads. Otherwise the extension falls back to the server's
+`total - used`. Those two figures differ in **either** direction, not a predictable one — measured 37 MiB
+apart on the reference machine, with `total - used` the more optimistic of the two. That gap is what
+`marginMib` exists to absorb; it is not a claim that the fallback is safe on its own. If the server is
+local but reached through a LAN address (as Pi's provider entry often is), the fallback is what runs.
+llama.cpp reports neither figure, which is why it has no gate to fall back on at all.
+
+## The RAM gate
+
+A restore is not free of RAM, and this is the part that decides whether the feature works at all on a
+given machine. Strata's own arithmetic, mirrored in [sessions.ts](sessions.ts) and applied only by the
+Strata backend:
+
+```
+peak(file)  = file + 16 MiB + (file / 16 MiB + 1) * 4096 + 1 MiB
+admitted    = available >= peak + floor
+```
+
+A save needs none of that — it streams out in 16 MiB blocks — which is why saves succeed at sizes where
+restores are refused. Two consequences worth knowing:
+
+- **The outgoing conversation is not released first.** The engine reads the new file, and only afterwards
+  drops the K/V it was holding. So the RAM available is whatever the *current* conversation leaves.
+- **File size is what to shrink, not the floor.** At int8 KV a session file costs about 16.1 KB per
+  token, so a 256K conversation needs about 4.1 GiB free on top of the floor. Whether that is available
+  depends entirely on what the machine has already committed to the model and the live conversation: on
+  the 62 GiB reference machine it is not, no floor setting makes it fit, and restores stop working around
+  190–220K tokens. A machine with more free RAM reaches further, and `/slot-sharing` prints the ceiling
+  for yours. `--kv k8v4` moves the ceiling by shrinking the file, at a quality cost on long documents
+  that has not been measured.
+
+`/slot-sharing` prints the current figure: how much is free, how many tokens a restore could bring
+back at that moment, and whether this session's context window is larger than that.
+
+## Commands
+
+| Command | What it does |
+|---------|--------------|
+| `/slot-sharing` | Server figures, gate math, who holds the slot, what is saved for whom |
+| `/slot-sharing-forget` | Drop this session's saved conversation from the index |
+
+## When a saved conversation stops being usable
+
+The file is a snapshot of one conversation on one engine configuration. The extension marks it stale,
+and re-prefills instead of reading it, after:
+
+- compaction, a fork, or moving in the session tree — the transcript changed underneath it
+- a model switch — a file is refused by a differently configured engine
+- another process took the slot and this session's copy is gone from it
+
+An engine restart does **not** invalidate a file: session files survive restarts, and the extension
+re-reads `started` to notice the restart happened.
+
+## Limits
+
+- **One slot.** Sessions take turns, they do not run concurrently. A server reporting more than one slot
+  is left alone: it is already serving sessions at once.
+- **On llama.cpp there is nothing to predict.** It has no RAM admission check, so a restore that will not
+  fit is discovered by it failing, not by the extension declining. And with no `started` figure, an
+  engine restart is noticed only through a failed restore.
+- **The lock is cooperation, not enforcement.** It arbitrates between Pi processes on one machine that
+  use this extension. Another client hitting the API directly can still take the slot; the extension
+  notices at the next save and marks its record stale rather than writing someone else's conversation
+  out under this session's name.
+- **Session files on HIP/AMD are not exercised upstream.** Strata's own notes say the Windows engine, HIP
+  and AMD cards have not been run for session files. A transfer failure after the device writes began
+  ends the engine. Saves and restores were verified working on an RX 7900 XTX (gfx1100) at 37K, 108K and
+  283K tokens, but treat the first large save on a new setup as the risky one.
+- **Restore throughput degrades with size**, and not linearly: 1.10 GB/s at 37K tokens against
+  0.276 GB/s at 108K on the reference machine. Cause not established. Budget the time accordingly.

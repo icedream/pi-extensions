@@ -1,0 +1,20 @@
+{
+	"name": "pi-slot-sharing",
+	"type": "module",
+	"version": "0.1.0",
+	"description": "Pi extension: let several Pi sessions take turns on a single-sequence Strata or llama.cpp server by saving and restoring the server's slot conversation, gated on the RAM the server actually has free",
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"scripts": {
+		"test": "node --test sessions.test.ts config.test.ts",
+		"typecheck": "tsc -p tsconfig.json"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^1.1.0",
+		"@types/node": "^26.1.1",
+		"typescript": "^6.0.3"
+	}
+}

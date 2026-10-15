@@ -1,0 +1,378 @@
+/**
+ * pi-slot-sharing — let several Pi sessions take turns on a server that holds one sequence.
+ *
+ * A server that can hold only one conversation at a time makes every Pi session but the last one
+ * re-prefill from scratch on each turn. Such a server can usually write the conversation it is holding
+ * out to a file and read it back (`POST /slots/0?action=save|restore` — llama.cpp's API, which Strata
+ * implements). Reading it back is far cheaper than re-prefilling it: measured on Qwen3.8-Flash-Next at
+ * 107,695 tokens, 6.8 s to restore against 64.5 s to re-prefill, and the follow-up request reused
+ * 107,690 of 107,695 prompt tokens.
+ *
+ * This extension does the turn-taking: before each provider request it makes sure the slot holds *this*
+ * session's conversation, saving and restoring as needed, and arbitrating through a lock file so
+ * concurrent Pi processes do not decide against each other.
+ *
+ * Nothing about the server is baked in. The backend is picked from `/props` (or stated in the config),
+ * and each backend reports what its server will tell us — see backend.ts for what Strata and llama.cpp
+ * share and where they differ. Bytes per token of a session file is learned from the server's own
+ * `n_written` / `n_saved` on the first save. Whether save/restore is available at all is probed.
+ *
+ * Strata refuses a restore it cannot hold in RAM, and the refusal happens *before* it releases the
+ * conversation in the slot, so the Strata backend mirrors that arithmetic and skips a restore that would
+ * be refused. The session still works: the request prefills as it would have anyway. llama.cpp has no
+ * such check, so there is nothing to predict there and the extension just tries.
+ *
+ * Config: ~/.pi/agent/slot-sharing.json (override with PI_SLOT_SHARING_CONFIG). Without a config
+ * file the extension does nothing.
+ *
+ * Commands:
+ *   /slot-sharing             what the server reports, what the gate allows, what is saved
+ *   /slot-sharing-forget      drop this session's saved conversation from the index
+ */
+
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { availableBytesFrom, detectKind, readProps, type ServerInfo, type SlotBackend, type SlotCapability } from "./backend.ts";
+import { loadConfig, type ResolvedConfig } from "./config.ts";
+import { JsonClient, ServerHttpError } from "./http.ts";
+import { LlamaCppBackend } from "./llamacpp.ts";
+import { StrataBackend } from "./strata.ts";
+import { SessionStore } from "./store.ts";
+import { bytesPerTokenFromSave, sessionKey, slotFilenameProblem, maxRestorableTokens, type SessionIndex } from "./sessions.ts";
+
+const AGENT_DIR = join(homedir(), ".pi", "agent");
+const CONFIG_PATH = process.env.PI_SLOT_SHARING_CONFIG ?? join(AGENT_DIR, "slot-sharing.json");
+const STATE_DIR = process.env.PI_SLOT_SHARING_STATE ?? join(AGENT_DIR, "slot-sharing");
+
+const INFO_TTL_MS = 5_000;
+const MEMINFO_PATH = "/proc/meminfo";
+
+function fileNameFor(key: string): string {
+	return `pi-${createHash("sha256").update(key).digest("hex").slice(0, 40)}.bin`;
+}
+
+function modelRef(ctx: ExtensionContext): string {
+	return `${ctx.model?.provider ?? "?"}/${ctx.model?.id ?? "?"}`;
+}
+
+/** Does the model this session is talking to live at the configured server? */
+function servesModel(cfg: ResolvedConfig, ctx: ExtensionContext): boolean {
+	const modelUrl = ctx.model?.baseUrl;
+	if (!modelUrl) return false;
+	const normalized = (url: string) => url.replace(/\/+$/, "").replace(/\/v1$/, "");
+	if (normalized(modelUrl) !== normalized(cfg.baseUrl)) return false;
+	if (cfg.provider && ctx.model?.provider !== cfg.provider) return false;
+	return true;
+}
+
+function readMeminfo(): string | undefined {
+	try {
+		return readFileSync(MEMINFO_PATH, "utf8");
+	} catch {
+		return undefined;
+	}
+}
+
+function isLoopback(baseUrl: string): boolean {
+	try {
+		const host = new URL(baseUrl).hostname;
+		return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
+	} catch {
+		return false;
+	}
+}
+
+const gib = (bytes: number) => `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+const describe = (error: unknown) => (error instanceof ServerHttpError ? `${error.status} ${error.message}` : String(error));
+
+export default async function (pi: ExtensionAPI) {
+	const loaded = loadConfig(CONFIG_PATH);
+	if (!loaded.present) return;
+	if (loaded.problems.length > 0 || !loaded.config) {
+		const problems = loaded.problems.join("; ");
+		pi.on("session_start", (_event, ctx) => ctx.ui.notify(`pi-slot-sharing: ${problems}`, "error"));
+		return;
+	}
+	const cfg = loaded.config;
+	const client = new JsonClient(cfg.baseUrl, cfg.apiKey);
+	const store = new SessionStore(STATE_DIR);
+
+	let backendChoice: { backend?: SlotBackend; note?: string } | undefined;
+	let infoCache: { at: number; info?: ServerInfo; capability?: SlotCapability; note?: string } = { at: 0 };
+	let turns = 0;
+	let lastNote = "";
+
+	function note(message: string, ctx: ExtensionContext): void {
+		if (message === lastNote) return;
+		lastNote = message;
+		ctx.ui.notify(`pi-slot-sharing: ${message}`, "info");
+	}
+
+	/** Which server is this, and what does it speak? */
+	async function pickBackend(): Promise<{ backend?: SlotBackend; note?: string }> {
+		if (backendChoice) return backendChoice;
+		let kind = cfg.backend === "auto" ? undefined : cfg.backend;
+		if (!kind) {
+			try {
+				kind = detectKind(await readProps(client));
+			} catch (error) {
+				backendChoice = { note: `${cfg.baseUrl} unreadable: ${describe(error)}` };
+				return backendChoice;
+			}
+		}
+		if (!kind) {
+			backendChoice = { note: `cannot tell which server ${cfg.baseUrl} is; set "backend" in the config` };
+			return backendChoice;
+		}
+		backendChoice = { backend: kind === "strata" ? new StrataBackend(client) : new LlamaCppBackend(client) };
+		return backendChoice;
+	}
+
+	async function info(force = false) {
+		if (!force && Date.now() - infoCache.at < INFO_TTL_MS) return infoCache;
+		const picked = await pickBackend();
+		if (!picked.backend) return { at: Date.now(), note: picked.note };
+		const next: typeof infoCache = { at: Date.now() };
+		try {
+			next.info = await picked.backend.info();
+			next.capability = await picked.backend.capability();
+		} catch (error) {
+			next.note = describe(error);
+		}
+		infoCache = next;
+		return next;
+	}
+
+	function availableBytes(found: ServerInfo | undefined): number | undefined {
+		return availableBytesFrom(found, isLoopback(cfg.baseUrl) ? readMeminfo() : undefined);
+	}
+
+	function identity(ctx: ExtensionContext) {
+		const sessionId = ctx.sessionManager.getSessionId();
+		const ref = modelRef(ctx);
+		const key = sessionKey(sessionId, ref);
+		return { sessionId, ref, key, fileName: fileNameFor(key) };
+	}
+
+	/** A server with several live slots is already serving sessions at once; there is nothing to arbitrate. */
+	function singleSlot(found: ServerInfo | undefined): boolean {
+		return found?.totalSlots === undefined || found.totalSlots <= 1;
+	}
+
+	/** Make sure the server's slot holds this session. Runs before every provider request. */
+	async function ensureLoaded(ctx: ExtensionContext): Promise<void> {
+		if (!cfg.enabled || !servesModel(cfg, ctx)) return;
+		const { sessionId, key, fileName } = identity(ctx);
+		const problem = slotFilenameProblem(fileName);
+		if (problem) {
+			note(`session file name ${problem}`, ctx);
+			return;
+		}
+		if (store.readOwner()?.key === key) return; // already ours, nothing to do
+
+		const found = await info();
+		if (found.note) {
+			note(`server unreadable, leaving the slot alone (${found.note})`, ctx);
+			return;
+		}
+		if (!singleSlot(found.info)) {
+			note(`${cfg.baseUrl} runs ${found.info?.totalSlots} slots at once — nothing to take turns over`, ctx);
+			return;
+		}
+		if (!found.capability?.enabled) {
+			note(`slot save/restore is off on ${cfg.baseUrl}; sessions will each re-prefill`, ctx);
+			return;
+		}
+		const backend = found.info ? (await pickBackend()).backend : undefined;
+		if (!backend) return;
+
+		await store.withLock(cfg.lockStaleMs, async () => {
+			if (store.readOwner()?.key === key) return;
+			const index = store.readIndex();
+			const entry = index.records[key];
+			const claim = () => store.writeOwner({ key, sessionId, pid: process.pid, at: Math.floor(Date.now() / 1000) });
+
+			if (!entry) {
+				// First request of this session here: nothing saved to read, the request prefills.
+				claim();
+				return;
+			}
+			if (entry.stale) {
+				note(`saved conversation is stale (${entry.stale}), re-prefilling`, ctx);
+				claim();
+				return;
+			}
+
+			const fresh = (await info(true)).info;
+			const available = availableBytes(fresh);
+			const verdict = backend.gate && available !== undefined ? backend.gate({ availableBytes: available, floorBytes: cfg.ramFloorBytes, marginBytes: cfg.marginBytes, fileBytes: entry.record.bytes }) : undefined;
+			if (verdict && !verdict.ok) {
+				note(`${entry.record.tokens.toLocaleString()} token conversation not restored: ${verdict.reason}. This request re-prefills.`, ctx);
+				claim();
+				return;
+			}
+			if (cfg.maxRestoreTokens !== undefined && entry.record.tokens > cfg.maxRestoreTokens) {
+				note(`${entry.record.tokens.toLocaleString()} tokens is over maxRestoreTokens (${cfg.maxRestoreTokens}); this request re-prefills`, ctx);
+				claim();
+				return;
+			}
+
+			try {
+				const restored = await backend.restore(fileName);
+				index.records[key] = { record: { ...entry.record, tokens: restored.tokens || entry.record.tokens } };
+				store.writeIndex(index);
+				claim();
+				note(`restored ${restored.tokens.toLocaleString()} tokens (${gib(restored.bytes)}) from ${fileName}`, ctx);
+			} catch (error) {
+				note(`restore of ${fileName} failed (${describe(error)}); this request re-prefills`, ctx);
+				claim();
+			}
+		});
+	}
+
+	async function saveNow(ctx: ExtensionContext, why: string): Promise<void> {
+		if (!cfg.enabled || !servesModel(cfg, ctx)) return;
+		const { sessionId, ref, key, fileName } = identity(ctx);
+		if (slotFilenameProblem(fileName)) return;
+		const found = await info(true);
+		const backend = found.info ? (await pickBackend()).backend : undefined;
+		if (!backend || !found.capability?.enabled || !singleSlot(found.info)) return;
+
+		await store.withLock(cfg.lockStaleMs, async () => {
+			const owner = store.readOwner();
+			if (owner && owner.key !== key) {
+				// Somebody else's conversation is in the slot now; saving would write their conversation out
+				// under our name, so there is nothing of ours to keep.
+				const index = store.readIndex();
+				if (index.records[key]) index.records[key].stale = `slot taken by ${owner.sessionId}`;
+				store.writeIndex(index);
+				return;
+			}
+			try {
+				const saved = await backend.save(fileName);
+				const index = store.readIndex();
+				index.records[key] = {
+					record: {
+						sessionId,
+						modelRef: ref,
+						fileName,
+						tokens: saved.tokens,
+						bytes: saved.bytes,
+						savedAt: Math.floor(Date.now() / 1000),
+						engineStarted: found.info?.started ?? 0,
+					},
+				};
+				const learned = bytesPerTokenFromSave(saved.bytes, saved.tokens);
+				if (learned !== undefined) index.bytesPerToken = learned;
+				store.writeIndex(index);
+				store.writeOwner({ key, sessionId, pid: process.pid, at: Math.floor(Date.now() / 1000) });
+			} catch (error) {
+				note(`save (${why}) failed: ${describe(error)}`, ctx);
+			}
+		});
+	}
+
+	/** The saved KV no longer matches this conversation: the transcript changed underneath it. */
+	function invalidate(ctx: ExtensionContext, why: string): void {
+		if (!cfg.enabled || !servesModel(cfg, ctx)) return;
+		const { key } = identity(ctx);
+		const index = store.readIndex();
+		if (!index.records[key]) return;
+		index.records[key].stale = why;
+		store.writeIndex(index);
+	}
+
+	pi.on("before_provider_request", async (_event, ctx) => {
+		await ensureLoaded(ctx);
+	});
+
+	pi.on("agent_end", async (_event, ctx) => {
+		turns += 1;
+		if (cfg.saveEveryTurns > 1 && turns % cfg.saveEveryTurns !== 0) return;
+		await saveNow(ctx, "end of run");
+	});
+
+	pi.on("session_before_switch", async (_event, ctx) => {
+		await saveNow(ctx, "session switch");
+	});
+
+	pi.on("session_shutdown", async (_event, ctx) => {
+		await saveNow(ctx, "shutdown");
+		store.clearOwner();
+	});
+
+	pi.on("session_before_compact", async (_event, ctx) => invalidate(ctx, "compacted"));
+	pi.on("session_before_fork", async (_event, ctx) => invalidate(ctx, "forked"));
+	pi.on("session_before_tree", async (_event, ctx) => invalidate(ctx, "tree moved"));
+
+	pi.on("model_select", async (_event, ctx) => {
+		// A file belongs to one model and configuration; after a switch the old one is not readable back.
+		if (!cfg.enabled) return;
+		const sessionId = ctx.sessionManager.getSessionId();
+		const index = store.readIndex();
+		for (const entry of Object.values(index.records)) {
+			if (entry.record.sessionId === sessionId && !entry.stale) entry.stale = "model changed";
+		}
+		store.writeIndex(index);
+	});
+
+	pi.registerCommand("slot-sharing", {
+		description: "Show what the server reports and what its RAM gate allows this session to restore",
+		handler: async (_args, ctx) => {
+			const found = await info(true);
+			const picked = await pickBackend();
+			const lines: string[] = [`config: ${CONFIG_PATH}`, `server: ${cfg.baseUrl}`];
+			if (found.note) lines.push(`server error: ${found.note}`);
+			lines.push(`backend: ${found.info?.kind ?? picked.note ?? "unknown"}${found.info?.version ? ` (${found.info.version})` : ""}`);
+			if (found.info?.model) lines.push(`model: ${found.info.model}${found.info.kv ? `, kv ${found.info.kv}` : ""}`);
+			if (found.info?.maxContext) lines.push(`context: ${found.info.maxContext.toLocaleString()} positions, slots: ${found.info.totalSlots ?? "?"}`);
+			if (found.info?.started) lines.push(`engine started: ${new Date(found.info.started * 1000).toISOString()}`);
+			if (found.info?.ram) lines.push(`server ram: ${found.info.ram.usedGib} of ${found.info.ram.totalGib} GiB used`);
+			lines.push(`save/restore: ${found.capability?.enabled ? "on" : `off (${found.capability?.reason ?? "unknown"})`}`);
+
+			const index = store.readIndex();
+			const perToken = index.bytesPerToken ?? cfg.bytesPerTokenFallback;
+			lines.push(`bytes/token: ${perToken.toFixed(0)} (${index.bytesPerToken ? "learned from saves" : "config fallback, no save measured yet"})`);
+
+			if (picked.backend?.gate) {
+				lines.push(`gate: floor ${Math.round(cfg.ramFloorBytes / (1024 * 1024))} MiB (config), margin ${Math.round(cfg.marginBytes / (1024 * 1024))} MiB (config)`);
+				const available = availableBytes(found.info);
+				if (available !== undefined) {
+					const room = maxRestorableTokens(available, cfg.ramFloorBytes, cfg.marginBytes, perToken);
+					lines.push(`free now: ${gib(available)} -> a restore of up to ~${room.toLocaleString()} tokens fits`);
+					if (ctx.model && ctx.model.contextWindow > room) {
+						lines.push(`this session's window (${ctx.model.contextWindow.toLocaleString()}) is past that: a long session re-prefills instead of restoring`);
+					}
+				}
+			} else {
+				lines.push("gate: this server does not refuse restores it cannot hold, so they are attempted and failures handled");
+			}
+
+			const owner = store.readOwner();
+			lines.push(`slot held by: ${owner ? `${owner.sessionId} (pid ${owner.pid})` : "nobody recorded"}`);
+			const mine = index.records[identity(ctx).key];
+			lines.push(`this session: ${mine ? `${mine.record.tokens.toLocaleString()} tokens, ${gib(mine.record.bytes)}${mine.stale ? `, stale: ${mine.stale}` : ""}` : "nothing saved"}`);
+			for (const [key, entry] of Object.entries(index.records)) {
+				if (key === identity(ctx).key) continue;
+				lines.push(`  saved: ${entry.record.sessionId} ${entry.record.modelRef} ${entry.record.tokens.toLocaleString()} tok ${gib(entry.record.bytes)} ${new Date(entry.record.savedAt * 1000).toISOString()}${entry.stale ? ` stale: ${entry.stale}` : ""}`);
+			}
+			ctx.ui.notify(lines.join("\n"), "info");
+		},
+	});
+
+	pi.registerCommand("slot-sharing-forget", {
+		description: "Stop tracking this session's saved conversation",
+		handler: async (_args, ctx) => {
+			const { key } = identity(ctx);
+			const index: SessionIndex = store.readIndex();
+			const had = index.records[key] !== undefined;
+			delete index.records[key];
+			store.writeIndex(index);
+			if (store.readOwner()?.key === key) store.clearOwner();
+			ctx.ui.notify(had ? "dropped this session's saved conversation from the index" : "nothing saved for this session", "info");
+		},
+	});
+}
