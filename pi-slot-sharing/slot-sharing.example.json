@@ -1,4 +1,8 @@
 {
 	"ramFloorMib": 2560,
-	"marginMib": 256
+	"marginMib": 256,
+	"providers": {
+		"icedream-homepc/strata": { "marginMib": 512 },
+		"lab/llamacpp": { "ramFloorMib": 0, "maxRestoreTokens": 60000 }
+	}
 }

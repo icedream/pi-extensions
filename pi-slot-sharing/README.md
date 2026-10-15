@@ -95,6 +95,28 @@ object is a working config. What is in here is only what no server can be asked 
 | `saveEveryTurns` | no | Save after every N agent runs. Default 1 |
 | `lockStaleMs` | no | A lock older than this, held by a process that is gone, is taken over. Default 120000 |
 | `enabled` | no | Master switch. Default true |
+| `providers` | no | Per-provider overrides, keyed by the model's provider name. Each block starts from the top level and replaces only what it names — see [Per-provider settings](#per-provider-settings) |
+
+### Per-provider settings
+
+The numbers in this file describe one server, not the extension. A Strata engine at 393,216 positions with
+int8 KV and a llama.cpp server at 160k with `q8_0` KV have different RAM floors and different restore
+ceilings, so `providers` keys off `ctx.model.provider` and overrides per provider:
+
+```json
+{
+  "ramFloorMib": 2560,
+  "marginMib": 256,
+  "providers": {
+    "icedream-homepc/strata": { "marginMib": 512 },
+    "lab/llamacpp": { "ramFloorMib": 0, "maxRestoreTokens": 60000 }
+  }
+}
+```
+
+Each block inherits the top level and replaces only what it names, so a provider that differs in one number
+states one number. An unlisted provider gets the top level, and `/slot-sharing` reports which block applied.
+A bad value inside a block is reported as `providers.<name>.<key>`, not as a bare key.
 
 State (index, owner record, lock) lives in `~/.pi/agent/slot-sharing/`, override with
 `PI_SLOT_SHARING_STATE`. The session files themselves live on the server.

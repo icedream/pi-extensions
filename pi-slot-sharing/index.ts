@@ -37,7 +37,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveAuth, type AuthResolver } from "./auth.ts";
 import { availableBytesFrom, detectKind, readProps, type ServerInfo, type ServerKind, type SlotBackend, type SlotCapability } from "./backend.ts";
-import { loadConfig, type ResolvedConfig } from "./config.ts";
+import { loadConfig, settingsFor, type ResolvedConfig, type Settings } from "./config.ts";
 import { JsonClient, ServerHttpError } from "./http.ts";
 import { LlamaCppBackend } from "./llamacpp.ts";
 import { StrataBackend } from "./strata.ts";
@@ -104,6 +104,9 @@ export default async function (pi: ExtensionAPI) {
 	}
 	const cfg = loaded.config;
 	const store = new SessionStore(STATE_DIR);
+
+	/** The knobs that apply to this session's provider. They describe one server, not the extension. */
+	const settings = (ctx: ExtensionContext): Settings => settingsFor(cfg, ctx.model?.provider);
 
 	let backendChoice: { key?: string; url?: string; backend?: SlotBackend; note?: string } | undefined;
 	let authSource = "none";
@@ -184,7 +187,8 @@ export default async function (pi: ExtensionAPI) {
 
 	/** Make sure the server's slot holds this session. Runs before every provider request. */
 	async function ensureLoaded(ctx: ExtensionContext): Promise<void> {
-		if (!cfg.enabled || !servesModel(ctx)) return;
+		const s = settings(ctx);
+		if (!s.enabled || !servesModel(ctx)) return;
 		const { sessionId, key, fileName } = identity(ctx);
 		const url = serverUrl(ctx) ?? "the model's server";
 		const problem = slotFilenameProblem(fileName);
@@ -210,7 +214,7 @@ export default async function (pi: ExtensionAPI) {
 		const backend = found.info ? (await pickBackend(ctx)).backend : undefined;
 		if (!backend) return;
 
-		await store.withLock(cfg.lockStaleMs, async () => {
+		await store.withLock(s.lockStaleMs, async () => {
 			if (store.readOwner()?.key === key) return;
 			const index = store.readIndex();
 			const entry = index.records[key];
@@ -229,14 +233,14 @@ export default async function (pi: ExtensionAPI) {
 
 			const fresh = (await info(true, ctx)).info;
 			const available = availableBytes(fresh, ctx);
-			const verdict = backend.gate && available !== undefined ? backend.gate({ availableBytes: available, floorBytes: cfg.ramFloorBytes, marginBytes: cfg.marginBytes, fileBytes: entry.record.bytes }) : undefined;
+			const verdict = backend.gate && available !== undefined ? backend.gate({ availableBytes: available, floorBytes: s.ramFloorBytes, marginBytes: s.marginBytes, fileBytes: entry.record.bytes }) : undefined;
 			if (verdict && !verdict.ok) {
 				note(`${entry.record.tokens.toLocaleString()} token conversation not restored: ${verdict.reason}. This request re-prefills.`, ctx);
 				claim();
 				return;
 			}
-			if (cfg.maxRestoreTokens !== undefined && entry.record.tokens > cfg.maxRestoreTokens) {
-				note(`${entry.record.tokens.toLocaleString()} tokens is over maxRestoreTokens (${cfg.maxRestoreTokens}); this request re-prefills`, ctx);
+			if (s.maxRestoreTokens !== undefined && entry.record.tokens > s.maxRestoreTokens) {
+				note(`${entry.record.tokens.toLocaleString()} tokens is over maxRestoreTokens (${s.maxRestoreTokens}); this request re-prefills`, ctx);
 				claim();
 				return;
 			}
@@ -255,14 +259,15 @@ export default async function (pi: ExtensionAPI) {
 	}
 
 	async function saveNow(ctx: ExtensionContext, why: string): Promise<void> {
-		if (!cfg.enabled || !servesModel(ctx)) return;
+		const s = settings(ctx);
+		if (!s.enabled || !servesModel(ctx)) return;
 		const { sessionId, ref, key, fileName } = identity(ctx);
 		if (slotFilenameProblem(fileName)) return;
 		const found = await info(true, ctx);
 		const backend = found.info ? (await pickBackend(ctx)).backend : undefined;
 		if (!backend || !found.capability?.enabled || !singleSlot(found.info)) return;
 
-		await store.withLock(cfg.lockStaleMs, async () => {
+		await store.withLock(s.lockStaleMs, async () => {
 			const owner = store.readOwner();
 			if (owner && owner.key !== key) {
 				// Somebody else's conversation is in the slot now; saving would write their conversation out
@@ -298,7 +303,7 @@ export default async function (pi: ExtensionAPI) {
 
 	/** The saved KV no longer matches this conversation: the transcript changed underneath it. */
 	function invalidate(ctx: ExtensionContext, why: string): void {
-		if (!cfg.enabled || !servesModel(ctx)) return;
+		if (!settings(ctx).enabled || !servesModel(ctx)) return;
 		const { key } = identity(ctx);
 		const index = store.readIndex();
 		if (!index.records[key]) return;
@@ -312,7 +317,8 @@ export default async function (pi: ExtensionAPI) {
 
 	pi.on("agent_end", async (_event, ctx) => {
 		turns += 1;
-		if (cfg.saveEveryTurns > 1 && turns % cfg.saveEveryTurns !== 0) return;
+		const every = settings(ctx).saveEveryTurns;
+		if (every > 1 && turns % every !== 0) return;
 		await saveNow(ctx, "end of run");
 	});
 
@@ -334,7 +340,7 @@ export default async function (pi: ExtensionAPI) {
 		backendChoice = undefined;
 		infoCache = { at: 0 };
 		// A file belongs to one model and configuration; after a switch the old one is not readable back.
-		if (!cfg.enabled) return;
+		if (!settings(ctx).enabled) return;
 		const sessionId = ctx.sessionManager.getSessionId();
 		const index = store.readIndex();
 		for (const entry of Object.values(index.records)) {
@@ -358,15 +364,17 @@ export default async function (pi: ExtensionAPI) {
 			if (found.info?.ram) lines.push(`server ram: ${found.info.ram.usedGib} of ${found.info.ram.totalGib} GiB used`);
 			lines.push(`save/restore: ${found.capability?.enabled ? "on" : `off (${found.capability?.reason ?? "unknown"})`}`);
 
+			const s = settings(ctx);
 			const index = store.readIndex();
-			const perToken = index.bytesPerToken ?? cfg.bytesPerTokenFallback;
+			const perToken = index.bytesPerToken ?? s.bytesPerTokenFallback;
 			lines.push(`bytes/token: ${perToken.toFixed(0)} (${index.bytesPerToken ? "learned from saves" : "config fallback, no save measured yet"})`);
+			lines.push(`provider: ${ctx.model?.provider ?? "?"}${cfg.byProvider[ctx.model?.provider ?? ""] ? " (per-provider settings apply)" : " (top-level settings)"}`);
 
 			if (picked.backend?.gate) {
-				lines.push(`gate: floor ${Math.round(cfg.ramFloorBytes / (1024 * 1024))} MiB (config), margin ${Math.round(cfg.marginBytes / (1024 * 1024))} MiB (config)`);
+				lines.push(`gate: floor ${Math.round(s.ramFloorBytes / (1024 * 1024))} MiB (config), margin ${Math.round(s.marginBytes / (1024 * 1024))} MiB (config)`);
 				const available = availableBytes(found.info, ctx);
 				if (available !== undefined) {
-					const room = maxRestorableTokens(available, cfg.ramFloorBytes, cfg.marginBytes, perToken);
+					const room = maxRestorableTokens(available, s.ramFloorBytes, s.marginBytes, perToken);
 					lines.push(`free now: ${gib(available)} -> a restore of up to ~${room.toLocaleString()} tokens fits`);
 					if (ctx.model && ctx.model.contextWindow > room) {
 						lines.push(`this session's window (${ctx.model.contextWindow.toLocaleString()}) is past that: a long session re-prefills instead of restoring`);
