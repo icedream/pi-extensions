@@ -93,6 +93,7 @@ function isLoopback(baseUrl: string): boolean {
 
 const gib = (bytes: number) => `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
 const describe = (error: unknown) => (error instanceof ServerHttpError ? `${error.status} ${error.message}` : String(error));
+const savedAt = (seconds: number) => new Date(seconds * 1000).toISOString().slice(11, 16) + "Z";
 
 export default async function (pi: ExtensionAPI) {
 	const loaded = loadConfig(CONFIG_PATH);
@@ -241,7 +242,7 @@ export default async function (pi: ExtensionAPI) {
 			const floorBytes = ramFloorBytesFor(s.ramFloorBytes, fresh?.conversationCacheMinFreeMib);
 			const verdict = backend.gate && available !== undefined ? backend.gate({ availableBytes: available, floorBytes, marginBytes: s.marginBytes, fileBytes: entry.record.bytes }) : undefined;
 			if (verdict && !verdict.ok) {
-				note(`${entry.record.tokens.toLocaleString()} token conversation not restored: ${verdict.reason}. This request re-prefills.`, ctx);
+				note(`the ${entry.record.tokens.toLocaleString()} token conversation saved at ${savedAt(entry.record.savedAt)} was not restored: ${verdict.reason}. This request re-prefills.`, ctx);
 				claim();
 				return;
 			}
