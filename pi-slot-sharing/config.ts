@@ -12,14 +12,22 @@ import { existsSync, readFileSync } from "node:fs";
 import { MIB } from "./sessions.ts";
 
 export interface SessionsConfig {
-	/** The server, e.g. `http://127.0.0.1:11182`. */
-	baseUrl: string;
+	/**
+	 * Pin the extension to one server. Leave it out to talk to whatever server the session's own model
+	 * reports — Pi already knows, and repeating it here is one more thing that can disagree with reality.
+	 * Set it only to restrict the extension to a single server, or to reach one no Pi model points at.
+	 */
+	baseUrl?: string;
 	/**
 	 * Which server this is. `auto` reads `/props`: Strata says `build_info: "Strata 0.1.44"`, llama.cpp
 	 * says `build_info: "b10920 <sha>"`. Set it explicitly only if auto-detection refuses.
 	 */
 	backend?: "auto" | "strata" | "llama.cpp";
-	/** Sent as `Authorization: Bearer`. Also read from `SLOT_SHARING_API_KEY` when absent. */
+	/**
+	 * Override for the slot API's bearer token. Normally leave this out: the extension asks Pi for the
+	 * same credentials the model's requests use. Set it only for a server Pi has no credential for.
+	 * `SLOT_SHARING_API_KEY` is the environment form of the same escape hatch.
+	 */
 	apiKey?: string;
 	/** Only act for sessions whose model provider matches. Absent means any provider. */
 	provider?: string;
@@ -46,7 +54,7 @@ export interface SessionsConfig {
 }
 
 export interface ResolvedConfig {
-	baseUrl: string;
+	baseUrl?: string;
 	backend: "auto" | "strata" | "llama.cpp";
 	apiKey?: string;
 	provider?: string;
@@ -84,8 +92,7 @@ export function resolveConfig(raw: unknown, env: NodeJS.ProcessEnv): { config?: 
 	if (!isRecord(raw)) return { problems: ["config file must contain a JSON object"] };
 
 	const baseUrl = typeof raw.baseUrl === "string" ? raw.baseUrl.replace(/\/+$/, "") : undefined;
-	if (!baseUrl) problems.push("baseUrl is required (the Strata server, e.g. http://127.0.0.1:11182)");
-	else if (!/^https?:\/\//.test(baseUrl)) problems.push("baseUrl must start with http:// or https://");
+	if (baseUrl !== undefined && !/^https?:\/\//.test(baseUrl)) problems.push("baseUrl must start with http:// or https://");
 
 	const apiKey = typeof raw.apiKey === "string" && raw.apiKey.length > 0 ? raw.apiKey : env.SLOT_SHARING_API_KEY;
 	const knownBackends = ["auto", "strata", "llama.cpp"] as const;
@@ -113,7 +120,7 @@ export function resolveConfig(raw: unknown, env: NodeJS.ProcessEnv): { config?: 
 
 	return {
 		config: {
-			baseUrl: baseUrl as string,
+			baseUrl,
 			backend,
 			apiKey,
 			provider,

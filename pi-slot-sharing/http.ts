@@ -22,18 +22,31 @@ function errorFrom(body: unknown, status: number): ServerHttpError {
 	return new ServerHttpError(err?.message ?? `HTTP ${status}`, status, err?.code, err?.type);
 }
 
+export interface RequestAuth {
+	apiKey?: string;
+	headers?: Record<string, string>;
+}
+
 export class JsonClient {
 	readonly baseUrl: string;
-	private apiKey?: string;
+	private auth: RequestAuth = {};
 
-	constructor(baseUrl: string, apiKey?: string) {
+	constructor(baseUrl: string, auth?: RequestAuth) {
 		this.baseUrl = baseUrl.replace(/\/+$/, "");
-		this.apiKey = apiKey;
+		this.auth = auth ?? {};
+	}
+
+	/**
+	 * Credentials come from Pi's own provider store (see auth.ts), so they can change when the model
+	 * does. Setting them here rather than at construction keeps one client per server.
+	 */
+	setAuth(auth: RequestAuth | undefined): void {
+		this.auth = auth ?? {};
 	}
 
 	async request<T>(path: string, init?: RequestInit): Promise<T> {
-		const headers: Record<string, string> = { accept: "application/json", ...(init?.headers as Record<string, string> | undefined) };
-		if (this.apiKey) headers.authorization = `Bearer ${this.apiKey}`;
+		const headers: Record<string, string> = { accept: "application/json", ...(this.auth.headers ?? {}), ...(init?.headers as Record<string, string> | undefined) };
+		if (this.auth.apiKey) headers.authorization = `Bearer ${this.auth.apiKey}`;
 		let response: Response;
 		try {
 			response = await fetch(`${this.baseUrl}${path}`, { ...init, headers });

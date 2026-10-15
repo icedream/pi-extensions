@@ -5,10 +5,13 @@ import { MIB } from "./sessions.ts";
 
 const EMPTY_ENV = {} as NodeJS.ProcessEnv;
 
-test("the only required key is the server", () => {
-	const { config, problems } = resolveConfig({ baseUrl: "http://127.0.0.1:11182/" }, EMPTY_ENV);
+test("nothing is required: the server comes from the model when not pinned", () => {
+	const { config, problems } = resolveConfig({}, EMPTY_ENV);
 	assert.deepEqual(problems, []);
-	assert.equal(config?.baseUrl, "http://127.0.0.1:11182");
+	assert.equal(config?.baseUrl, undefined, "absent means derive it from the session's model");
+	const pinned = resolveConfig({ baseUrl: "http://127.0.0.1:11182/" }, EMPTY_ENV);
+	assert.deepEqual(pinned.problems, []);
+	assert.equal(pinned.config?.baseUrl, "http://127.0.0.1:11182");
 });
 
 test("defaults match the engine's defaults, not a guess of ours", () => {
@@ -24,8 +27,7 @@ test("the RAM floor is stated, because the server does not report it", () => {
 	assert.equal(config?.ramFloorBytes, 1024 * MIB);
 });
 
-test("a missing or malformed server is a problem, not a silent no-op", () => {
-	assert.match(resolveConfig({}, EMPTY_ENV).problems.join(";"), /baseUrl is required/);
+test("a malformed server is a problem, not a silent no-op", () => {
 	assert.match(resolveConfig({ baseUrl: "h:1" }, EMPTY_ENV).problems.join(";"), /must start with/);
 	assert.deepEqual(resolveConfig(null, EMPTY_ENV).problems, ["config file must contain a JSON object"]);
 });

@@ -35,6 +35,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { resolveAuth, type AuthResolver } from "./auth.ts";
 import { availableBytesFrom, detectKind, readProps, type ServerInfo, type SlotBackend, type SlotCapability } from "./backend.ts";
 import { loadConfig, type ResolvedConfig } from "./config.ts";
 import { JsonClient, ServerHttpError } from "./http.ts";
@@ -58,13 +59,23 @@ function modelRef(ctx: ExtensionContext): string {
 	return `${ctx.model?.provider ?? "?"}/${ctx.model?.id ?? "?"}`;
 }
 
-/** Does the model this session is talking to live at the configured server? */
+const normalizeUrl = (url: string) => url.replace(/\/+$/, "").replace(/\/v1$/, "");
+
+/**
+ * Which server to talk to. Normally derived from the model this session uses: Pi already carries its
+ * baseUrl, so the config does not have to repeat it. A configured `baseUrl` pins the extension to one
+ * server instead, and every session pointed elsewhere stands down.
+ */
+function serverUrl(cfg: ResolvedConfig, ctx: ExtensionContext): string | undefined {
+	if (cfg.baseUrl) return cfg.baseUrl;
+	return ctx.model?.baseUrl ? normalizeUrl(ctx.model.baseUrl) : undefined;
+}
+
+/** Should this session take part at all? */
 function servesModel(cfg: ResolvedConfig, ctx: ExtensionContext): boolean {
-	const modelUrl = ctx.model?.baseUrl;
-	if (!modelUrl) return false;
-	const normalized = (url: string) => url.replace(/\/+$/, "").replace(/\/v1$/, "");
-	if (normalized(modelUrl) !== normalized(cfg.baseUrl)) return false;
-	if (cfg.provider && ctx.model?.provider !== cfg.provider) return false;
+	if (!ctx.model?.baseUrl) return false;
+	if (cfg.baseUrl && normalizeUrl(ctx.model.baseUrl) !== normalizeUrl(cfg.baseUrl)) return false;
+	if (cfg.provider && ctx.model.provider !== cfg.provider) return false;
 	return true;
 }
 
@@ -97,10 +108,10 @@ export default async function (pi: ExtensionAPI) {
 		return;
 	}
 	const cfg = loaded.config;
-	const client = new JsonClient(cfg.baseUrl, cfg.apiKey);
 	const store = new SessionStore(STATE_DIR);
 
-	let backendChoice: { backend?: SlotBackend; note?: string } | undefined;
+	let backendChoice: { key?: string; url?: string; backend?: SlotBackend; note?: string } | undefined;
+	let authSource = "none";
 	let infoCache: { at: number; info?: ServerInfo; capability?: SlotCapability; note?: string } = { at: 0 };
 	let turns = 0;
 	let lastNote = "";
@@ -111,29 +122,47 @@ export default async function (pi: ExtensionAPI) {
 		ctx.ui.notify(`pi-slot-sharing: ${message}`, "info");
 	}
 
-	/** Which server is this, and what does it speak? */
-	async function pickBackend(): Promise<{ backend?: SlotBackend; note?: string }> {
-		if (backendChoice) return backendChoice;
+	/**
+	 * Which server is this, and what does it speak? Credentials are resolved per model from Pi's provider
+	 * store, so the choice is cached against the model reference and re-resolved when the model changes.
+	 */
+	async function pickBackend(ctx: ExtensionContext): Promise<{ key?: string; url?: string; backend?: SlotBackend; note?: string }> {
+		const url = serverUrl(cfg, ctx);
+		if (!url) return { note: "no baseUrl in the config, and this model reports no server either" };
+		const key = `${url}|${modelRef(ctx)}`;
+		if (backendChoice?.key === key) return backendChoice;
+
+		const resolved = await resolveAuth({
+			configApiKey: cfg.apiKey,
+			env: process.env,
+			registry: ctx.modelRegistry as unknown as AuthResolver,
+			model: ctx.model,
+		});
+		authSource = resolved.source;
+		if (!resolved.auth) return { key, url, note: resolved.note ?? "no credentials" };
+		const client = new JsonClient(url, resolved.auth);
+
 		let kind = cfg.backend === "auto" ? undefined : cfg.backend;
 		if (!kind) {
 			try {
 				kind = detectKind(await readProps(client));
 			} catch (error) {
-				backendChoice = { note: `${cfg.baseUrl} unreadable: ${describe(error)}` };
+				backendChoice = { key, url, note: `${url} unreadable: ${describe(error)}` };
 				return backendChoice;
 			}
 		}
 		if (!kind) {
-			backendChoice = { note: `cannot tell which server ${cfg.baseUrl} is; set "backend" in the config` };
+			backendChoice = { key, url, note: `cannot tell which server ${url} is; set "backend" in the config` };
 			return backendChoice;
 		}
-		backendChoice = { backend: kind === "strata" ? new StrataBackend(client) : new LlamaCppBackend(client) };
+		backendChoice = { key, url, backend: kind === "strata" ? new StrataBackend(client) : new LlamaCppBackend(client) };
 		return backendChoice;
 	}
 
-	async function info(force = false) {
+	async function info(force = false, ctx?: ExtensionContext) {
 		if (!force && Date.now() - infoCache.at < INFO_TTL_MS) return infoCache;
-		const picked = await pickBackend();
+		if (!ctx) return { at: Date.now(), note: "no session context" };
+		const picked = await pickBackend(ctx);
 		if (!picked.backend) return { at: Date.now(), note: picked.note };
 		const next: typeof infoCache = { at: Date.now() };
 		try {
@@ -146,8 +175,9 @@ export default async function (pi: ExtensionAPI) {
 		return next;
 	}
 
-	function availableBytes(found: ServerInfo | undefined): number | undefined {
-		return availableBytesFrom(found, isLoopback(cfg.baseUrl) ? readMeminfo() : undefined);
+	function availableBytes(found: ServerInfo | undefined, ctx: ExtensionContext): number | undefined {
+		const url = serverUrl(cfg, ctx);
+		return availableBytesFrom(found, url && isLoopback(url) ? readMeminfo() : undefined);
 	}
 
 	function identity(ctx: ExtensionContext) {
@@ -166,6 +196,7 @@ export default async function (pi: ExtensionAPI) {
 	async function ensureLoaded(ctx: ExtensionContext): Promise<void> {
 		if (!cfg.enabled || !servesModel(cfg, ctx)) return;
 		const { sessionId, key, fileName } = identity(ctx);
+		const url = serverUrl(cfg, ctx) ?? "the configured server";
 		const problem = slotFilenameProblem(fileName);
 		if (problem) {
 			note(`session file name ${problem}`, ctx);
@@ -173,20 +204,20 @@ export default async function (pi: ExtensionAPI) {
 		}
 		if (store.readOwner()?.key === key) return; // already ours, nothing to do
 
-		const found = await info();
+		const found = await info(false, ctx);
 		if (found.note) {
 			note(`server unreadable, leaving the slot alone (${found.note})`, ctx);
 			return;
 		}
 		if (!singleSlot(found.info)) {
-			note(`${cfg.baseUrl} runs ${found.info?.totalSlots} slots at once — nothing to take turns over`, ctx);
+			note(`${url} runs ${found.info?.totalSlots} slots at once — nothing to take turns over`, ctx);
 			return;
 		}
 		if (!found.capability?.enabled) {
-			note(`slot save/restore is off on ${cfg.baseUrl}; sessions will each re-prefill`, ctx);
+			note(`slot save/restore is off on ${url}; sessions will each re-prefill`, ctx);
 			return;
 		}
-		const backend = found.info ? (await pickBackend()).backend : undefined;
+		const backend = found.info ? (await pickBackend(ctx)).backend : undefined;
 		if (!backend) return;
 
 		await store.withLock(cfg.lockStaleMs, async () => {
@@ -206,8 +237,8 @@ export default async function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const fresh = (await info(true)).info;
-			const available = availableBytes(fresh);
+			const fresh = (await info(true, ctx)).info;
+			const available = availableBytes(fresh, ctx);
 			const verdict = backend.gate && available !== undefined ? backend.gate({ availableBytes: available, floorBytes: cfg.ramFloorBytes, marginBytes: cfg.marginBytes, fileBytes: entry.record.bytes }) : undefined;
 			if (verdict && !verdict.ok) {
 				note(`${entry.record.tokens.toLocaleString()} token conversation not restored: ${verdict.reason}. This request re-prefills.`, ctx);
@@ -237,8 +268,8 @@ export default async function (pi: ExtensionAPI) {
 		if (!cfg.enabled || !servesModel(cfg, ctx)) return;
 		const { sessionId, ref, key, fileName } = identity(ctx);
 		if (slotFilenameProblem(fileName)) return;
-		const found = await info(true);
-		const backend = found.info ? (await pickBackend()).backend : undefined;
+		const found = await info(true, ctx);
+		const backend = found.info ? (await pickBackend(ctx)).backend : undefined;
 		if (!backend || !found.capability?.enabled || !singleSlot(found.info)) return;
 
 		await store.withLock(cfg.lockStaleMs, async () => {
@@ -309,6 +340,9 @@ export default async function (pi: ExtensionAPI) {
 	pi.on("session_before_tree", async (_event, ctx) => invalidate(ctx, "tree moved"));
 
 	pi.on("model_select", async (_event, ctx) => {
+		// Credentials and the backend both belong to a model: re-resolve them, and stop trusting the cache.
+		backendChoice = undefined;
+		infoCache = { at: 0 };
 		// A file belongs to one model and configuration; after a switch the old one is not readable back.
 		if (!cfg.enabled) return;
 		const sessionId = ctx.sessionManager.getSessionId();
@@ -322,10 +356,11 @@ export default async function (pi: ExtensionAPI) {
 	pi.registerCommand("slot-sharing", {
 		description: "Show what the server reports and what its RAM gate allows this session to restore",
 		handler: async (_args, ctx) => {
-			const found = await info(true);
-			const picked = await pickBackend();
-			const lines: string[] = [`config: ${CONFIG_PATH}`, `server: ${cfg.baseUrl}`];
+			const found = await info(true, ctx);
+			const picked = await pickBackend(ctx);
+			const lines: string[] = [`config: ${CONFIG_PATH}`, `server: ${picked.url ?? "not resolved"}${cfg.baseUrl ? " (pinned by config)" : " (from this model's provider)"}`];
 			if (found.note) lines.push(`server error: ${found.note}`);
+			lines.push(`credentials: ${authSource === "provider" ? "from Pi's provider store for this model" : authSource}`);
 			lines.push(`backend: ${found.info?.kind ?? picked.note ?? "unknown"}${found.info?.version ? ` (${found.info.version})` : ""}`);
 			if (found.info?.model) lines.push(`model: ${found.info.model}${found.info.kv ? `, kv ${found.info.kv}` : ""}`);
 			if (found.info?.maxContext) lines.push(`context: ${found.info.maxContext.toLocaleString()} positions, slots: ${found.info.totalSlots ?? "?"}`);
@@ -339,7 +374,7 @@ export default async function (pi: ExtensionAPI) {
 
 			if (picked.backend?.gate) {
 				lines.push(`gate: floor ${Math.round(cfg.ramFloorBytes / (1024 * 1024))} MiB (config), margin ${Math.round(cfg.marginBytes / (1024 * 1024))} MiB (config)`);
-				const available = availableBytes(found.info);
+				const available = availableBytes(found.info, ctx);
 				if (available !== undefined) {
 					const room = maxRestorableTokens(available, cfg.ramFloorBytes, cfg.marginBytes, perToken);
 					lines.push(`free now: ${gib(available)} -> a restore of up to ~${room.toLocaleString()} tokens fits`);
