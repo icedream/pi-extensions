@@ -157,7 +157,7 @@ test("Strata merges its three reporting endpoints", async () => {
 	const strata = new StrataBackend(
 		fakeClient({
 			"/v1/status": { started: 1791983814, context: { native: 393216, max_positions: 393216 }, machine: { ram: { used_gib: 58.5, total_gib: 62.0 } } },
-			"/metrics": { engine: { model: "qwen3.8-flash-next-iq3_s", max_context: 393216, kv: "int8", version: "0.1.44" } },
+			"/metrics": { engine: { model: "qwen3.8-flash-next-iq3_s", max_context: 393216, kv: "int8", version: "0.1.44", conversation_cache_min_free_mib: 1024 } },
 			"/props": { total_slots: 1 },
 		}),
 	);
@@ -168,6 +168,18 @@ test("Strata merges its three reporting endpoints", async () => {
 	assert.equal(info.totalSlots, 1);
 	assert.equal(info.started, 1791983814);
 	assert.deepEqual(info.ram, { usedGib: 58.5, totalGib: 62 });
+	assert.equal(info.conversationCacheMinFreeMib, 1024, "the gate's floor comes from the server, not from a guess");
+});
+
+test("a server that does not report its floor leaves it unset rather than inventing one", async () => {
+	const strata = new StrataBackend(
+		fakeClient({
+			"/v1/status": { started: 1791983814 },
+			"/metrics": { engine: { model: "qwen3.8-flash-next-iq3_s", kv: "int8" } },
+			"/props": { total_slots: 1 },
+		}),
+	);
+	assert.equal((await strata.info()).conversationCacheMinFreeMib, undefined);
 });
 
 test("free RAM: meminfo wins, the server's used/total is the fallback, neither is neither", () => {

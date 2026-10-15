@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { loadConfig, resolveConfig, settingsFor } from "./config.ts";
+import { loadConfig, ramFloorBytesFor, resolveConfig, settingsFor } from "./config.ts";
 import { MIB } from "./sessions.ts";
 
 test("an empty config is a working config", () => {
@@ -9,16 +9,24 @@ test("an empty config is a working config", () => {
 	assert.ok(config);
 });
 
-test("defaults match the engine's defaults, not a guess of ours", () => {
+test("defaults leave the RAM floor to the engine", () => {
 	const { config } = resolveConfig({});
 	const s = settingsFor(config!, undefined);
-	assert.equal(s.ramFloorBytes, 2560 * MIB, "Strata's own --conversation-cache-min-free-mib default");
+	assert.equal(s.ramFloorBytes, undefined, "unspecified: Strata reports its own floor on /metrics");
+	assert.equal(ramFloorBytesFor(s.ramFloorBytes, undefined), 2560 * MIB, "and the default is Strata's own default");
 	assert.equal(s.marginBytes, 256 * MIB);
 	assert.equal(s.saveEveryTurns, 1);
 	assert.equal(s.enabled, true);
 });
 
-test("the RAM floor is stated, because no server reports it", () => {
+test("the floor is the operator's if stated, the server's otherwise", () => {
+	assert.equal(ramFloorBytesFor(1024 * MIB, 512), 1024 * MIB, "a stated floor wins");
+	assert.equal(ramFloorBytesFor(undefined, 1024), 1024 * MIB, "otherwise believe the server");
+	assert.equal(ramFloorBytesFor(undefined, undefined), 2560 * MIB, "and failing both, Strata's default");
+	assert.equal(ramFloorBytesFor(undefined, -1), 2560 * MIB, "a nonsense report is not a floor");
+});
+
+test("the RAM floor can still be stated for a server that reports nothing", () => {
 	const { config } = resolveConfig({ ramFloorMib: 1024 });
 	assert.equal(settingsFor(config!, undefined).ramFloorBytes, 1024 * MIB);
 });

@@ -6,8 +6,9 @@
  * is configured here, because a second copy of any of it is one more thing that can disagree with the
  * thing it copies.
  *
- * What remains is only what no server reports — chiefly the RAM floor it keeps free for a session read,
- * which is a launch argument — plus behaviour knobs. An empty config object is a working config.
+ * What remains is only what the server will not tell us — or tells us in a form we cannot trust on its
+ * own, like a RAM floor that a restart can change — plus behaviour knobs. An empty config object is a
+ * working config.
  *
  * Those remaining numbers are properties of one server, not of the extension. A Strata engine at 393216
  * positions with int8 KV and a llama.cpp server at 160k with q8_0 KV need different floors and different
@@ -20,10 +21,11 @@ import { MIB } from "./sessions.ts";
 /** The knobs, before resolution. `providers` is only valid at the top level. */
 export interface SessionsConfig {
 	/**
-	 * The engine's `--conversation-cache-min-free-mib`. Strata refuses a restore unless it can read the
-	 * file and still hold this much free, and it does not report the value, so it has to be stated.
-	 * Defaults to Strata's own default (2560). Only used by the Strata backend: llama.cpp has no such
-	 * check and no refusal to predict.
+	 * The engine's `--conversation-cache-min-free-mib`, in MiB: Strata refuses a restore unless it can read
+	 * the file and still hold this much free. Strata 0.1.44 reports it on `/metrics`
+	 * (`conversation_cache_min_free_mib`), so it only has to be stated for a server that does not, or to
+	 * deliberately keep more headroom than the engine asks for. When it is stated it wins; otherwise the
+	 * server's number is used, and failing that Strata's own default (2560).
 	 */
 	ramFloorMib?: number;
 	/** Extra headroom beyond the floor, in MiB. Covers our own allocations and the gap between
@@ -54,7 +56,8 @@ export interface SessionsConfig {
 
 /** The knobs, resolved to bytes and defaults. */
 export interface Settings {
-	ramFloorBytes: number;
+	/** Stated in the config, in bytes. Undefined means "let the server say" — see `ramFloorBytesFor`. */
+	ramFloorBytes?: number;
 	marginBytes: number;
 	bytesPerTokenFallback: number;
 	maxSessionTokens?: number;
@@ -104,7 +107,7 @@ function resolveSettings(raw: Record<string, unknown>, problems: string[], label
 	if (problems.length > 0) return undefined;
 
 	return {
-		ramFloorBytes: (ramFloorMib ?? 2560) * MIB,
+		ramFloorBytes: ramFloorMib === undefined ? undefined : ramFloorMib * MIB,
 		marginBytes: (marginMib ?? 256) * MIB,
 		bytesPerTokenFallback: bytesPerTokenFallback ?? 16896,
 		maxSessionTokens,
@@ -112,6 +115,20 @@ function resolveSettings(raw: Record<string, unknown>, problems: string[], label
 		saveEveryTurns: saveEveryTurns ?? 1,
 		enabled: raw.enabled !== false,
 	};
+}
+
+/** Strata's own default for `--conversation-cache-min-free-mib`, for a server that states no floor. */
+export const DEFAULT_RAM_FLOOR_MIB = 2560;
+
+/**
+ * The floor to gate a restore on. A stated value wins — it is how an operator keeps more headroom than
+ * the engine asks for, and it survives a server that does not report one. Otherwise believe the server's
+ * own number.
+ */
+export function ramFloorBytesFor(statedBytes: number | undefined, reportedMib: number | undefined): number {
+	if (statedBytes !== undefined) return statedBytes;
+	if (reportedMib !== undefined && Number.isFinite(reportedMib) && reportedMib >= 0) return reportedMib * MIB;
+	return DEFAULT_RAM_FLOOR_MIB * MIB;
 }
 
 export function resolveConfig(raw: unknown): { config?: ResolvedConfig; problems: string[] } {

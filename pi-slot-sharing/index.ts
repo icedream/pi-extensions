@@ -37,12 +37,12 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveAuth, type AuthResolver } from "./auth.ts";
 import { availableBytesFrom, detectKind, detectRouter, readProps, type ServerInfo, type ServerKind, type SlotBackend, type SlotCapability, type SlotTarget } from "./backend.ts";
-import { loadConfig, settingsFor, type ResolvedConfig, type Settings } from "./config.ts";
+import { loadConfig, ramFloorBytesFor, settingsFor, type ResolvedConfig, type Settings } from "./config.ts";
 import { JsonClient, ServerHttpError } from "./http.ts";
 import { LlamaCppBackend } from "./llamacpp.ts";
 import { StrataBackend } from "./strata.ts";
 import { SessionStore } from "./store.ts";
-import { bytesPerTokenFromSave, sessionKey, slotFilenameProblem, maxRestorableTokens, type SessionIndex } from "./sessions.ts";
+import { bytesPerTokenFromSave, MIB, sessionKey, slotFilenameProblem, maxRestorableTokens, type SessionIndex } from "./sessions.ts";
 
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 const CONFIG_PATH = process.env.PI_SLOT_SHARING_CONFIG ?? join(AGENT_DIR, "slot-sharing.json");
@@ -236,7 +236,8 @@ export default async function (pi: ExtensionAPI) {
 
 			const fresh = (await info(true, ctx)).info;
 			const available = availableBytes(fresh, ctx);
-			const verdict = backend.gate && available !== undefined ? backend.gate({ availableBytes: available, floorBytes: s.ramFloorBytes, marginBytes: s.marginBytes, fileBytes: entry.record.bytes }) : undefined;
+			const floorBytes = ramFloorBytesFor(s.ramFloorBytes, fresh?.conversationCacheMinFreeMib);
+			const verdict = backend.gate && available !== undefined ? backend.gate({ availableBytes: available, floorBytes, marginBytes: s.marginBytes, fileBytes: entry.record.bytes }) : undefined;
 			if (verdict && !verdict.ok) {
 				note(`${entry.record.tokens.toLocaleString()} token conversation not restored: ${verdict.reason}. This request re-prefills.`, ctx);
 				claim();
@@ -388,10 +389,13 @@ export default async function (pi: ExtensionAPI) {
 			lines.push(`provider: ${ctx.model?.provider ?? "?"}${cfg.byProvider[ctx.model?.provider ?? ""] ? " (per-provider settings apply)" : " (top-level settings)"}`);
 
 			if (picked.backend?.gate) {
-				lines.push(`gate: floor ${Math.round(s.ramFloorBytes / (1024 * 1024))} MiB (config), margin ${Math.round(s.marginBytes / (1024 * 1024))} MiB (config)`);
+				const reported = found.info?.conversationCacheMinFreeMib;
+				const floorBytes = ramFloorBytesFor(s.ramFloorBytes, reported);
+				const floorSource = s.ramFloorBytes !== undefined ? "config" : reported !== undefined ? "reported by the server" : "Strata default";
+				lines.push(`gate: floor ${Math.round(floorBytes / MIB)} MiB (${floorSource}), margin ${Math.round(s.marginBytes / MIB)} MiB (config)`);
 				const available = availableBytes(found.info, ctx);
 				if (available !== undefined) {
-					const room = maxRestorableTokens(available, s.ramFloorBytes, s.marginBytes, perToken);
+					const room = maxRestorableTokens(available, floorBytes, s.marginBytes, perToken);
 					lines.push(`free now: ${gib(available)} -> a restore of up to ~${room.toLocaleString()} tokens fits`);
 					if (ctx.model && ctx.model.contextWindow > room) {
 						lines.push(`this session's window (${ctx.model.contextWindow.toLocaleString()}) is past that: a long session re-prefills instead of restoring`);

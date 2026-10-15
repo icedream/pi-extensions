@@ -27,7 +27,7 @@ export class StrataBackend implements SlotBackend {
 					"/v1/status",
 				)
 				.catch(() => undefined),
-			this.client.request<{ engine?: { model?: string; max_context?: number; kv?: string; version?: string } }>("/metrics").catch(() => undefined),
+			this.client.request<{ engine?: { model?: string; max_context?: number; kv?: string; version?: string; conversation_cache_min_free_mib?: number } }>("/metrics").catch(() => undefined),
 			this.client.request<{ total_slots?: number }>("/props").catch(() => undefined),
 		]);
 
@@ -39,6 +39,7 @@ export class StrataBackend implements SlotBackend {
 			kv: metrics?.engine?.kv,
 			maxContext: status?.context?.max_positions ?? metrics?.engine?.max_context,
 			totalSlots: props?.total_slots,
+			conversationCacheMinFreeMib: metrics?.engine?.conversation_cache_min_free_mib,
 			started: status?.started,
 			ram: ram?.used_gib !== undefined && ram?.total_gib !== undefined ? { usedGib: ram.used_gib, totalGib: ram.total_gib } : undefined,
 		};

@@ -34,6 +34,11 @@ export interface ServerInfo {
 	kv?: string;
 	maxContext?: number;
 	totalSlots?: number;
+	/**
+	 * The engine's `--conversation-cache-min-free-mib` in MiB — the free RAM it keeps for itself before it
+	 * will admit a restore. Strata 0.1.44 reports it on `/metrics`; llama.cpp has no such check.
+	 */
+	conversationCacheMinFreeMib?: number;
 	/** Seconds since epoch the engine started. Strata only; absent on llama.cpp. */
 	started?: number;
 	/** The server's own RAM, when it reports it. Strata only. */
