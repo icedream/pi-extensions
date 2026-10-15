@@ -107,7 +107,7 @@ object is a working config. What is in here is only what no server can be asked 
 
 | Key | Required | Meaning |
 |-----|----------|---------|
-| `ramFloorMib` | no | The engine's `--conversation-cache-min-free-mib`. **Not reported by the server**, so it has to be stated. Default 2560, which is Strata's own default. Strata backend only |
+| `ramFloorMib` | no | The engine's `--conversation-cache-min-free-mib`. Strata 0.1.44 reports it on `/metrics`, so this is only needed for a server that does not, or to keep more headroom than the engine asks for. When stated it wins; otherwise the server's figure, and failing that 2560 (Strata's own default). Strata backend only |
 | `marginMib` | no | Extra headroom beyond the floor. Default 256. Covers our own allocations and the gap between `MemAvailable` and the `used/total` pair the server reports |
 | `bytesPerTokenFallback` | no | Assumed bytes/token until a save reports `n_written` / `n_saved`. Default 16896 (int8 KV). Only used for reporting, never to decide a restore |
 | `maxSessionTokens` | no | Refuse to swap a session larger than this at all — no save, and no restore of a file that big. A save writes roughly `tokens × KV-bytes-per-token` to disk, so on a server with no RAM gate this is the only brake. Default: unlimited, though a Strata restore is still refused by the RAM gate |
@@ -163,6 +163,7 @@ authenticate is reported with Pi's own error text.
 | Context size | `/v1/status` `context.max_positions`, `/metrics` `engine.max_context` |
 | Model, engine version, KV type | `/metrics` `engine.model`, `.version`, `.kv` |
 | Slot count | `/props` `total_slots` |
+| RAM floor for a restore | `/metrics` `engine.conversation_cache_min_free_mib` (Strata 0.1.44); `ramFloorMib` overrides it |
 | Engine start time (restart = slot state lost) | `/v1/status` `started` |
 | Server RAM | `/v1/status` `machine.ram.used_gib` / `total_gib` |
 | Whether save/restore is switched on | probed: `POST /slots/0?action=capability` answers 501 when off, 400 when on. No file is written either way |
@@ -186,6 +187,11 @@ Strata backend:
 peak(file)  = file + 16 MiB + (file / 16 MiB + 1) * 4096 + 1 MiB
 admitted    = available >= peak + floor
 ```
+
+The floor is the engine's `--conversation-cache-min-free-mib`. Strata 0.1.44 reports it on `/metrics`, so
+nothing has to be stated; `ramFloorMib` in the config overrides it when a server does not report one, or
+when you want to keep more headroom than the engine asks for. With neither, the default is Strata's own
+2560.
 
 A save needs none of that — it streams out in 16 MiB blocks — which is why saves succeed at sizes where
 restores are refused. That asymmetry has a cost of its own: an uncapped save writes a file you may never
@@ -220,12 +226,20 @@ and re-prefills instead of reading it, after:
 - compaction, a fork, or moving in the session tree — the transcript changed underneath it
 - a model switch — a file is refused by a differently configured engine
 - another process took the slot and this session's copy is gone from it
+- a save was refused because the slot was not holding this session's conversation (see below)
 
 An engine restart does **not** invalidate a file: session files survive restarts, and the extension
 re-reads `started` to notice the restart happened.
 
 ## Limits
 
+- **A save writes whatever the engine is holding.** The owner record says who meant to use the slot last,
+  not what is in it, and the server queues a `save` behind whatever request is already running. So a save
+  can capture another session's conversation. The extension checks the size the server reports on
+  `GET /slots` against the size this session's last request had (`usage.input + cacheRead + cacheWrite +
+  output` of its final assistant message) and refuses the save when the two cannot be the same
+  conversation, marking the record instead. A run that was aborted or failed reports no usage, so it saves
+  nothing. A llama.cpp server started without `--slots` reports no slot size, and the check fails open.
 - **One slot.** Sessions take turns, they do not run concurrently. A server reporting more than one slot
   is left alone: it is already serving sessions at once.
 - **On llama.cpp there is nothing to predict.** It has no RAM admission check, so a restore that will not
