@@ -97,6 +97,42 @@ export function maxRestorableTokens(availableBytes: number, floorBytes: number, 
 	return tokens;
 }
 
+/**
+ * Whether the token count the server reports for its slot can be this session's conversation.
+ *
+ * A save writes whatever the engine is holding, and the owner record only says who meant to use the slot
+ * last: another session's request can be in flight while this one finishes, and then the save writes that
+ * other conversation out under this session's name. The two directions are not equally sure, so the
+ * tolerances differ — a slot holding far more than this session ever sent cannot be ours, while a slot
+ * holding less may only be a server that counts generated tokens separately.
+ */
+export function slotContentProblem(held: number | undefined, expected: number | undefined): string | undefined {
+	if (held === undefined || expected === undefined || !Number.isFinite(held) || !Number.isFinite(expected)) return undefined;
+	if (held > expected + Math.max(512, Math.round(expected * 0.05))) {
+		return `the slot holds ${held.toLocaleString()} tokens but this session's last request was ${expected.toLocaleString()}`;
+	}
+	if (held < expected - Math.max(2048, Math.round(expected * 0.1))) {
+		return `the slot holds ${held.toLocaleString()} tokens, this session's last request was ${expected.toLocaleString()}`;
+	}
+	return undefined;
+}
+
+/**
+ * Prompt plus completion tokens of the last assistant message of a run: what the engine's slot should be
+ * holding once the run is over. Undefined when the run was aborted or failed before reporting usage, which
+ * is also the case where the slot may be holding somebody else's conversation.
+ */
+export function lastRunTokens(messages: readonly unknown[]): number | undefined {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i] as { role?: unknown; stopReason?: unknown; usage?: Record<string, unknown> } | undefined;
+		if (message?.role !== "assistant") continue;
+		if (message.stopReason === "aborted" || message.stopReason === "error") return undefined;
+		const sum = ["input", "cacheRead", "cacheWrite", "output"].reduce((total, field) => total + (typeof message.usage?.[field] === "number" ? (message.usage[field] as number) : 0), 0);
+		return sum > 0 ? sum : undefined;
+	}
+	return undefined;
+}
+
 /** Names are stable across processes, so two Pi sessions never collide on one file. */
 export function sessionKey(sessionId: string, modelRef: string): string {
 	return `${sessionId}|${modelRef}`;

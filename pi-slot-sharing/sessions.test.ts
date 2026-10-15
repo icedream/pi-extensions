@@ -9,11 +9,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	bytesPerTokenFromSave,
+	lastRunTokens,
 	maxRestorableTokens,
 	MIB,
 	pidLooksAlive,
 	sessionKey,
 	sessionReadPeakBytes,
+	slotContentProblem,
 	slotFilenameProblem,
 	restoreGate,
 } from "./sessions.ts";
@@ -86,6 +88,35 @@ test("file names are checked the way the server checks them", () => {
 	}
 	assert.notEqual(slotFilenameProblem("x".repeat(201)), undefined);
 	assert.notEqual(slotFilenameProblem(undefined), undefined);
+});
+
+test("a save is refused when the slot cannot be this session's conversation", () => {
+	// The incident: a session whose last request was 37,080 tokens saved a slot holding another session's
+	// 198,079 tokens, because the server queued our save behind that session's in-flight request.
+	assert.match(slotContentProblem(198_079, 37_080) ?? "", /the slot holds 198,079 tokens but this session's last request was 37,080/);
+	// Within tolerance is ours: the chat template and generated tokens are not in the usage figures.
+	assert.equal(slotContentProblem(37_954, 37_080), undefined);
+	assert.equal(slotContentProblem(37_080 + 512, 37_080), undefined);
+	assert.equal(slotContentProblem(124_470, 124_470), undefined);
+	// A slot holding far less means the slot moved on to a shorter conversation.
+	assert.match(slotContentProblem(30_000, 124_470) ?? "", /the slot holds 30,000 tokens/);
+	assert.equal(slotContentProblem(124_470 - 2_048, 124_470), undefined, "generated tokens may not be counted");
+	// Unknown on either side fails open, as everywhere else: GET /slots is off unless llama.cpp is started
+	// with --slots, and a run that reported no usage has nothing to check against.
+	assert.equal(slotContentProblem(undefined, 37_080), undefined);
+	assert.equal(slotContentProblem(198_079, undefined), undefined);
+});
+
+test("a run's own size comes from its last assistant message", () => {
+	const assistant = (input: number, cacheRead: number, output: number, stopReason = "toolUse") => ({
+		role: "assistant", stopReason, usage: { input, cacheRead, cacheWrite: 0, output },
+	});
+	// The run that was aborted at 13:42:31: its last message reports nothing, so there is no expectation
+	// to check a save against, and nothing worth saving.
+	assert.equal(lastRunTokens([assistant(1714, 34_760, 606), { role: "toolResult" }, assistant(0, 0, 0, "aborted")]), undefined);
+	assert.equal(lastRunTokens([assistant(1714, 34_760, 606)]), 37_080, "prompt and completion, not just prompt");
+	assert.equal(lastRunTokens([{ role: "user" }, assistant(37_429, 0, 525)]), 37_954);
+	assert.equal(lastRunTokens([]), undefined, "a run with no assistant message");
 });
 
 test("a dead process cannot hold the slot", () => {
