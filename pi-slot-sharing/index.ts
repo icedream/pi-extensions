@@ -42,7 +42,7 @@ import { JsonClient, ServerHttpError } from "./http.ts";
 import { LlamaCppBackend } from "./llamacpp.ts";
 import { StrataBackend } from "./strata.ts";
 import { SessionStore } from "./store.ts";
-import { bytesPerTokenFromSave, MIB, sessionKey, slotFilenameProblem, maxRestorableTokens, type SessionIndex } from "./sessions.ts";
+import { bytesPerTokenFromSave, lastRunTokens, MIB, sessionKey, slotContentProblem, slotFilenameProblem, maxRestorableTokens, type SessionIndex } from "./sessions.ts";
 
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 const CONFIG_PATH = process.env.PI_SLOT_SHARING_CONFIG ?? join(AGENT_DIR, "slot-sharing.json");
@@ -113,6 +113,8 @@ export default async function (pi: ExtensionAPI) {
 	let infoCache: { at: number; info?: ServerInfo; capability?: SlotCapability; note?: string } = { at: 0 };
 	let turns = 0;
 	let lastNote = "";
+	/** Per session: the size its last completed run left in the slot, used to check what a save captures. */
+	const lastRunSize = new Map<string, number>();
 
 	function note(message: string, ctx: ExtensionContext): void {
 		if (message === lastNote) return;
@@ -262,7 +264,7 @@ export default async function (pi: ExtensionAPI) {
 		});
 	}
 
-	async function saveNow(ctx: ExtensionContext, why: string): Promise<void> {
+	async function saveNow(ctx: ExtensionContext, why: string, expectedTokens?: number): Promise<void> {
 		const s = settings(ctx);
 		if (!s.enabled || !servesModel(ctx)) return;
 		const { sessionId, ref, key, fileName } = identity(ctx);
@@ -275,14 +277,29 @@ export default async function (pi: ExtensionAPI) {
 		// gate this cap is the only brake, so it has to stop the write and not merely the read back. An
 		// unknown slot size fails open: refusing every save because GET /slots is switched off would break
 		// the feature, and the note below says which case ran.
+		const held = await backend.slotTokens();
 		if (s.maxSessionTokens !== undefined) {
-			const held = await backend.slotTokens();
 			if (held === undefined) {
 				note("maxSessionTokens is set but the server does not report the slot size, so the save was not capped", ctx);
 			} else if (held > s.maxSessionTokens) {
 				note(`not saving: the slot holds ${held.toLocaleString()} tokens, over maxSessionTokens (${s.maxSessionTokens.toLocaleString()})`, ctx);
 				return;
 			}
+		}
+
+		// The owner record only says who meant to use the slot last, not what the engine is holding: another
+		// session's request can be in flight while this run ends, and the save would write that conversation
+		// out under this session's name. Check the size the server reports against the size this session's
+		// last request had, and keep the record honest instead.
+		const foreign = slotContentProblem(held, expectedTokens);
+		if (foreign) {
+			await store.withLock(s.lockStaleMs, async () => {
+				const index = store.readIndex();
+				if (index.records[key]) index.records[key].stale = `not saved: ${foreign}`;
+				store.writeIndex(index);
+			});
+			note(`not saving: ${foreign}`, ctx);
+			return;
 		}
 
 		await store.withLock(s.lockStaleMs, async () => {
@@ -333,19 +350,29 @@ export default async function (pi: ExtensionAPI) {
 		await ensureLoaded(ctx);
 	});
 
-	pi.on("agent_end", async (_event, ctx) => {
+	pi.on("agent_end", async (event, ctx) => {
 		turns += 1;
+		const { key } = identity(ctx);
+		const expected = lastRunTokens(event.messages);
+		if (expected === undefined) {
+			// Aborted or failed before reporting usage: the slot may hold anything, and there is nothing of
+			// ours worth writing.
+			lastRunSize.delete(key);
+			note("this run reported no usage (aborted or failed), so nothing was saved", ctx);
+			return;
+		}
+		lastRunSize.set(key, expected);
 		const every = settings(ctx).saveEveryTurns;
 		if (every > 1 && turns % every !== 0) return;
-		await saveNow(ctx, "end of run");
+		await saveNow(ctx, "end of run", expected);
 	});
 
 	pi.on("session_before_switch", async (_event, ctx) => {
-		await saveNow(ctx, "session switch");
+		await saveNow(ctx, "session switch", lastRunSize.get(identity(ctx).key));
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		await saveNow(ctx, "shutdown");
+		await saveNow(ctx, "shutdown", lastRunSize.get(identity(ctx).key));
 		store.clearOwner();
 	});
 
