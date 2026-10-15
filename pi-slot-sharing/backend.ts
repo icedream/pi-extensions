@@ -25,6 +25,8 @@ export type ServerKind = "strata" | "llama.cpp";
 
 export interface ServerInfo {
 	kind: ServerKind;
+	/** llama.cpp router mode: one server fronting one child server per model. */
+	router?: boolean;
 	model?: string;
 	/** Engine build or version string. */
 	version?: string;
@@ -71,12 +73,39 @@ export interface SlotBackend {
  * its save path and batch mode first too. So 501 means off, anything else means the feature is live.
  * No file is written either way.
  */
-export async function probeCapability(client: JsonClient): Promise<SlotCapability> {
+/**
+ * How to address the slot. A plain llama-server is one server for one model, so the slot id is enough.
+ * llama.cpp's router proxies to one child server per model and refuses any slot route that does not name
+ * the model — `?model=` on GET, `"model"` in the body on POST (`server-models.cpp: router_validate_model`).
+ * `autoload=false` goes on every router call so the extension can never be the thing that triggers a
+ * multi-minute model load: if the model is not resident, the call fails and the session simply re-prefills.
+ */
+export interface SlotTarget {
+	model?: string;
+	router?: boolean;
+}
+
+function withTarget(path: string, target?: SlotTarget): string {
+	if (!target?.router) return path;
+	const params = new URLSearchParams();
+	if (target.model) params.set("model", target.model);
+	params.set("autoload", "false");
+	const query = params.toString();
+	return query ? `${path}${path.includes("?") ? "&" : "?"}${query}` : path;
+}
+
+function bodyFor(target: SlotTarget | undefined, extra: Record<string, unknown>): string {
+	const body: Record<string, unknown> = { ...extra };
+	if (target?.router && target.model) body.model = target.model;
+	return JSON.stringify(body);
+}
+
+export async function probeCapability(client: JsonClient, target?: SlotTarget): Promise<SlotCapability> {
 	try {
-		await client.request("/slots/0?action=capability", {
+		await client.request(withTarget("/slots/0?action=capability", target), {
 			method: "POST",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({}),
+			body: bodyFor(target, {}),
 		});
 		return { enabled: true };
 	} catch (error) {
@@ -85,10 +114,10 @@ export async function probeCapability(client: JsonClient): Promise<SlotCapabilit
 	}
 }
 
-export async function slotAction(client: JsonClient, action: "save" | "restore", fileName: string): Promise<SlotResult> {
+export async function slotAction(client: JsonClient, action: "save" | "restore", fileName: string, target?: SlotTarget): Promise<SlotResult> {
 	const r = await client.request<{ filename?: string; n_saved?: number; n_written?: number; n_restored?: number; n_read?: number }>(
-		`/slots/0?action=${action}`,
-		{ method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ filename: fileName }) },
+		withTarget(`/slots/0?action=${action}`, target),
+		{ method: "POST", headers: { "content-type": "application/json" }, body: bodyFor(target, { filename: fileName }) },
 	);
 	return {
 		fileName: r.filename ?? fileName,
@@ -102,10 +131,10 @@ export async function slotAction(client: JsonClient, action: "save" | "restore",
  * (llama.cpp: `server_slot::to_json` sets `n_prompt_tokens`). Undefined means the server did not say —
  * llama.cpp answers 501 unless started with `--slots` — which callers must treat as unknown, not zero.
  */
-export async function slotPromptTokens(client: JsonClient): Promise<number | undefined> {
+export async function slotPromptTokens(client: JsonClient, target?: SlotTarget): Promise<number | undefined> {
 	let slots: unknown;
 	try {
-		slots = await client.request("/slots");
+		slots = await client.request(withTarget("/slots", target));
 	} catch {
 		return undefined;
 	}
@@ -126,8 +155,24 @@ export function detectKind(props: unknown): ServerKind | undefined {
 	if (!props || typeof props !== "object") return undefined;
 	const p = props as { build_info?: unknown; total_slots?: unknown; default_generation_settings?: unknown };
 	if (typeof p.build_info === "string" && /strata/i.test(p.build_info)) return "strata";
-	if (typeof p.total_slots === "number" && p.default_generation_settings !== undefined) return "llama.cpp";
+	// A plain llama-server reports total_slots. The router answers /props itself and does not — but its
+	// build_info is a llama.cpp build tag ("b10850-6e09de1b4"), which is enough to recognise it.
+	const llamaShaped = typeof p.total_slots === "number" || (typeof p.build_info === "string" && /^b\d{4}/.test(p.build_info));
+	if (llamaShaped && p.default_generation_settings !== undefined) return "llama.cpp";
 	return undefined;
+}
+
+/**
+ * llama.cpp router mode: the server answers /props itself rather than proxying to a model, so the payload
+ * is synthetic — no `total_slots`, and `default_generation_settings.n_ctx` is 0. Slot routes then need the
+ * model named.
+ */
+export function detectRouter(props: unknown): boolean {
+	if (!props || typeof props !== "object") return false;
+	const p = props as { total_slots?: unknown; build_info?: unknown; default_generation_settings?: { n_ctx?: number } };
+	if (typeof p.build_info !== "string" || /strata/i.test(p.build_info)) return false;
+	if (typeof p.total_slots === "number") return false;
+	return p.default_generation_settings?.n_ctx === 0;
 }
 
 export async function readProps(client: JsonClient): Promise<unknown> {

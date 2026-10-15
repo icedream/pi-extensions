@@ -36,7 +36,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveAuth, type AuthResolver } from "./auth.ts";
-import { availableBytesFrom, detectKind, readProps, type ServerInfo, type ServerKind, type SlotBackend, type SlotCapability } from "./backend.ts";
+import { availableBytesFrom, detectKind, detectRouter, readProps, type ServerInfo, type ServerKind, type SlotBackend, type SlotCapability, type SlotTarget } from "./backend.ts";
 import { loadConfig, settingsFor, type ResolvedConfig, type Settings } from "./config.ts";
 import { JsonClient, ServerHttpError } from "./http.ts";
 import { LlamaCppBackend } from "./llamacpp.ts";
@@ -136,19 +136,22 @@ export default async function (pi: ExtensionAPI) {
 		const client = new JsonClient(url, resolved.auth);
 
 		let kind: ServerKind | undefined;
-		if (!kind) {
-			try {
-				kind = detectKind(await readProps(client));
-			} catch (error) {
-				backendChoice = { key, url, note: `${url} unreadable: ${describe(error)}` };
-				return backendChoice;
-			}
+		let router = false;
+		try {
+			const props = await readProps(client);
+			router = detectRouter(props);
+			kind = detectKind(props);
+		} catch (error) {
+			backendChoice = { key, url, note: `${url} unreadable: ${describe(error)}` };
+			return backendChoice;
 		}
 		if (!kind) {
 			backendChoice = { key, url, note: `${url} is neither Strata nor llama.cpp; standing down` };
 			return backendChoice;
 		}
-		backendChoice = { key, url, backend: kind === "strata" ? new StrataBackend(client) : new LlamaCppBackend(client) };
+		// llama.cpp router mode addresses slots per model; Strata and plain llama-server do not need it.
+		const target: SlotTarget = { model: ctx.model?.id, router };
+		backendChoice = { key, url, backend: kind === "strata" ? new StrataBackend(client) : new LlamaCppBackend(client, target) };
 		return backendChoice;
 	}
 
@@ -371,7 +374,7 @@ export default async function (pi: ExtensionAPI) {
 			const lines: string[] = [`config: ${CONFIG_PATH}`, `server: ${picked.url ?? "not resolved"} (from this model's provider)`];
 			if (found.note) lines.push(`server error: ${found.note}`);
 			lines.push(`credentials: ${authSource === "provider" ? "from Pi's provider store for this model" : authSource}`);
-			lines.push(`backend: ${found.info?.kind ?? picked.note ?? "unknown"}${found.info?.version ? ` (${found.info.version})` : ""}`);
+			lines.push(`backend: ${found.info?.kind ?? picked.note ?? "unknown"}${found.info?.version ? ` (${found.info.version})` : ""}${found.info?.router ? ", router mode" : ""}`);
 			if (found.info?.model) lines.push(`model: ${found.info.model}${found.info.kv ? `, kv ${found.info.kv}` : ""}`);
 			if (found.info?.maxContext) lines.push(`context: ${found.info.maxContext.toLocaleString()} positions, slots: ${found.info.totalSlots ?? "?"}`);
 			if (found.info?.started) lines.push(`engine started: ${new Date(found.info.started * 1000).toISOString()}`);

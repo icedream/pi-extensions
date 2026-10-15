@@ -58,8 +58,8 @@ Two things have to be true of the server; the extension checks both and stays qu
 
 ## Backends
 
-The backend is detected from `/props` (`build_info` reads `"Strata 0.1.44"` on one, `"b10920-eafe15a5e"`
-on the other), or stated with `"backend": "strata" | "llama.cpp"`.
+The backend is detected from `/props`: `build_info` reads `"Strata 0.1.44"` on one and `"b10850-6e09de1b4"`
+on the other. There is nothing to state.
 
 | | Strata | llama.cpp |
 |---|---|---|
@@ -73,6 +73,25 @@ on the other), or stated with `"backend": "strata" | "llama.cpp"`.
 | server RAM | `/v1/status` `machine.ram` | not reported |
 | refuses a restore it cannot hold | **yes** — the gate applies | **no** — no admission check exists, so the restore is attempted and the failure handled |
 | several slots at once | refuses save/restore with `--batch` | `-np N`, and per-request `id_slot` |
+
+### llama.cpp router mode
+
+With `--models-preset`, one process fronts one child server per model. Two things follow, and the extension
+handles both:
+
+- **Slot routes must name the model.** The router answers `GET /props` itself with a synthetic payload — no
+  `total_slots`, `n_ctx` 0 — and refuses `GET /slots` or `POST /slots/0` with *"model name is missing from
+  the request"* unless the model is given: `?model=` on GET, `"model"` in the body on POST. The extension
+  takes the name from `ctx.model.id`; the router resolves aliases to canonical names itself.
+- **Naming a model loads it.** Router autoload is on by default, so a slot call naming a non-resident model
+  would start a multi-minute load. Every router call carries `autoload=false`: if the model is not resident
+  the call fails, the session re-prefills, and nothing waited on a load the extension started. `GET /props`
+  is asked the same way, so the real `n_ctx` and `total_slots` come from the child when the model is loaded
+  and stay unknown when it is not.
+
+Verified against a live router with nothing resident: detection reported `llama.cpp` in router mode, the
+capability probe reached the slot route, and a save returned *"model is not loaded"* rather than *"model
+name is missing"* — the model parameter was honoured — with 0 of 27 models loaded afterwards.
 
 llama.cpp with `-np N` is the better answer to "three sessions on one server" when the VRAM fits N
 contexts — no extension involved. b10920 also has `--kv-unified-per-slot N`, which sizes a shared KV pool

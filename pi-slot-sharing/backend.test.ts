@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { availableBytesFrom, detectKind, slotAction, slotPromptTokens, type ServerInfo, type SlotBackend } from "./backend.ts";
+import { availableBytesFrom, detectKind, detectRouter, slotAction, slotPromptTokens, type ServerInfo, type SlotBackend } from "./backend.ts";
 import { JsonClient, ServerHttpError } from "./http.ts";
 import { LlamaCppBackend } from "./llamacpp.ts";
 import { StrataBackend } from "./strata.ts";
@@ -82,6 +82,57 @@ test("the slot's current prompt size is read from GET /slots", async () => {
 	assert.equal(await slotPromptTokens(refused), undefined);
 });
 
+test("router mode is recognised and addressed per model", async () => {
+	// captured live from the docker-llamacpp router with no model loaded
+	const routerProps = {
+		default_generation_settings: { params: {}, n_ctx: 0 },
+		build_info: "b10850-6e09de1b4",
+		model_alias: "llama-server",
+		cors_proxy_enabled: false,
+	};
+	assert.equal(detectKind(routerProps), "llama.cpp", "no total_slots must not make it unknown");
+	assert.equal(detectRouter(routerProps), true);
+
+	const plain = { default_generation_settings: { n_ctx: 512 }, total_slots: 1, build_info: "b10920 4a1f0e2" };
+	assert.equal(detectRouter(plain), false, "a plain llama-server reports total_slots");
+	assert.equal(detectRouter({ build_info: "Strata 0.1.44", total_slots: 1 }), false, "Strata is never a router");
+	assert.equal(detectRouter(undefined), false);
+
+	const calls: string[] = [];
+	const recording = {
+		request: async (path: string, init?: RequestInit) => {
+			calls.push(`${init?.method ?? "GET"} ${path} ${String(init?.body ?? "")}`);
+			return [];
+		},
+	} as unknown as JsonClient;
+	const router = new LlamaCppBackend(recording, { model: "maple", router: true });
+	await router.slotTokens();
+	await router.save("pi-x.bin");
+	await router.restore("pi-x.bin");
+	await router.capability();
+
+	assert.deepEqual(calls, [
+		"GET /slots?model=maple&autoload=false ",
+		'POST /slots/0?action=save&model=maple&autoload=false {"filename":"pi-x.bin","model":"maple"}',
+		'POST /slots/0?action=restore&model=maple&autoload=false {"filename":"pi-x.bin","model":"maple"}',
+		'POST /slots/0?action=capability&model=maple&autoload=false {"model":"maple"}',
+	]);
+});
+
+test("a plain llama-server is addressed without a model parameter", async () => {
+	const calls: string[] = [];
+	const recording = {
+		request: async (path: string, init?: RequestInit) => {
+			calls.push(`${init?.method ?? "GET"} ${path}`);
+			return [];
+		},
+	} as unknown as JsonClient;
+	const plain = new LlamaCppBackend(recording, { model: "qwen3-coder", router: false });
+	await plain.slotTokens();
+	await plain.save("pi-x.bin");
+	assert.deepEqual(calls, ["GET /slots", "POST /slots/0?action=save"]);
+});
+
 test("only Strata warns before it fails", () => {
 	const strata: SlotBackend = new StrataBackend(fakeClient({}));
 	const llama: SlotBackend = new LlamaCppBackend(fakeClient({}));
@@ -98,7 +149,7 @@ test("llama.cpp facts come from /props alone, and it reports no KV type", async 
 		}),
 	);
 	const info = await llama.info();
-	assert.deepEqual(info, { kind: "llama.cpp", model: "Qwen3.5-27B", version: "b10920 4a1f0e2", kv: undefined, maxContext: 131072, totalSlots: 1 });
+	assert.deepEqual(info, { kind: "llama.cpp", router: false, model: "Qwen3.5-27B", version: "b10920 4a1f0e2", kv: undefined, maxContext: 131072, totalSlots: 1 });
 	assert.equal(info.started, undefined, "no /v1/status on llama.cpp: a restart cannot be noticed there");
 });
 

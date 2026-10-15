@@ -6,20 +6,25 @@
  * slot id or the action, and reports `ERROR_TYPE_NOT_SUPPORTED`, which `format_error_response` maps to
  * 501. Same status, same probe.
  *
- * Two things llama.cpp does *not* do, and the extension has to know the difference:
+ * Two modes, and they address slots differently:
  *
- *   - It has no RAM admission check. `handle_slots_save` / `handle_slots_restore` post the task with no
- *     preflight at all, so there is no arithmetic to mirror and no `gate()`. Guessing at another
- *     server's memory would be worse than trying the restore and handling the failure.
- *   - It has no `/v1/status`: no engine start time, no reported RAM. Facts come from `/props`
- *     (`total_slots`, `model_alias`, `build_info`, `default_generation_settings.n_ctx`).
+ *   - **plain `llama-server`** — one process, one model. `/slots/0` is the whole story, and `/props`
+ *     reports `total_slots`.
+ *   - **router mode** (`--models-preset`) — one process fronting one child server per model. `/props` is
+ *     answered by the router itself and is synthetic (no `total_slots`, `n_ctx` 0), and every slot route
+ *     is refused with "model name is missing from the request" unless the model is named: `?model=` on
+ *     GET, `"model"` in the body on POST. Naming a model also loads it, so every call here carries
+ *     `autoload=false` — if the model is not resident the call fails and the session re-prefills, rather
+ *     than the extension silently starting a multi-minute load.
  *
- * And one thing it does that Strata deliberately refuses: `-np, --parallel N` gives it several real
- * slots at once. Several live slots means no turn-taking is needed, so the caller stands down rather
- * than swapping conversations behind a server that is already serving them concurrently.
+ * What llama.cpp does *not* do, and the extension has to know the difference:
+ *
+ *   - No RAM admission check. `handle_slots_save` / `handle_slots_restore` post the task with no
+ *     preflight, so there is no arithmetic to mirror and no `gate()`.
+ *   - No `/v1/status`: no engine start time, no reported RAM.
  */
 
-import { probeCapability, slotAction, slotPromptTokens, type ServerInfo, type SlotBackend, type SlotCapability, type SlotResult } from "./backend.ts";
+import { detectRouter, probeCapability, slotAction, slotPromptTokens, type ServerInfo, type SlotBackend, type SlotCapability, type SlotResult, type SlotTarget } from "./backend.ts";
 import { JsonClient } from "./http.ts";
 
 interface LlamaCppProps {
@@ -33,37 +38,53 @@ interface LlamaCppProps {
 export class LlamaCppBackend implements SlotBackend {
 	readonly kind = "llama.cpp" as const;
 	private client: JsonClient;
+	private target: SlotTarget;
 
-	constructor(client: JsonClient) {
+	constructor(client: JsonClient, target: SlotTarget = {}) {
 		this.client = client;
+		this.target = target;
 	}
 
 	async info(): Promise<ServerInfo> {
 		const props = await this.client.request<LlamaCppProps>("/props");
+		const router = detectRouter(props);
+		let real = props;
+
+		// In router mode the router's own /props says nothing useful about the model. Ask the child that
+		// serves it — with autoload=false, so a model that is not resident stays not resident.
+		if (router && this.target.model) {
+			try {
+				real = await this.client.request<LlamaCppProps>(`/props?model=${encodeURIComponent(this.target.model)}&autoload=false`);
+			} catch {
+				// not loaded: the synthetic answer is the honest one
+			}
+		}
+
 		return {
 			kind: this.kind,
-			model: props.model_alias,
-			version: props.build_info,
+			router,
+			model: real.model_alias,
+			version: real.build_info ?? props.build_info,
 			// llama.cpp does not report the KV cache type over HTTP; it is a launch argument.
 			kv: undefined,
-			maxContext: props.default_generation_settings?.n_ctx,
-			totalSlots: props.total_slots,
+			maxContext: real.default_generation_settings?.n_ctx || props.default_generation_settings?.n_ctx,
+			totalSlots: real.total_slots,
 		};
 	}
 
 	capability(): Promise<SlotCapability> {
-		return probeCapability(this.client);
+		return probeCapability(this.client, this.target);
 	}
 
 	slotTokens(): Promise<number | undefined> {
-		return slotPromptTokens(this.client);
+		return slotPromptTokens(this.client, this.target);
 	}
 
 	save(fileName: string): Promise<SlotResult> {
-		return slotAction(this.client, "save", fileName);
+		return slotAction(this.client, "save", fileName, this.target);
 	}
 
 	restore(fileName: string): Promise<SlotResult> {
-		return slotAction(this.client, "restore", fileName);
+		return slotAction(this.client, "restore", fileName, this.target);
 	}
 }
