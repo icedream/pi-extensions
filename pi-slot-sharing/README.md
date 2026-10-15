@@ -84,17 +84,12 @@ Path: `~/.pi/agent/slot-sharing.json`, or the file in `PI_SLOT_SHARING_CONFIG`. 
 [slot-sharing.example.json](slot-sharing.example.json).
 
 The rule for this file: **if the server can be asked, the extension asks.** No key is required — an empty
-object is a working config. What is in here is only what the server cannot be asked for, or a deliberate
-pin against what it says.
+object is a working config. What is in here is only what no server can be asked for.
 
 | Key | Required | Meaning |
 |-----|----------|---------|
-| `baseUrl` | no | Pin the extension to one server. Leave it out and it talks to whatever server the session's own model reports (`ctx.model.baseUrl`) — Pi already knows it, and a copy here is one more thing that can disagree with reality. Set it to restrict the extension to a single server, or to reach a server no Pi model points at |
-| `backend` | no | `"auto"` (default), `"strata"` or `"llama.cpp"`. Auto reads `/props`; set it only if auto-detection refuses |
-| `apiKey` | no | Override for the bearer token. Leave it out normally — see [Credentials](#credentials). `SLOT_SHARING_API_KEY` is the same escape hatch from the environment |
 | `ramFloorMib` | no | The engine's `--conversation-cache-min-free-mib`. **Not reported by the server**, so it has to be stated. Default 2560, which is Strata's own default. Strata backend only |
 | `marginMib` | no | Extra headroom beyond the floor. Default 256. Covers our own allocations and the gap between `MemAvailable` and the `used/total` pair the server reports |
-| `provider` | no | Restrict which model providers this acts on. Usually unnecessary: a server that is neither Strata nor llama.cpp fails detection and stands down on its own |
 | `bytesPerTokenFallback` | no | Assumed bytes/token until a save reports `n_written` / `n_saved`. Default 16896 (int8 KV). Only used for reporting, never to decide a restore |
 | `maxRestoreTokens` | no | Hard cap below what the gate allows. Default: whatever the gate allows |
 | `saveEveryTurns` | no | Save after every N agent runs. Default 1 |
@@ -115,10 +110,8 @@ Keeping a second copy in the extension's own config would be a second thing to r
 keep out of git, and a second place to be stale after a rotation — and it could not refresh an expiring
 credential at all.
 
-Order of resolution: an explicit `apiKey` in the config (an override, for a server Pi has no credential
-for), then the provider's credentials for the current model, then `SLOT_SHARING_API_KEY` for headless use
-with no Pi model in play. If none of those produce a credential, the extension says so rather than
-failing silently, and `/slot-sharing` reports which one it used.
+There is no credential to configure and no fallback to set up. If the model's provider has no credential,
+the extension says so rather than failing silently, and `/slot-sharing` reports what it found.
 
 Credentials are resolved per model, so switching model re-resolves them; a provider that cannot
 authenticate is reported with Pi's own error text.

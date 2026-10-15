@@ -1,36 +1,19 @@
 /**
  * Configuration for pi-slot-sharing.
  *
- * Everything the extension can learn from the server, it learns: context size, KV type, slot count,
- * engine start time, and the server's own RAM figures come from `/props`, `/metrics` and `/v1/status`.
- * What is left here is only what the server does not report — chiefly the RAM floor the engine keeps
- * free for a session read, which is a launch argument (`--conversation-cache-min-free-mib`) and is not
- * exposed over HTTP. Getting that number wrong in the safe direction is the point of `marginMib`.
+ * Everything a server can be asked, the extension asks: the server address comes from the model's own
+ * `baseUrl`, credentials from Pi's provider store, and the backend from `/props`. Nothing about a server
+ * is configured here, because a second copy of any of it is one more thing that can disagree with the
+ * thing it copies.
+ *
+ * What remains is only what no server reports — chiefly the RAM floor it keeps free for a session read,
+ * which is a launch argument — plus behaviour knobs. An empty config object is a working config.
  */
 
 import { existsSync, readFileSync } from "node:fs";
 import { MIB } from "./sessions.ts";
 
 export interface SessionsConfig {
-	/**
-	 * Pin the extension to one server. Leave it out to talk to whatever server the session's own model
-	 * reports — Pi already knows, and repeating it here is one more thing that can disagree with reality.
-	 * Set it only to restrict the extension to a single server, or to reach one no Pi model points at.
-	 */
-	baseUrl?: string;
-	/**
-	 * Which server this is. `auto` reads `/props`: Strata says `build_info: "Strata 0.1.44"`, llama.cpp
-	 * says `build_info: "b10920 <sha>"`. Set it explicitly only if auto-detection refuses.
-	 */
-	backend?: "auto" | "strata" | "llama.cpp";
-	/**
-	 * Override for the slot API's bearer token. Normally leave this out: the extension asks Pi for the
-	 * same credentials the model's requests use. Set it only for a server Pi has no credential for.
-	 * `SLOT_SHARING_API_KEY` is the environment form of the same escape hatch.
-	 */
-	apiKey?: string;
-	/** Only act for sessions whose model provider matches. Absent means any provider. */
-	provider?: string;
 	/**
 	 * The engine's `--conversation-cache-min-free-mib`. Strata refuses a restore unless it can read the
 	 * file and still hold this much free, and it does not report the value, so it has to be stated.
@@ -54,10 +37,6 @@ export interface SessionsConfig {
 }
 
 export interface ResolvedConfig {
-	baseUrl?: string;
-	backend: "auto" | "strata" | "llama.cpp";
-	apiKey?: string;
-	provider?: string;
 	ramFloorBytes: number;
 	marginBytes: number;
 	bytesPerTokenFallback: number;
@@ -87,24 +66,9 @@ function positiveNumber(value: unknown, name: string, problems: string[]): numbe
 	return value;
 }
 
-export function resolveConfig(raw: unknown, env: NodeJS.ProcessEnv): { config?: ResolvedConfig; problems: string[] } {
+export function resolveConfig(raw: unknown): { config?: ResolvedConfig; problems: string[] } {
 	const problems: string[] = [];
 	if (!isRecord(raw)) return { problems: ["config file must contain a JSON object"] };
-
-	const baseUrl = typeof raw.baseUrl === "string" ? raw.baseUrl.replace(/\/+$/, "") : undefined;
-	if (baseUrl !== undefined && !/^https?:\/\//.test(baseUrl)) problems.push("baseUrl must start with http:// or https://");
-
-	const apiKey = typeof raw.apiKey === "string" && raw.apiKey.length > 0 ? raw.apiKey : env.SLOT_SHARING_API_KEY;
-	const knownBackends = ["auto", "strata", "llama.cpp"] as const;
-	let backend: "auto" | "strata" | "llama.cpp" = "auto";
-	if (raw.backend !== undefined) {
-		if (typeof raw.backend === "string" && (knownBackends as readonly string[]).includes(raw.backend)) {
-			backend = raw.backend as typeof backend;
-		} else {
-			problems.push('backend must be "auto", "strata" or "llama.cpp"');
-		}
-	}
-	const provider = typeof raw.provider === "string" && raw.provider.length > 0 ? raw.provider : undefined;
 
 	const ramFloorMib = positiveNumber(raw.ramFloorMib, "ramFloorMib", problems);
 	const marginMib = positiveNumber(raw.marginMib, "marginMib", problems);
@@ -120,10 +84,6 @@ export function resolveConfig(raw: unknown, env: NodeJS.ProcessEnv): { config?: 
 
 	return {
 		config: {
-			baseUrl,
-			backend,
-			apiKey,
-			provider,
 			ramFloorBytes: (ramFloorMib ?? 2560) * MIB,
 			marginBytes: (marginMib ?? 256) * MIB,
 			bytesPerTokenFallback: bytesPerTokenFallback ?? 16896,
@@ -136,7 +96,7 @@ export function resolveConfig(raw: unknown, env: NodeJS.ProcessEnv): { config?: 
 	};
 }
 
-export function loadConfig(path: string, env: NodeJS.ProcessEnv = process.env): ConfigResult {
+export function loadConfig(path: string): ConfigResult {
 	if (!existsSync(path)) return { problems: [], path, present: false };
 	let parsed: unknown;
 	try {
@@ -144,6 +104,6 @@ export function loadConfig(path: string, env: NodeJS.ProcessEnv = process.env): 
 	} catch (error) {
 		return { problems: [`${path}: ${(error as Error).message}`], path, present: true };
 	}
-	const { config, problems } = resolveConfig(parsed, env);
+	const { config, problems } = resolveConfig(parsed);
 	return { config, problems, path, present: true };
 }

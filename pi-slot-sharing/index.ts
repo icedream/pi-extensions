@@ -36,7 +36,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveAuth, type AuthResolver } from "./auth.ts";
-import { availableBytesFrom, detectKind, readProps, type ServerInfo, type SlotBackend, type SlotCapability } from "./backend.ts";
+import { availableBytesFrom, detectKind, readProps, type ServerInfo, type ServerKind, type SlotBackend, type SlotCapability } from "./backend.ts";
 import { loadConfig, type ResolvedConfig } from "./config.ts";
 import { JsonClient, ServerHttpError } from "./http.ts";
 import { LlamaCppBackend } from "./llamacpp.ts";
@@ -62,21 +62,16 @@ function modelRef(ctx: ExtensionContext): string {
 const normalizeUrl = (url: string) => url.replace(/\/+$/, "").replace(/\/v1$/, "");
 
 /**
- * Which server to talk to. Normally derived from the model this session uses: Pi already carries its
- * baseUrl, so the config does not have to repeat it. A configured `baseUrl` pins the extension to one
- * server instead, and every session pointed elsewhere stands down.
+ * Which server to talk to: the one the model this session uses already reports. Pi carries it, so the
+ * config does not repeat it.
  */
-function serverUrl(cfg: ResolvedConfig, ctx: ExtensionContext): string | undefined {
-	if (cfg.baseUrl) return cfg.baseUrl;
+function serverUrl(ctx: ExtensionContext): string | undefined {
 	return ctx.model?.baseUrl ? normalizeUrl(ctx.model.baseUrl) : undefined;
 }
 
-/** Should this session take part at all? */
-function servesModel(cfg: ResolvedConfig, ctx: ExtensionContext): boolean {
-	if (!ctx.model?.baseUrl) return false;
-	if (cfg.baseUrl && normalizeUrl(ctx.model.baseUrl) !== normalizeUrl(cfg.baseUrl)) return false;
-	if (cfg.provider && ctx.model.provider !== cfg.provider) return false;
-	return true;
+/** Should this session take part at all? A model with no server cannot have a slot to share. */
+function servesModel(ctx: ExtensionContext): boolean {
+	return ctx.model?.baseUrl !== undefined;
 }
 
 function readMeminfo(): string | undefined {
@@ -127,22 +122,17 @@ export default async function (pi: ExtensionAPI) {
 	 * store, so the choice is cached against the model reference and re-resolved when the model changes.
 	 */
 	async function pickBackend(ctx: ExtensionContext): Promise<{ key?: string; url?: string; backend?: SlotBackend; note?: string }> {
-		const url = serverUrl(cfg, ctx);
-		if (!url) return { note: "no baseUrl in the config, and this model reports no server either" };
+		const url = serverUrl(ctx);
+		if (!url) return { note: "this model reports no server, so there is no slot to share" };
 		const key = `${url}|${modelRef(ctx)}`;
 		if (backendChoice?.key === key) return backendChoice;
 
-		const resolved = await resolveAuth({
-			configApiKey: cfg.apiKey,
-			env: process.env,
-			registry: ctx.modelRegistry as unknown as AuthResolver,
-			model: ctx.model,
-		});
+		const resolved = await resolveAuth(ctx.modelRegistry as unknown as AuthResolver, ctx.model);
 		authSource = resolved.source;
 		if (!resolved.auth) return { key, url, note: resolved.note ?? "no credentials" };
 		const client = new JsonClient(url, resolved.auth);
 
-		let kind = cfg.backend === "auto" ? undefined : cfg.backend;
+		let kind: ServerKind | undefined;
 		if (!kind) {
 			try {
 				kind = detectKind(await readProps(client));
@@ -152,7 +142,7 @@ export default async function (pi: ExtensionAPI) {
 			}
 		}
 		if (!kind) {
-			backendChoice = { key, url, note: `cannot tell which server ${url} is; set "backend" in the config` };
+			backendChoice = { key, url, note: `${url} is neither Strata nor llama.cpp; standing down` };
 			return backendChoice;
 		}
 		backendChoice = { key, url, backend: kind === "strata" ? new StrataBackend(client) : new LlamaCppBackend(client) };
@@ -176,7 +166,7 @@ export default async function (pi: ExtensionAPI) {
 	}
 
 	function availableBytes(found: ServerInfo | undefined, ctx: ExtensionContext): number | undefined {
-		const url = serverUrl(cfg, ctx);
+		const url = serverUrl(ctx);
 		return availableBytesFrom(found, url && isLoopback(url) ? readMeminfo() : undefined);
 	}
 
@@ -194,9 +184,9 @@ export default async function (pi: ExtensionAPI) {
 
 	/** Make sure the server's slot holds this session. Runs before every provider request. */
 	async function ensureLoaded(ctx: ExtensionContext): Promise<void> {
-		if (!cfg.enabled || !servesModel(cfg, ctx)) return;
+		if (!cfg.enabled || !servesModel(ctx)) return;
 		const { sessionId, key, fileName } = identity(ctx);
-		const url = serverUrl(cfg, ctx) ?? "the configured server";
+		const url = serverUrl(ctx) ?? "the model's server";
 		const problem = slotFilenameProblem(fileName);
 		if (problem) {
 			note(`session file name ${problem}`, ctx);
@@ -265,7 +255,7 @@ export default async function (pi: ExtensionAPI) {
 	}
 
 	async function saveNow(ctx: ExtensionContext, why: string): Promise<void> {
-		if (!cfg.enabled || !servesModel(cfg, ctx)) return;
+		if (!cfg.enabled || !servesModel(ctx)) return;
 		const { sessionId, ref, key, fileName } = identity(ctx);
 		if (slotFilenameProblem(fileName)) return;
 		const found = await info(true, ctx);
@@ -308,7 +298,7 @@ export default async function (pi: ExtensionAPI) {
 
 	/** The saved KV no longer matches this conversation: the transcript changed underneath it. */
 	function invalidate(ctx: ExtensionContext, why: string): void {
-		if (!cfg.enabled || !servesModel(cfg, ctx)) return;
+		if (!cfg.enabled || !servesModel(ctx)) return;
 		const { key } = identity(ctx);
 		const index = store.readIndex();
 		if (!index.records[key]) return;
@@ -358,7 +348,7 @@ export default async function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			const found = await info(true, ctx);
 			const picked = await pickBackend(ctx);
-			const lines: string[] = [`config: ${CONFIG_PATH}`, `server: ${picked.url ?? "not resolved"}${cfg.baseUrl ? " (pinned by config)" : " (from this model's provider)"}`];
+			const lines: string[] = [`config: ${CONFIG_PATH}`, `server: ${picked.url ?? "not resolved"} (from this model's provider)`];
 			if (found.note) lines.push(`server error: ${found.note}`);
 			lines.push(`credentials: ${authSource === "provider" ? "from Pi's provider store for this model" : authSource}`);
 			lines.push(`backend: ${found.info?.kind ?? picked.note ?? "unknown"}${found.info?.version ? ` (${found.info.version})` : ""}`);

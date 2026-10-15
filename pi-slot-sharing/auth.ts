@@ -4,15 +4,12 @@
  * The slot API is authenticated by the same token the model's requests carry, and Pi already holds that
  * token: `ctx.modelRegistry.getApiKeyAndHeaders(model)` resolves whatever the provider is configured
  * with — an API key in models.json, a value from the environment, or an OAuth credential with its
- * refresh handled — and returns the headers that go with it. So the extension asks Pi instead of
- * keeping a second copy of the secret in its own config.
+ * refresh handled — and returns the headers that go with it. The extension asks Pi, never stores a copy,
+ * and never learns where the credential came from.
  *
- * That matters beyond tidiness. A duplicated key is a second thing to rotate, a second file to keep out
- * of git, and a second place to be stale after a rotation. It also cannot refresh an OAuth credential.
- *
- * Order: an explicit `apiKey` in the config (an escape hatch for a server Pi has no credential for),
- * then the provider's own credentials for the current model, then `SLOT_SHARING_API_KEY` for headless
- * use with no Pi model in play.
+ * Keeping a copy would mean a second secret to rotate, a second file to keep out of git, and a second
+ * place to be stale after a rotation. It also could not refresh an OAuth credential, which is the failure
+ * mode that actually bites eventually.
  */
 
 import type { RequestAuth } from "./http.ts";
@@ -24,7 +21,7 @@ export interface AuthResolver {
 
 export interface ResolvedAuth {
 	auth?: RequestAuth;
-	source: "config" | "provider" | "env" | "none";
+	source: "provider" | "none";
 	/** Why there are no credentials, for the caller to report rather than fail silently. */
 	note?: string;
 }
@@ -36,24 +33,14 @@ function usableHeaders(headers: Record<string, string | null> | undefined): Reco
 	return Object.keys(kept).length > 0 ? kept : undefined;
 }
 
-export async function resolveAuth(options: {
-	configApiKey?: string;
-	env?: NodeJS.ProcessEnv;
-	registry?: AuthResolver;
-	model?: unknown;
-}): Promise<ResolvedAuth> {
-	if (options.configApiKey) return { auth: { apiKey: options.configApiKey }, source: "config" };
-
-	const { registry, model, env } = options;
-	if (registry && model !== undefined) {
-		const resolved = await registry.getApiKeyAndHeaders(model);
-		if (resolved.ok && (resolved.apiKey || resolved.headers)) {
-			return { auth: { apiKey: resolved.apiKey, headers: usableHeaders(resolved.headers) }, source: "provider" };
-		}
-		if (!resolved.ok) return { source: "none", note: resolved.error };
+export async function resolveAuth(registry: AuthResolver | undefined, model: unknown): Promise<ResolvedAuth> {
+	if (!registry || model === undefined) {
+		return { source: "none", note: "no model registry or no model in this context" };
 	}
-
-	const fromEnv = env?.SLOT_SHARING_API_KEY;
-	if (fromEnv) return { auth: { apiKey: fromEnv }, source: "env" };
-	return { source: "none", note: "no credential for this model's provider, and no apiKey in the config" };
+	const resolved = await registry.getApiKeyAndHeaders(model);
+	if (!resolved.ok) return { source: "none", note: resolved.error };
+	if (!resolved.apiKey && !resolved.headers) {
+		return { source: "none", note: "the model's provider reports no credential" };
+	}
+	return { auth: { apiKey: resolved.apiKey, headers: usableHeaders(resolved.headers) }, source: "provider" };
 }
