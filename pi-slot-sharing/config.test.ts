@@ -39,7 +39,7 @@ test("per-provider blocks inherit the top level and replace only what they name"
 		marginMib: 256,
 		providers: {
 			"icedream-homepc/strata": { marginMib: 512 },
-			"lab/llamacpp": { ramFloorMib: 0, maxRestoreTokens: 60_000, enabled: false },
+			"lab/llamacpp": { ramFloorMib: 0, maxSessionTokens: 60_000, enabled: false },
 		},
 	});
 	assert.deepEqual(problems, []);
@@ -48,7 +48,7 @@ test("per-provider blocks inherit the top level and replace only what they name"
 	assert.equal(strata.marginBytes, 512 * MIB, "overridden");
 	const llama = settingsFor(config!, "lab/llamacpp");
 	assert.equal(llama.ramFloorBytes, 0);
-	assert.equal(llama.maxRestoreTokens, 60_000);
+	assert.equal(llama.maxSessionTokens, 60_000);
 	assert.equal(llama.enabled, false);
 	assert.equal(llama.marginBytes, 256 * MIB, "still inherited");
 });

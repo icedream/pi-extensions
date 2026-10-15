@@ -8,7 +8,7 @@
  * to discover the limit at the worst moment.
  */
 
-import { probeCapability, slotAction, type ServerInfo, type SlotBackend, type SlotCapability, type SlotResult } from "./backend.ts";
+import { probeCapability, slotAction, slotPromptTokens, type ServerInfo, type SlotBackend, type SlotCapability, type SlotResult } from "./backend.ts";
 import { JsonClient } from "./http.ts";
 import { restoreGate, type GateInput, type GateVerdict } from "./sessions.ts";
 
@@ -46,6 +46,10 @@ export class StrataBackend implements SlotBackend {
 
 	capability(): Promise<SlotCapability> {
 		return probeCapability(this.client);
+	}
+
+	slotTokens(): Promise<number | undefined> {
+		return slotPromptTokens(this.client);
 	}
 
 	save(fileName: string): Promise<SlotResult> {

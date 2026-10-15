@@ -19,7 +19,7 @@
  * than swapping conversations behind a server that is already serving them concurrently.
  */
 
-import { probeCapability, slotAction, type ServerInfo, type SlotBackend, type SlotCapability, type SlotResult } from "./backend.ts";
+import { probeCapability, slotAction, slotPromptTokens, type ServerInfo, type SlotBackend, type SlotCapability, type SlotResult } from "./backend.ts";
 import { JsonClient } from "./http.ts";
 
 interface LlamaCppProps {
@@ -53,6 +53,10 @@ export class LlamaCppBackend implements SlotBackend {
 
 	capability(): Promise<SlotCapability> {
 		return probeCapability(this.client);
+	}
+
+	slotTokens(): Promise<number | undefined> {
+		return slotPromptTokens(this.client);
 	}
 
 	save(fileName: string): Promise<SlotResult> {

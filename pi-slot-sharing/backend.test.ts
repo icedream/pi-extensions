@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { availableBytesFrom, detectKind, slotAction, type ServerInfo, type SlotBackend } from "./backend.ts";
+import { availableBytesFrom, detectKind, slotAction, slotPromptTokens, type ServerInfo, type SlotBackend } from "./backend.ts";
 import { JsonClient, ServerHttpError } from "./http.ts";
 import { LlamaCppBackend } from "./llamacpp.ts";
 import { StrataBackend } from "./strata.ts";
@@ -66,6 +66,20 @@ test("save and restore field names are shared, and both are read", async () => {
 	assert.deepEqual(saved, { fileName: "pi-x.bin", tokens: 107_695, bytes: 1_734_536_070 });
 	assert.deepEqual(restored, { fileName: "pi-x.bin", tokens: 107_695, bytes: 1_734_536_070 });
 	assert.deepEqual(calls, ["POST /slots/0?action=save", "POST /slots/0?action=restore"]);
+});
+
+test("the slot's current prompt size is read from GET /slots", async () => {
+	// both servers report it: llama.cpp server_slot::to_json, Strata's /slots
+	const strata = fakeClient({ "/slots": [{ id: 0, n_ctx: 393216, is_processing: false, n_prompt_tokens: 61594 }] });
+	assert.equal(await slotPromptTokens(strata), 61594);
+
+	// a server that does not report it is unknown, not zero
+	assert.equal(await slotPromptTokens(fakeClient({ "/slots": [{ id: 0, n_ctx: 4096 }] })), undefined);
+	assert.equal(await slotPromptTokens(fakeClient({ "/slots": {} })), undefined);
+
+	// llama.cpp without --slots answers 501; unknown must not become a refusal or a zero
+	const refused = { request: async () => { throw new ServerHttpError("This server does not support slots endpoint", 501); } } as unknown as JsonClient;
+	assert.equal(await slotPromptTokens(refused), undefined);
 });
 
 test("only Strata warns before it fails", () => {

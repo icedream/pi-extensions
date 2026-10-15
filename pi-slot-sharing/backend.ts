@@ -54,6 +54,8 @@ export interface SlotBackend {
 	/** Everything the server will tell us about itself. */
 	info(): Promise<ServerInfo>;
 	capability(): Promise<SlotCapability>;
+	/** Tokens the slot currently holds, when the server reports it. Used to refuse an oversized save. */
+	slotTokens(): Promise<number | undefined>;
 	save(fileName: string): Promise<SlotResult>;
 	restore(fileName: string): Promise<SlotResult>;
 	/**
@@ -93,6 +95,27 @@ export async function slotAction(client: JsonClient, action: "save" | "restore",
 		tokens: r.n_saved ?? r.n_restored ?? 0,
 		bytes: r.n_written ?? r.n_read ?? 0,
 	};
+}
+
+/**
+ * How many prompt tokens the server's slot currently holds. Both report it on `GET /slots`
+ * (llama.cpp: `server_slot::to_json` sets `n_prompt_tokens`). Undefined means the server did not say —
+ * llama.cpp answers 501 unless started with `--slots` — which callers must treat as unknown, not zero.
+ */
+export async function slotPromptTokens(client: JsonClient): Promise<number | undefined> {
+	let slots: unknown;
+	try {
+		slots = await client.request("/slots");
+	} catch {
+		return undefined;
+	}
+	if (!Array.isArray(slots)) return undefined;
+	for (const slot of slots) {
+		if (slot && typeof slot === "object" && typeof (slot as { n_prompt_tokens?: unknown }).n_prompt_tokens === "number") {
+			return (slot as { n_prompt_tokens: number }).n_prompt_tokens;
+		}
+	}
+	return undefined;
 }
 
 /**

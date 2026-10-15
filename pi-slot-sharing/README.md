@@ -91,7 +91,7 @@ object is a working config. What is in here is only what no server can be asked 
 | `ramFloorMib` | no | The engine's `--conversation-cache-min-free-mib`. **Not reported by the server**, so it has to be stated. Default 2560, which is Strata's own default. Strata backend only |
 | `marginMib` | no | Extra headroom beyond the floor. Default 256. Covers our own allocations and the gap between `MemAvailable` and the `used/total` pair the server reports |
 | `bytesPerTokenFallback` | no | Assumed bytes/token until a save reports `n_written` / `n_saved`. Default 16896 (int8 KV). Only used for reporting, never to decide a restore |
-| `maxRestoreTokens` | no | Hard cap below what the gate allows. Default: whatever the gate allows |
+| `maxSessionTokens` | no | Refuse to swap a session larger than this at all — no save, and no restore of a file that big. A save writes roughly `tokens × KV-bytes-per-token` to disk, so on a server with no RAM gate this is the only brake. Default: unlimited, though a Strata restore is still refused by the RAM gate |
 | `saveEveryTurns` | no | Save after every N agent runs. Default 1 |
 | `lockStaleMs` | no | A lock older than this, held by a process that is gone, is taken over. Default 120000 |
 | `enabled` | no | Master switch. Default true |
@@ -109,7 +109,7 @@ ceilings, so `providers` keys off `ctx.model.provider` and overrides per provide
   "marginMib": 256,
   "providers": {
     "icedream-homepc/strata": { "marginMib": 512 },
-    "lab/llamacpp": { "ramFloorMib": 0, "maxRestoreTokens": 60000 }
+    "lab/llamacpp": { "ramFloorMib": 0, "maxSessionTokens": 60000 }
   }
 }
 ```
@@ -169,7 +169,9 @@ admitted    = available >= peak + floor
 ```
 
 A save needs none of that — it streams out in 16 MiB blocks — which is why saves succeed at sizes where
-restores are refused. Two consequences worth knowing:
+restores are refused. That asymmetry has a cost of its own: an uncapped save writes a file you may never
+be able to read back, onto a disk that has to hold it. `maxSessionTokens` stops the write as well as the
+read, using the size the server reports on `GET /slots`. Two consequences worth knowing:
 
 - **The outgoing conversation is not released first.** The engine reads the new file, and only afterwards
   drops the K/V it was holding. So the RAM available is whatever the *current* conversation leaves.

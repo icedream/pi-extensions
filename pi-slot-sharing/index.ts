@@ -239,8 +239,8 @@ export default async function (pi: ExtensionAPI) {
 				claim();
 				return;
 			}
-			if (s.maxRestoreTokens !== undefined && entry.record.tokens > s.maxRestoreTokens) {
-				note(`${entry.record.tokens.toLocaleString()} tokens is over maxRestoreTokens (${s.maxRestoreTokens}); this request re-prefills`, ctx);
+			if (s.maxSessionTokens !== undefined && entry.record.tokens > s.maxSessionTokens) {
+				note(`${entry.record.tokens.toLocaleString()} tokens is over maxSessionTokens (${s.maxSessionTokens.toLocaleString()}); this request re-prefills`, ctx);
 				claim();
 				return;
 			}
@@ -266,6 +266,20 @@ export default async function (pi: ExtensionAPI) {
 		const found = await info(true, ctx);
 		const backend = found.info ? (await pickBackend(ctx)).backend : undefined;
 		if (!backend || !found.capability?.enabled || !singleSlot(found.info)) return;
+
+		// A save is not free: it writes roughly tokens x KV-bytes-per-token to disk. On a server with no RAM
+		// gate this cap is the only brake, so it has to stop the write and not merely the read back. An
+		// unknown slot size fails open: refusing every save because GET /slots is switched off would break
+		// the feature, and the note below says which case ran.
+		if (s.maxSessionTokens !== undefined) {
+			const held = await backend.slotTokens();
+			if (held === undefined) {
+				note("maxSessionTokens is set but the server does not report the slot size, so the save was not capped", ctx);
+			} else if (held > s.maxSessionTokens) {
+				note(`not saving: the slot holds ${held.toLocaleString()} tokens, over maxSessionTokens (${s.maxSessionTokens.toLocaleString()})`, ctx);
+				return;
+			}
+		}
 
 		await store.withLock(s.lockStaleMs, async () => {
 			const owner = store.readOwner();

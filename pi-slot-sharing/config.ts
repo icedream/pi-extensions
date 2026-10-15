@@ -31,8 +31,13 @@ export interface SessionsConfig {
 	marginMib?: number;
 	/** Bytes per token assumed until a save reports `n_written` / `n_saved`. Default 16896 (int8 KV). */
 	bytesPerTokenFallback?: number;
-	/** Refuse a restore above this token count even when the gate passes. Default: whatever the gate allows. */
-	maxRestoreTokens?: number;
+	/**
+	 * Refuse to swap a session larger than this at all: no save, and no restore of a file that big. A save
+	 * is not free either — it writes a file of roughly tokens x KV-bytes-per-token to disk, and on a server
+	 * with no RAM gate (llama.cpp) it is the only brake there is. Default: unlimited, except that a Strata
+	 * restore is still refused by the RAM gate.
+	 */
+	maxSessionTokens?: number;
 	/** A lock or owner record older than this, held by a process that is gone, is taken over. Default 120000. */
 	lockStaleMs?: number;
 	/** Save after every N agent runs. 1 saves after each. Default 1. */
@@ -52,7 +57,7 @@ export interface Settings {
 	ramFloorBytes: number;
 	marginBytes: number;
 	bytesPerTokenFallback: number;
-	maxRestoreTokens?: number;
+	maxSessionTokens?: number;
 	lockStaleMs: number;
 	saveEveryTurns: number;
 	enabled: boolean;
@@ -90,7 +95,7 @@ function resolveSettings(raw: Record<string, unknown>, problems: string[], label
 	const ramFloorMib = positiveNumber(raw.ramFloorMib, at("ramFloorMib"), problems);
 	const marginMib = positiveNumber(raw.marginMib, at("marginMib"), problems);
 	const bytesPerTokenFallback = positiveNumber(raw.bytesPerTokenFallback, at("bytesPerTokenFallback"), problems);
-	const maxRestoreTokens = positiveNumber(raw.maxRestoreTokens, at("maxRestoreTokens"), problems);
+	const maxSessionTokens = positiveNumber(raw.maxSessionTokens, at("maxSessionTokens"), problems);
 	const lockStaleMs = positiveNumber(raw.lockStaleMs, at("lockStaleMs"), problems);
 	const saveEveryTurns = positiveNumber(raw.saveEveryTurns, at("saveEveryTurns"), problems);
 
@@ -102,7 +107,7 @@ function resolveSettings(raw: Record<string, unknown>, problems: string[], label
 		ramFloorBytes: (ramFloorMib ?? 2560) * MIB,
 		marginBytes: (marginMib ?? 256) * MIB,
 		bytesPerTokenFallback: bytesPerTokenFallback ?? 16896,
-		maxRestoreTokens,
+		maxSessionTokens,
 		lockStaleMs: lockStaleMs ?? 120_000,
 		saveEveryTurns: saveEveryTurns ?? 1,
 		enabled: raw.enabled !== false,
