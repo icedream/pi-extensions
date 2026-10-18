@@ -42,6 +42,12 @@ export interface SessionsConfig {
 	maxSessionTokens?: number;
 	/** A lock or owner record older than this, held by a process that is gone, is taken over. Default 120000. */
 	lockStaleMs?: number;
+	/**
+	 * How long to wait for another session's lock before giving up on a save or restore. The winner holds it
+	 * across one HTTP call — seconds for a large restore — and waiting that long is far cheaper than the
+	 * re-prefill a skipped swap costs. Default 10000.
+	 */
+	lockWaitMs?: number;
 	/** Save after every N agent runs. 1 saves after each. Default 1. */
 	saveEveryTurns?: number;
 	/** Master switch. Default true. */
@@ -62,6 +68,7 @@ export interface Settings {
 	bytesPerTokenFallback: number;
 	maxSessionTokens?: number;
 	lockStaleMs: number;
+	lockWaitMs: number;
 	saveEveryTurns: number;
 	enabled: boolean;
 }
@@ -100,6 +107,7 @@ function resolveSettings(raw: Record<string, unknown>, problems: string[], label
 	const bytesPerTokenFallback = positiveNumber(raw.bytesPerTokenFallback, at("bytesPerTokenFallback"), problems);
 	const maxSessionTokens = positiveNumber(raw.maxSessionTokens, at("maxSessionTokens"), problems);
 	const lockStaleMs = positiveNumber(raw.lockStaleMs, at("lockStaleMs"), problems);
+	const lockWaitMs = positiveNumber(raw.lockWaitMs, at("lockWaitMs"), problems);
 	const saveEveryTurns = positiveNumber(raw.saveEveryTurns, at("saveEveryTurns"), problems);
 
 	if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") problems.push(`${at("enabled")} must be true or false`);
@@ -112,6 +120,7 @@ function resolveSettings(raw: Record<string, unknown>, problems: string[], label
 		bytesPerTokenFallback: bytesPerTokenFallback ?? 16896,
 		maxSessionTokens,
 		lockStaleMs: lockStaleMs ?? 120_000,
+		lockWaitMs: lockWaitMs ?? 10_000,
 		saveEveryTurns: saveEveryTurns ?? 1,
 		enabled: raw.enabled !== false,
 	};

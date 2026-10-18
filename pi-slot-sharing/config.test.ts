@@ -16,6 +16,8 @@ test("defaults leave the RAM floor to the engine", () => {
 	assert.equal(ramFloorBytesFor(s.ramFloorBytes, undefined), 2560 * MIB, "and the default is Strata's own default");
 	assert.equal(s.marginBytes, 256 * MIB);
 	assert.equal(s.saveEveryTurns, 1);
+	assert.equal(s.lockWaitMs, 10_000, "a busy lock is waited out, not failed");
+	assert.equal(s.lockStaleMs, 120_000);
 	assert.equal(s.enabled, true);
 });
 
@@ -47,7 +49,7 @@ test("per-provider blocks inherit the top level and replace only what they name"
 		marginMib: 256,
 		providers: {
 			"icedream-homepc/strata": { marginMib: 512 },
-			"lab/llamacpp": { ramFloorMib: 0, maxSessionTokens: 60_000, enabled: false },
+			"lab/llamacpp": { ramFloorMib: 0, maxSessionTokens: 60_000, enabled: false, lockWaitMs: 0 },
 		},
 	});
 	assert.deepEqual(problems, []);
@@ -58,6 +60,8 @@ test("per-provider blocks inherit the top level and replace only what they name"
 	assert.equal(llama.ramFloorBytes, 0);
 	assert.equal(llama.maxSessionTokens, 60_000);
 	assert.equal(llama.enabled, false);
+	assert.equal(llama.lockWaitMs, 0, "a provider that would rather not wait can say so");
+	assert.equal(strata.lockWaitMs, 10_000, "inherited");
 	assert.equal(llama.marginBytes, 256 * MIB, "still inherited");
 });
 

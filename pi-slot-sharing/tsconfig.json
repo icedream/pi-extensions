@@ -9,5 +9,5 @@
 		"noEmit": true,
 		"allowImportingTsExtensions": true
 	},
-	"include": ["index.ts", "auth.ts", "backend.ts", "config.ts", "http.ts", "llamacpp.ts", "sessions.ts", "store.ts", "strata.ts", "sessions.test.ts", "config.test.ts", "backend.test.ts", "auth.test.ts"]
+	"include": ["index.ts", "auth.ts", "backend.ts", "config.ts", "http.ts", "llamacpp.ts", "sessions.ts", "store.ts", "strata.ts", "sessions.test.ts", "config.test.ts", "backend.test.ts", "auth.test.ts", "store.test.ts"]
 }

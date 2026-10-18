@@ -220,7 +220,7 @@ export default async function (pi: ExtensionAPI) {
 		const backend = found.info ? (await pickBackend(ctx)).backend : undefined;
 		if (!backend) return;
 
-		await store.withLock(s.lockStaleMs, async () => {
+		const swap = await store.withLock({ waitMs: s.lockWaitMs, staleMs: s.lockStaleMs }, async () => {
 			if (store.readOwner()?.key === key) return;
 			const index = store.readIndex();
 			const entry = index.records[key];
@@ -263,9 +263,10 @@ export default async function (pi: ExtensionAPI) {
 				claim();
 			}
 		});
+		if (!swap.ok) note(`another session is deciding at the same time — ${swap.reason}; this request re-prefills`, ctx);
 	}
 
-	async function saveNow(ctx: ExtensionContext, why: string, expectedTokens?: number): Promise<void> {
+	async function saveNow(ctx: ExtensionContext, why: string, expectedTokens?: number, maxWaitMs?: number): Promise<void> {
 		const s = settings(ctx);
 		if (!s.enabled || !servesModel(ctx)) return;
 		const { sessionId, ref, key, fileName } = identity(ctx);
@@ -294,16 +295,16 @@ export default async function (pi: ExtensionAPI) {
 		// last request had, and keep the record honest instead.
 		const foreign = slotContentProblem(held, expectedTokens);
 		if (foreign) {
-			await store.withLock(s.lockStaleMs, async () => {
+			const marked = await store.withLock({ waitMs: Math.min(s.lockWaitMs, maxWaitMs ?? Infinity), staleMs: s.lockStaleMs }, async () => {
 				const index = store.readIndex();
 				if (index.records[key]) index.records[key].stale = `not saved: ${foreign}`;
 				store.writeIndex(index);
 			});
-			note(`not saving: ${foreign}`, ctx);
+			note(marked.ok ? `not saving: ${foreign}` : `not saving: ${foreign}, and ${marked.reason} so the index still points at the old save`, ctx);
 			return;
 		}
 
-		await store.withLock(s.lockStaleMs, async () => {
+		const swap = await store.withLock({ waitMs: Math.min(s.lockWaitMs, maxWaitMs ?? Infinity), staleMs: s.lockStaleMs }, async () => {
 			const owner = store.readOwner();
 			if (owner && owner.key !== key) {
 				// Somebody else's conversation is in the slot now; saving would write their conversation out
@@ -335,6 +336,7 @@ export default async function (pi: ExtensionAPI) {
 				note(`save (${why}) failed: ${describe(error)}`, ctx);
 			}
 		});
+		if (!swap.ok) note(`not saving (${why}) — ${swap.reason}`, ctx);
 	}
 
 	/** The saved KV no longer matches this conversation: the transcript changed underneath it. */
@@ -372,8 +374,12 @@ export default async function (pi: ExtensionAPI) {
 		await saveNow(ctx, "session switch", lastRunSize.get(identity(ctx).key));
 	});
 
+	// Exiting must not queue behind another session's restore for the whole lock wait: the save is worth
+	// two seconds, not ten.
+	const SHUTDOWN_LOCK_WAIT_MS = 2_000;
+
 	pi.on("session_shutdown", async (_event, ctx) => {
-		await saveNow(ctx, "shutdown", lastRunSize.get(identity(ctx).key));
+		await saveNow(ctx, "shutdown", lastRunSize.get(identity(ctx).key), SHUTDOWN_LOCK_WAIT_MS);
 		store.clearOwner();
 	});
 

@@ -113,6 +113,7 @@ object is a working config. What is in here is only what no server can be asked 
 | `maxSessionTokens` | no | Refuse to swap a session larger than this at all — no save, and no restore of a file that big. A save writes roughly `tokens × KV-bytes-per-token` to disk, so on a server with no RAM gate this is the only brake. Default: unlimited, though a Strata restore is still refused by the RAM gate |
 | `saveEveryTurns` | no | Save after every N agent runs. Default 1 |
 | `lockStaleMs` | no | A lock older than this, held by a process that is gone, is taken over. Default 120000 |
+| `lockWaitMs` | no | How long to wait for another session's lock before giving up on a save or restore. The winner holds it across one HTTP call — seconds for a large restore — and waiting is far cheaper than the re-prefill a skipped swap costs. Default 10000 |
 | `enabled` | no | Master switch. Default true |
 | `providers` | no | Per-provider overrides, keyed by the model's provider name. Each block starts from the top level and replaces only what it names — see [Per-provider settings](#per-provider-settings) |
 
@@ -249,6 +250,10 @@ re-reads `started` to notice the restart happened.
   use this extension. Another client hitting the API directly can still take the slot; the extension
   notices at the next save and marks its record stale rather than writing someone else's conversation
   out under this session's name.
+- **Contention is expected and quiet.** Several sessions reaching their next turn at the same moment
+  means one of them waits for another's save or restore to finish, up to `lockWaitMs`. If the wait runs
+  out the swap is skipped and the note says so at info level — the request prefills as it would have
+  anyway, and no error is raised. A lock whose holder is gone is taken over once `lockStaleMs` passes.
 - **Session files on HIP/AMD are not exercised upstream.** Strata's own notes say the Windows engine, HIP
   and AMD cards have not been run for session files. A transfer failure after the device writes began
   ends the engine. Saves and restores were verified working on an RX 7900 XTX (gfx1100) at 37K, 108K and

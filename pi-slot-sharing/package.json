@@ -9,7 +9,7 @@
 		]
 	},
 	"scripts": {
-		"test": "node --test sessions.test.ts config.test.ts backend.test.ts auth.test.ts",
+		"test": "node --test sessions.test.ts config.test.ts backend.test.ts auth.test.ts store.test.ts",
 		"typecheck": "tsc -p tsconfig.json"
 	},
 	"devDependencies": {
