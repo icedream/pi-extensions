@@ -1,0 +1,20 @@
+{
+	"name": "pi-thinking-hygiene",
+	"type": "module",
+	"version": "0.1.0",
+	"description": "Pi extension: keep confabulated session-opening reasoning out of the prompt so it cannot seed itself",
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"scripts": {
+		"test": "node --test hygiene.test.ts config.test.ts index.test.ts",
+		"typecheck": "tsc -p tsconfig.json"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^1.1.0",
+		"@types/node": "^26.1.1",
+		"typescript": "^6.0.3"
+	}
+}
