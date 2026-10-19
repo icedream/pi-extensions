@@ -7,7 +7,10 @@ import path from "node:path";
 import {
 	DEFAULT_MAX_TOKENS,
 	canDiscover,
+	describeRejections,
 	discoveryFlag,
+	fetchModels,
+	groupRejections,
 	isDecisionModel,
 	modelsUrlFor,
 	parseModelsPayload,
@@ -17,6 +20,7 @@ import {
 	resolveConfigValue,
 	setDiscoveryFlagInFile,
 	setDiscoveryFlagInText,
+	type RejectedModel,
 } from "./discovery.ts";
 
 /** Mirrors the awkward shapes a hand-maintained models.json really has. */
@@ -310,4 +314,83 @@ test("setDiscoveryFlagInFile writes the edit and keeps a pre-write copy", async 
 test("a missing models.json is not an error", async () => {
 	const providers = await readModelsJsonProviders(path.join(os.tmpdir(), "pi-model-context-absent.json"));
 	assert.deepEqual(providers, []);
+});
+
+const skipped = (ids: string[], cause: string): RejectedModel[] => ids.map((id) => ({ id, cause, reason: `${cause}; see models.json` }));
+
+test("parseModelsPayload names the cause of every skip, not just its advice", () => {
+	const { rejected } = parseModelsPayload({
+		data: [{ id: "no-context" }, { id: "julia-1", meta: { n_ctx: 8192 }, architecture: { output_modalities: ["decisions"] } }],
+	});
+	assert.deepEqual(
+		rejected.map((r) => r.cause),
+		["no context window reported", "decision model"],
+	);
+});
+
+test("skips are counted per cause, biggest first", () => {
+	const rejected = [...skipped(["a", "b", "c"], "no context window reported"), ...skipped(["d", "e"], "decision model")];
+	assert.deepEqual(groupRejections(rejected), [
+		{ cause: "no context window reported", count: 3 },
+		{ cause: "decision model", count: 2 },
+	]);
+});
+
+test("one cause is named without a count, because the caller already printed the total", () => {
+	assert.equal(describeRejections(skipped(["a", "b", "c"], "no context window reported")), "no context window reported");
+	assert.equal(
+		describeRejections([...skipped(["a", "b", "c"], "no context window reported"), ...skipped(["d", "e"], "decision model")]),
+		"no context window reported (3), decision model (2)",
+	);
+	assert.equal(describeRejections([]), "");
+});
+
+test("more causes than the limit collapse into a remainder that still adds up", () => {
+	const rejected = [
+		...skipped(["a1", "a2", "a3"], "alpha"),
+		...skipped(["b1", "b2"], "bravo"),
+		...skipped(["c1"], "charlie"),
+		...skipped(["d1"], "delta"),
+	];
+	const groups = groupRejections(rejected, 2);
+	assert.deepEqual(groups, [
+		{ cause: "alpha", count: 3 },
+		{ cause: "3 other cause(s)", count: 4 },
+	]);
+	assert.equal(groups.reduce((total, group) => total + group.count, 0), rejected.length);
+});
+
+test("fetchModels returns what registered and what was skipped", async () => {
+	const payload = { data: [{ id: "ok", meta: { n_ctx: 32768 } }, { id: "no-context" }] };
+	const original = globalThis.fetch;
+	globalThis.fetch = (async () => new Response(JSON.stringify(payload))) as typeof globalThis.fetch;
+	try {
+		const result = await fetchModels({ id: "p", baseUrl: "http://x/v1" });
+		assert.deepEqual(
+			result.models.map((m) => m.id),
+			["ok"],
+		);
+		assert.deepEqual(
+			result.rejected.map((r) => r.id),
+			["no-context"],
+		);
+	} finally {
+		globalThis.fetch = original;
+	}
+});
+
+test("an endpoint whose whole list is unusable fails with counts, not one clause per model", async () => {
+	const payload = { data: Array.from({ length: 300 }, (_, i) => ({ id: `model-${i}` })) };
+	const original = globalThis.fetch;
+	globalThis.fetch = (async () => new Response(JSON.stringify(payload))) as typeof globalThis.fetch;
+	try {
+		await assert.rejects(fetchModels({ id: "p", baseUrl: "http://x/v1" }), (error: Error) => {
+			assert.match(error.message, /listed no usable models \(300 skipped: no context window reported\)/);
+			// The old message joined 300 ids and reasons into one line; this one stays a notification.
+			assert.ok(error.message.length < 160, `error message is ${error.message.length} characters`);
+			return true;
+		});
+	} finally {
+		globalThis.fetch = original;
+	}
 });

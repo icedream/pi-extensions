@@ -30,6 +30,7 @@
  * Commands:
  *   /model-context            menu to turn automatic discovery on or off per provider
  *   /model-context-refresh   re-read models.json and re-fetch every discovery provider
+ *   /model-context-list      what discovery reported for one provider, one model at a time
  */
 
 import { homedir } from "node:os";
@@ -37,6 +38,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import {
 	canDiscover,
+	describeRejections,
 	discoveryFlag,
 	fetchModels,
 	LOG_PREFIX,
@@ -45,6 +47,7 @@ import {
 	setDiscoveryFlagInFile,
 	type DiscoveredModel,
 	type ProviderEntry,
+	type RejectedModel,
 } from "./discovery.ts";
 
 const MODELS_JSON = process.env.PI_MODELS_JSON ?? join(homedir(), ".pi", "agent", "models.json");
@@ -62,6 +65,13 @@ type ChatModel = Exclude<ProviderModelConfig, { type: "image" } | { type: "class
 
 interface Notify {
 	(message: string, level?: "info" | "warning" | "error"): void;
+}
+
+/** What the last successful fetch reported for one provider, kept for `/model-context-list`. */
+interface LastDiscovery {
+	url: string;
+	models: ChatModel[];
+	skipped: RejectedModel[];
 }
 
 function toModelConfig(entry: ProviderEntry, model: DiscoveredModel): ChatModel {
@@ -86,20 +96,28 @@ async function registerProvider(
 	pi: ExtensionAPI,
 	entry: ProviderEntry,
 	notify: Notify,
+	last: Map<string, LastDiscovery>,
 ): Promise<boolean> {
 	let lastModels: ChatModel[] = [];
 
 	const discover = async (signal?: AbortSignal): Promise<ChatModel[]> => {
-		const discovered = await fetchModels(entry, signal);
-		const models = discovered.map((model) => toModelConfig(entry, model));
+		const { models: found, rejected } = await fetchModels(entry, signal);
+		const models = found.map((model) => toModelConfig(entry, model));
 		lastModels = models;
-		const unreported = discovered.filter((model) => !model.maxTokensReported);
+		last.set(entry.id, { url: modelsUrlFor(entry), models, skipped: rejected });
+		const unreported = found.filter((model) => !model.maxTokensReported);
 		if (unreported.length > 0) {
 			notify(
 				`${LOG_PREFIX} ${entry.id}: ${unreported.length} model(s) report no output limit; ` +
 					`using ${unreported[0].maxTokens} (pin "maxTokens" in models.json to change it)`,
 				"info",
 			);
+		}
+		// Counted by cause, never named: an aggregator can list hundreds of models and skip a fifth of
+		// them, and one name per skip is a wall of text nobody reads. `/model-context-list` shows detail
+		// for the models that did register.
+		if (rejected.length > 0) {
+			notify(`${LOG_PREFIX} ${entry.id}: ${rejected.length} model(s) skipped: ${describeRejections(rejected)}`, "info");
 		}
 		return models;
 	};
@@ -139,23 +157,23 @@ async function registerProvider(
 		},
 	});
 
-	notify(
-		`${LOG_PREFIX} ${entry.id}: ${models.length} model(s) from ${modelsUrlFor(entry)}: ` +
-			`${models.map((m) => `${m.id} (${m.contextWindow} tokens, ${m.input.join("+")})`).join(", ")}`,
-		"info",
-	);
+	notify(`${LOG_PREFIX} ${entry.id}: ${models.length} model(s) from ${modelsUrlFor(entry)}`, "info");
 	return true;
 }
 
 export default async function (pi: ExtensionAPI) {
+	/** What each discovery provider reported last time it was fetched, for `/model-context-list`. */
+	const lastDiscovered = new Map<string, LastDiscovery>();
+
 	/** Register or unregister one provider according to its current flag. */
 	const applyProvider = async (entry: ProviderEntry, notify: Notify): Promise<void> => {
 		if (entry.discoverModels === true) {
-			if (canDiscover(entry)) await registerProvider(pi, entry, notify);
+			if (canDiscover(entry)) await registerProvider(pi, entry, notify, lastDiscovered);
 			else notify(`${LOG_PREFIX} ${entry.id}: discovery is on but it has no baseUrl or modelsUrl`, "warning");
 		} else if (entry.discoverModels === false) {
 			// Discovery turned off on purpose: hand it back to plain models.json.
 			pi.unregisterProvider(entry.id);
+			lastDiscovered.delete(entry.id);
 		}
 	};
 
@@ -251,6 +269,57 @@ export default async function (pi: ExtensionAPI) {
 		description: "Re-read models.json and re-fetch every provider with discoverModels",
 		handler: async (_args, ctx) => {
 			await run((message, level) => ctx.ui.notify(message, level ?? "info"));
+		},
+	});
+
+	// The discovery line is a count, so the detail has to be reachable somewhere. Two scrollable picks -
+	// provider, then model - rather than one notification per model: an aggregator lists hundreds of
+	// models, and nobody scrolls through hundreds of notifications either.
+	pi.registerCommand("model-context-list", {
+		description: "Show the context window and modalities discovery reported for one model",
+		handler: async (args, ctx) => {
+			const notify: Notify = (message, level) => ctx.ui.notify(message, level ?? "info");
+			const providers = [...lastDiscovered.keys()];
+			if (providers.length === 0) {
+				notify(`${LOG_PREFIX} nothing discovered this session; turn discovery on with /model-context`, "warning");
+				return;
+			}
+
+			const asked = args.trim();
+			let providerId = providers.includes(asked) ? asked : undefined;
+			if (!providerId) {
+				if (asked) notify(`${LOG_PREFIX} no discovery results for "${asked}"; choosing a provider`, "warning");
+				const options = providers.map((id) => `${id} (${lastDiscovered.get(id)!.models.length} model(s))`);
+				const pickedProvider = await ctx.ui.select("Model discovery - choose a provider", options);
+				if (!pickedProvider) return; // Esc closes the picker
+				providerId = providers[options.indexOf(pickedProvider)];
+				if (!providerId) return;
+			}
+
+			const found = lastDiscovered.get(providerId);
+			if (!found) {
+				notify(`${LOG_PREFIX} ${providerId}: nothing discovered`, "warning");
+				return;
+			}
+
+			const picked = await ctx.ui.select(
+				`${providerId}: ${found.models.length} model(s) from ${found.url}` +
+					(found.skipped.length > 0 ? ` - ${found.skipped.length} skipped` : ""),
+				found.models.map((model) => model.id),
+			);
+			if (!picked) return;
+
+			const model = found.models.find((m) => m.id === picked);
+			if (!model) return;
+			notify(
+				`${LOG_PREFIX} ${providerId}/${model.id}\n` +
+					`name: ${model.name}\n` +
+					`context window: ${model.contextWindow} tokens\n` +
+					`max output: ${model.maxTokens} tokens\n` +
+					`input: ${model.input.join("+")}\n` +
+					`from: ${found.url}`,
+				"info",
+			);
 		},
 	});
 }

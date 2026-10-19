@@ -59,9 +59,31 @@ copy is kept as `models.json.bak`.
 ```
 
 Re-reads `models.json` and re-fetches every discovery provider, reporting one line per provider with
-the context window and modalities it found.
+how many models it registered and how many it skipped.
+
+```
+/model-context-list [provider]
+```
+
+Two scrollable picks - provider, then model - and one notification with what the endpoint reported
+for that model: display name, context window, max output, input modalities and the URL it came from.
+This is where the per-model detail lives; the discovery lines themselves only give counts. Passing
+the provider id skips the first pick. The list is whatever the last successful fetch saw, so
+`/model-context-refresh` first if a server has changed since the session started.
 
 ## Behaviour and limits
+
+- **Discovery reports counts, never a dump.** An aggregator can list hundreds of models, and one line
+  per model buries everything else in the terminal. A provider gets a count of what registered and a
+  count per reason for what did not:
+
+  ```
+  pi-model-context: aggregator: 446 model(s) from https://aggregator.example/v1/models
+  pi-model-context: aggregator: 56 model(s) skipped: no context window reported
+  pi-model-context: aggregator: 446 model(s) report no output limit; using 65536 (pin "maxTokens" in models.json to change it)
+  ```
+
+  `/model-context-list` is the way in to the individual models.
 
 - **No cache file.** There is nothing to go stale and no fingerprint to invalidate. The cost is
   that startup performs one request per discovery provider; an unreachable endpoint costs up to

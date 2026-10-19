@@ -62,6 +62,9 @@ export interface DiscoveredModel {
 
 export interface RejectedModel {
 	id: string;
+	/** Short label for why, so a list of hundreds can be reported as counts instead of names. */
+	cause: string;
+	/** Full guidance for a human fixing one entry. */
 	reason: string;
 }
 
@@ -136,7 +139,11 @@ export function parseModelsPayload(payload: unknown): { models: DiscoveredModel[
 		if (!id) continue;
 
 		if (isDecisionModel(entry)) {
-			rejected.push({ id, reason: "reports output modality 'decisions'; register it as a classifier instead" });
+			rejected.push({
+				id,
+				cause: "decision model",
+				reason: "reports output modality 'decisions'; register it as a classifier instead",
+			});
 			continue;
 		}
 
@@ -144,6 +151,7 @@ export function parseModelsPayload(payload: unknown): { models: DiscoveredModel[
 		if (contextWindow === undefined) {
 			rejected.push({
 				id,
+				cause: "no context window reported",
 				reason: "endpoint reports no context window; pin \"contextWindow\" for this model in models.json",
 			});
 			continue;
@@ -163,6 +171,37 @@ export function parseModelsPayload(payload: unknown): { models: DiscoveredModel[
 	}
 
 	return { models, rejected };
+}
+
+/**
+ * Skipped entries counted per cause, most skipped first. An endpoint that lists 500 models can skip
+ * 50 of them for two reasons; naming all 50 is a wall of text, counting them by cause is one line.
+ * At most `limit` causes are kept, and the last one carries the remainder so the total still adds up.
+ */
+export function groupRejections(rejected: RejectedModel[], limit = 3): { cause: string; count: number }[] {
+	const counts = new Map<string, number>();
+	for (const entry of rejected) counts.set(entry.cause, (counts.get(entry.cause) ?? 0) + 1);
+
+	const groups = [...counts.entries()]
+		.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+		.map(([cause, count]) => ({ cause, count }));
+	if (groups.length <= limit) return groups;
+	const kept = groups.slice(0, limit - 1);
+	const rest = groups.slice(limit - 1);
+	kept.push({ cause: `${rest.length} other cause(s)`, count: rest.reduce((total, group) => total + group.count, 0) });
+	return kept;
+}
+
+/**
+ * The groups as one fragment: `no context window reported`, or `no context window reported (56),
+ * decision model (4)`. A single group leaves out its count because the caller prints the total.
+ * "" when nothing was rejected.
+ */
+export function describeRejections(rejected: RejectedModel[], limit = 3): string {
+	const groups = groupRejections(rejected, limit);
+	if (groups.length === 0) return "";
+	if (groups.length === 1) return groups[0].cause;
+	return groups.map((group) => `${group.cause} (${group.count})`).join(", ");
 }
 
 /** Resolve `$NAME`, `${NAME}`, `$$` and `$!`. A leading `!` (command) is refused. */
@@ -193,7 +232,10 @@ export function modelsUrlFor(entry: ProviderEntry): string {
 }
 
 /** Request the model list. Throws with the reason so the caller can report one line per provider. */
-export async function fetchModels(entry: ProviderEntry, signal?: AbortSignal): Promise<DiscoveredModel[]> {
+export async function fetchModels(
+	entry: ProviderEntry,
+	signal?: AbortSignal,
+): Promise<{ models: DiscoveredModel[]; rejected: RejectedModel[] }> {
 	if (!entry.baseUrl && !entry.modelsUrl) throw new Error("provider has neither baseUrl nor modelsUrl");
 
 	const headers: Record<string, string> = {};
@@ -223,10 +265,10 @@ export async function fetchModels(entry: ProviderEntry, signal?: AbortSignal): P
 
 	const { models, rejected } = parseModelsPayload(payload);
 	if (models.length === 0) {
-		const skipped = rejected.map((r) => `${r.id} (${r.reason})`).join("; ");
-		throw new Error(`GET ${url} listed no usable models${skipped ? `: ${skipped}` : ""}`);
+		const detail = describeRejections(rejected);
+		throw new Error(`GET ${url} listed no usable models${detail ? ` (${rejected.length} skipped: ${detail})` : ""}`);
 	}
-	return models;
+	return { models, rejected };
 }
 
 /**
