@@ -102,6 +102,8 @@ graph LR
 
 TypeScript uses the compiler API (`ts.createProgram`) instead of LSP, because `typescript-language-server` requires a `tsserver` binary which Linux TypeScript packages don't ship.
 
+`loadTypeScriptModule` resolves the compiler in two steps: the indexed project's own `typescript` package, via `require.resolve` from the project root, then the extension's own dependency. A candidate is used only when it exposes `createProgram`. TypeScript 7 is skipped because its npm entry point is a version shim and the JS compiler API moved to `typescript/unstable/*`, which holds TypeScript indexing to typescript `<7`; `renovate.json` carries a matching `packageRules` entry. When no candidate qualifies, one warning names the cause instead of leaving an index file unwritten.
+
 ## Development
 
 ```bash
@@ -131,6 +133,7 @@ timeout 90 pi -p 'Run pi_symbol_build. Then run pi_project_symbols.'
 
 - References may fail for symbols LSP servers don't fully resolve
 - Call hierarchy may not be supported by all LSP servers
+- TypeScript indexing needs a `typescript` package that still ships the legacy JS compiler API, so typescript 7 in either the indexed project or the extension leaves TypeScript files unindexed
 
 ## Future work
 

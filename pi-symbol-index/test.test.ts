@@ -6,7 +6,7 @@
 // and a temporary TypeScript project.
 
 import extensionDefault, { buildIndex, readIndex, INDEX_DIR } from './index.ts';
-import { crc32, toBase36, symbolNameMatches, findIdentifierColumn } from './index.ts';
+import { crc32, toBase36, symbolNameMatches, findIdentifierColumn, loadTypeScriptModule } from './index.ts';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -338,6 +338,7 @@ async function main(): Promise<void> {
   await run('identifier column skips longer words and receivers', testFindIdentifierColumn);
   await run('symbol_index_build rejects a directory with no language markers', testBuildRejectsNoLanguage);
   await run('stale index refresh rejects when language markers were removed', testRefreshRejectsWhenMarkersGone);
+  await run('TypeScript compiler resolver prefers the indexed project copy', testTypeScriptResolver);
 
   // -- Tear down --
   await cleanup();
@@ -444,6 +445,58 @@ async function testRefreshRejectsWhenMarkersGone() {
     process.chdir(prevCwd);
     await fs.rm(dir, { recursive: true, force: true });
   }
+}
+
+// The extension used to resolve the compiler with a bare directory specifier, which ESM rejects, so
+// it always landed on its own typescript devDependency. A major bump there then changed indexing for
+// every project. These cases pin the resolution order and the skip of a compiler without the legacy
+// JS API.
+async function testTypeScriptResolver() {
+  const stamp = Date.now();
+  const ownVersion = JSON.parse(
+    await fs.readFile(path.join(__dirname, 'node_modules', 'typescript', 'package.json'), 'utf-8'),
+  ).version as string;
+
+  const writePkg = async (root: string, main: string) => {
+    const pkgDir = path.join(root, 'node_modules', 'typescript');
+    await fs.mkdir(pkgDir, { recursive: true });
+    await fs.writeFile(path.join(root, 'package.json'), JSON.stringify({ name: 'consumer' }));
+    await fs.writeFile(
+      path.join(pkgDir, 'package.json'),
+      JSON.stringify({ name: 'typescript', version: '0.0.0-fake', main }),
+    );
+    return pkgDir;
+  };
+
+  // 1. A project copy that exposes createProgram wins over the extension's own.
+  const localRoot = path.join(os.tmpdir(), `sym_test_tsres_local_${stamp}`);
+  const localPkg = await writePkg(localRoot, 'index.js');
+  await fs.writeFile(path.join(localPkg, 'index.js'), 'module.exports = { createProgram: () => "project-local" };');
+  const local = await loadTypeScriptModule(localRoot);
+  assertEq(typeof local?.createProgram, 'function', 'project copy loaded');
+  assertEq(local.createProgram(), 'project-local', 'project copy beats the extension copy');
+
+  // 2. A project copy without the legacy JS API (typescript 7 ships a version shim) is skipped.
+  const shimRoot = path.join(os.tmpdir(), `sym_test_tsres_shim_${stamp}`);
+  const shimPkg = await writePkg(shimRoot, 'shim.js');
+  await fs.writeFile(path.join(shimPkg, 'shim.js'), 'module.exports = { version: "7.0.0" };');
+  const afterShim = await loadTypeScriptModule(shimRoot);
+  assertEq(
+    typeof afterShim?.createProgram,
+    'function',
+    'fallback compiler has createProgram: the extension copy must expose the legacy JS API, typescript 7 does not',
+  );
+  assertEq(afterShim.version, ownVersion, 'shim skipped, extension copy used');
+
+  // 3. No project copy at all: the extension's own dependency is used.
+  const bareRoot = path.join(os.tmpdir(), `sym_test_tsres_bare_${stamp}`);
+  await fs.mkdir(bareRoot, { recursive: true });
+  await fs.writeFile(path.join(bareRoot, 'package.json'), JSON.stringify({ name: 'bare' }));
+  const bare = await loadTypeScriptModule(bareRoot);
+  assertEq(typeof bare?.createProgram, 'function', 'extension copy loaded for a project without one');
+  assertEq(bare.version, ownVersion, 'extension copy version matches its package.json');
+
+  for (const dir of [localRoot, shimRoot, bareRoot]) await fs.rm(dir, { recursive: true, force: true });
 }
 
 

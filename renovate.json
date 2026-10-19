@@ -1,3 +1,10 @@
 {
-  "$schema": "https://docs.renovatebot.com/renovate-schema.json"
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "packageRules": [
+    {
+      "matchPackageNames": ["typescript"],
+      "allowedVersions": "<7",
+      "description": "pi-symbol-index indexes TypeScript projects through the legacy JS compiler API (ts.createProgram). TypeScript 7's npm entry point is a version shim and its replacement is published under typescript/unstable/*, so the major is deferred until that API settles."
+    }
+  ]
 }

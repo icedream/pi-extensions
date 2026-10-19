@@ -10,6 +10,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 
 // Lazy-import pi-coding-agent utilities (not available during local tests)
 let _withFileMutationQueue: typeof import("@earendil-works/pi-coding-agent")["withFileMutationQueue"] | null = null;
@@ -452,6 +454,47 @@ async function extractSymbolsFromLspForFile(
 }
 
 // =========================================
+// TypeScript compiler resolution
+// =========================================
+
+/**
+ * Loads a TypeScript compiler reachable through the legacy JS API (`createProgram`).
+ *
+ * The indexed project's own copy wins. `require.resolve` from the workspace root honours that
+ * package's entry point, which is what `import("<workspace>/node_modules/typescript")` was meant to
+ * do but never could: ESM rejects a bare directory specifier with ERR_UNSUPPORTED_DIR_IMPORT, so the
+ * old code always fell through to the extension's own copy and a devDependency bump there silently
+ * changed indexing behaviour. Candidates without `createProgram` are skipped rather than trusted —
+ * typescript 7's npm entry point is a version shim, its JS API moved to `typescript/unstable/*`.
+ */
+let tsApiWarned = false;
+
+export async function loadTypeScriptModule(workspaceFolder: string): Promise<any | undefined> {
+  const candidates: Array<() => Promise<any>> = [
+    () => import(pathToFileURL(createRequire(path.join(workspaceFolder, "index.js")).resolve("typescript")).href),
+    () => import("typescript"),
+  ];
+  for (const load of candidates) {
+    try {
+      const mod = await load();
+      const ts = mod?.default?.createProgram ? mod.default : mod;
+      if (ts && typeof ts.createProgram === "function") return ts;
+    } catch {
+      // Unresolvable or API-incompatible candidate: try the next one.
+    }
+  }
+  if (!tsApiWarned) {
+    tsApiWarned = true;
+    console.warn(
+      "[pi-symbol-index] no TypeScript compiler exposing the legacy JS API (ts.createProgram) is reachable " +
+      "from the indexed project or from the extension, so TypeScript indexing is skipped. typescript 7 " +
+      "replaced that API with typescript/unstable/*.",
+    );
+  }
+  return undefined;
+}
+
+// =========================================
 // Per-file TypeScript extraction (no tree walk)
 // =========================================
 
@@ -463,14 +506,8 @@ async function extractSymbolsFromTsFile(workspaceFolder: string, filePath: strin
     return [];
   }
 
-  let tsModule: any;
-  try {
-    tsModule = await import(path.join(workspaceFolder, "node_modules", "typescript"));
-  } catch {
-    tsModule = await import("typescript");
-  }
-  if (!tsModule || !tsModule.createProgram) return [];
-  const ts = tsModule.default || tsModule;
+  const ts = await loadTypeScriptModule(workspaceFolder);
+  if (!ts) return [];
 
   const program = ts.createProgram({
     rootNames: [fullFilePath],
@@ -608,14 +645,8 @@ async function extractSymbolsFromTsProgram(
   const slice = files;
 
   try {
-    let tsModule: any;
-    try {
-      tsModule = await import(path.join(workspaceFolder, "node_modules", "typescript"));
-    } catch {
-      tsModule = await import("typescript");
-    }
-    if (!tsModule || !tsModule.createProgram) return {};
-    const ts = tsModule.default || tsModule;
+    const ts = await loadTypeScriptModule(workspaceFolder);
+    if (!ts) return {};
 
     // Try to load tsconfig.json
     let tsconfig: any = null;
