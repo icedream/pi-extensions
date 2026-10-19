@@ -14,6 +14,7 @@ import {
 	parseConfig,
 	parseSeatFigure,
 	preSwitchCompactionStep,
+	providerForModelRef,
 	spendSince,
 	statusLabel,
 	tierFor,
@@ -89,6 +90,17 @@ test("tierFor maps fractions to tiers at the threshold boundaries", () => {
 const COPILOT = "github-copilot";
 const LOCAL = "llama-server=http://icedream-homepc:11180/qwen3.8-27b";
 
+// Registry fixture for divert tests: provider names with and without slashes, ids with colons.
+const LOCAL_REF = "icedream-homepc/strata/qwen3.8-flash-next-iq3_s";
+const REGISTRY = [
+	{ provider: COPILOT, id: "claude-sonnet-5.5" },
+	{ provider: "freellmapi", id: "auto" },
+	{ provider: "freellmapi", id: "openai/gpt-oss-120b:free" },
+	{ provider: "hetzner", id: "Qwen3.8-27B" },
+	{ provider: "kubeai", id: "claude-sonnet-5.5" },
+	{ provider: "icedream-homepc/strata", id: "qwen3.8-flash-next-iq3_s" },
+];
+
 // Simulate one crossing: each agent_end feeds its returned flag back in, exactly like index.ts.
 function crossing(steps: Array<[Tier | undefined, string | undefined]>): boolean[] {
 	let compacted = false;
@@ -131,26 +143,89 @@ test("divert does not compact again after prepare already compacted in the same 
 test("applyDivert rewrites local-eligible launches and blocks the rest", () => {
 	const ref = "llama-server=http://x:1/qwen";
 	const local = ["scout", "Plan"];
+	const opts = { localSubagents: local, subagentRef: ref, budgetProvider: COPILOT };
 
 	const single = { agent: "scout", task: "find X" };
-	assert.deepEqual(applyDivert(single, local, ref), { rewritten: 1, blocked: [] });
+	assert.deepEqual(applyDivert(single, opts), { rewritten: 1, blocked: [], passed: [] });
 	assert.equal((single as { model?: string }).model, ref);
 
 	const blockedSingle = { agent: "worker", task: "implement" };
-	assert.deepEqual(applyDivert(blockedSingle, local, ref), { rewritten: 0, blocked: ["worker"] });
+	assert.deepEqual(applyDivert(blockedSingle, opts), { rewritten: 0, blocked: ["worker"], passed: [] });
 	assert.equal((blockedSingle as { model?: string }).model, undefined);
 
 	const batch = { tasks: [{ agent: "Plan", task: "a" }, { agent: "reviewer", task: "b" }, { task: "no agent" }] };
-	const r = applyDivert(batch, local, ref);
-	assert.deepEqual(r, { rewritten: 1, blocked: ["reviewer", "(no agent)"] });
-	assert.equal(batch.tasks[0].model, ref);
+	const r = applyDivert(batch, opts);
+	assert.deepEqual(r, { rewritten: 1, blocked: ["reviewer", "(no agent)"], passed: [] });
+	assert.equal((batch.tasks[0] as { model?: string }).model, ref);
 	assert.equal((batch.tasks[1] as { model?: string }).model, undefined);
 });
 
 test("applyDivert leaves management actions untouched", () => {
 	const status = { action: "status", id: "abc" };
-	assert.deepEqual(applyDivert(status, ["scout"], "ref"), { rewritten: 0, blocked: [] });
+	assert.deepEqual(applyDivert(status, { localSubagents: ["scout"], subagentRef: "ref", budgetProvider: COPILOT }), {
+		rewritten: 0,
+		blocked: [],
+		passed: [],
+	});
 	assert.equal((status as { model?: string }).model, undefined);
+});
+
+test("applyDivert does not touch launches aimed at another provider", () => {
+	const opts = { localSubagents: ["scout"], subagentRef: LOCAL_REF, budgetProvider: COPILOT, models: REGISTRY };
+
+	// The reported bug: a non-local agent explicitly on freellmapi is neither blocked nor rewritten.
+	const researcher = { agent: "researcher", model: "freellmapi/auto", task: "critique the plan" };
+	assert.deepEqual(applyDivert(researcher, opts), { rewritten: 0, blocked: [], passed: ["researcher"] });
+	assert.equal(researcher.model, "freellmapi/auto");
+
+	const advisor = { agent: "advisor", model: "hetzner/Qwen3.8-27B:xhigh", task: "critique" };
+	assert.deepEqual(applyDivert(advisor, opts), { rewritten: 0, blocked: [], passed: ["advisor"] });
+
+	// A local-eligible agent that already names another provider keeps that model.
+	const scout = { agent: "scout", model: "hetzner/Qwen3.8-27B", task: "look" };
+	assert.deepEqual(applyDivert(scout, opts), { rewritten: 0, blocked: [], passed: ["scout"] });
+	assert.equal(scout.model, "hetzner/Qwen3.8-27B");
+
+	// Mixed batch: only the copilot launch is diverted or blocked.
+	const batch = {
+		tasks: [
+			{ agent: "worker", model: "github-copilot/claude-sonnet-5.5", task: "a" },
+			{ agent: "delegate", model: LOCAL_REF, task: "b" },
+			{ agent: "scout", task: "c" },
+		],
+	};
+	assert.deepEqual(applyDivert(batch, opts), { rewritten: 1, blocked: ["worker"], passed: ["delegate"] });
+	assert.equal((batch.tasks[2] as { model?: string }).model, LOCAL_REF);
+});
+
+test("applyDivert treats an unattributable model as capped-provider spend", () => {
+	const opts = { localSubagents: ["scout"], subagentRef: LOCAL_REF, budgetProvider: COPILOT, models: REGISTRY };
+	const unknown = { agent: "worker", model: "not-a-provider/whatever", task: "a" };
+	assert.deepEqual(applyDivert(unknown, opts), { rewritten: 0, blocked: ["worker"], passed: [] });
+	const ambiguous = { agent: "worker", model: "claude-sonnet-5.5", task: "a" };
+	assert.deepEqual(applyDivert(ambiguous, opts), { rewritten: 0, blocked: ["worker"], passed: [] });
+});
+
+test("applyDivert uses the session provider when a launch names no model", () => {
+	const local = { localSubagents: ["scout"], subagentRef: LOCAL_REF, budgetProvider: COPILOT, sessionProvider: "freellmapi" };
+	assert.deepEqual(applyDivert({ agent: "worker", task: "a" }, local), { rewritten: 0, blocked: [], passed: ["worker"] });
+	assert.deepEqual(applyDivert({ agent: "scout", task: "a" }, local), { rewritten: 0, blocked: [], passed: ["scout"] });
+
+	const capped = { localSubagents: ["scout"], subagentRef: LOCAL_REF, budgetProvider: COPILOT, sessionProvider: COPILOT };
+	assert.deepEqual(applyDivert({ agent: "worker", task: "a" }, capped), { rewritten: 0, blocked: ["worker"], passed: [] });
+	assert.deepEqual(applyDivert({ agent: "scout", task: "a" }, capped), { rewritten: 1, blocked: [], passed: [] });
+});
+
+test("providerForModelRef resolves full ids, bare ids, and thinking suffixes", () => {
+	assert.equal(providerForModelRef("freellmapi/auto", REGISTRY), "freellmapi");
+	// Provider names may contain slashes: the full id, not the first slash, decides.
+	assert.equal(providerForModelRef(LOCAL_REF, REGISTRY), "icedream-homepc/strata");
+	assert.equal(providerForModelRef("hetzner/Qwen3.8-27B:xhigh", REGISTRY), "hetzner");
+	assert.equal(providerForModelRef("openai/gpt-oss-120b:free", REGISTRY), "freellmapi");
+	assert.equal(providerForModelRef("Qwen3.8-27B", REGISTRY), "hetzner");
+	assert.equal(providerForModelRef("claude-sonnet-5.5", REGISTRY), undefined); // ambiguous
+	assert.equal(providerForModelRef("nope/nope", REGISTRY), undefined);
+	assert.equal(providerForModelRef("", REGISTRY), undefined);
 });
 
 const validRaw = {

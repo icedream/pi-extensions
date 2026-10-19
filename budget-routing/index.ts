@@ -266,23 +266,30 @@ export default function (pi: ExtensionAPI) {
 		void refreshSeat(ctx).then(() => refreshStatus(ctx));
 	});
 
-	// At divert: light subagent launches run locally; other launches are blocked.
+	// At divert: launches that would spend the capped provider are rewritten to the local model when
+	// their agent is local-eligible, and blocked otherwise. Launches already aimed at another provider
+	// cost nothing against this cap and are left alone.
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "subagent") return undefined;
 		const st = await safeState(ctx);
 		if (!st || st.tier !== "divert") return undefined;
 
-		const plan = applyDivert(
-			(event as unknown as { input?: unknown }).input,
-			st.cfg.localSubagents,
-			st.cfg.localModel.subagentRef,
-		);
+		const plan = applyDivert((event as unknown as { input?: unknown }).input, {
+			localSubagents: st.cfg.localSubagents,
+			subagentRef: st.cfg.localModel.subagentRef,
+			budgetProvider: st.cfg.provider,
+			sessionProvider: ctx.model?.provider,
+			models: ctx.modelRegistry.getAll(),
+		});
 		if (plan.blocked.length > 0) {
 			return {
 				block: true,
 				reason:
 					`${st.cfg.provider} cap reached (${st.pct}%). Blocked launches: ${plan.blocked.join(", ")}. ` +
-					`Local-eligible: ${st.cfg.localSubagents.join(", ")}. Raise monthlyCapUsd in budget-routing.json to override.`,
+					`Local-eligible: ${st.cfg.localSubagents.join(", ")}. Launches with an explicit model from another ` +
+					`provider are not blocked: pass model as "<other-provider>/<model-id>". Raise monthlyCapUsd in ` +
+					`budget-routing.json to allow ${st.cfg.provider} launches again.` +
+					(plan.passed.length > 0 ? ` Already allowed: ${plan.passed.join(", ")}.` : ""),
 			};
 		}
 		return undefined;

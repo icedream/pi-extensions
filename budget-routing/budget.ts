@@ -316,30 +316,86 @@ export function statusLabel(
 	return { text: `${name} ${estimate}${pct}%${mark}`, color: STATUS_COLORS[tier] };
 }
 
+const THINKING_SUFFIXES = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** Removes a trailing `:level` thinking suffix, the way the subagent tool does before resolving a model. */
+export function stripThinkingSuffix(ref: string): string {
+	const i = ref.lastIndexOf(":");
+	if (i === -1) return ref;
+	return THINKING_SUFFIXES.includes(ref.slice(i + 1)) ? ref.slice(0, i) : ref;
+}
+
+export interface RegistryModelLike {
+	provider: string;
+	id: string;
+}
+
+/**
+ * Provider that a subagent `model` reference resolves to. Mirrors the subagent tool: an exact
+ * `provider/id` match wins, otherwise a bare id counts when exactly one known model has it. Provider
+ * names may themselves contain slashes (`icedream-homepc/strata`), so matching is against full ids
+ * rather than a split on the first slash. undefined when the reference is unknown or ambiguous.
+ */
+export function providerForModelRef(ref: string, models: readonly RegistryModelLike[]): string | undefined {
+	const base = stripThinkingSuffix(ref.trim());
+	if (!base) return undefined;
+	const exact = models.find((m) => `${m.provider}/${m.id}` === base);
+	if (exact) return exact.provider;
+	const byId = models.filter((m) => m.id === base);
+	return byId.length === 1 ? byId[0].provider : undefined;
+}
+
+export interface DivertOptions {
+	/** Agent names that may run on the local model. */
+	localSubagents: string[];
+	/** Model reference written to diverted launches. */
+	subagentRef: string;
+	/** The provider under the spend cap. Only launches that spend it are diverted or blocked. */
+	budgetProvider: string;
+	/** Provider of the current session model: what a launch with no explicit model inherits. */
+	sessionProvider?: string;
+	/** Known registry models, used to attribute an explicit `model` reference to a provider. */
+	models?: readonly RegistryModelLike[];
+}
+
 export interface DivertResult {
 	/** Launches whose model was rewritten to the local subagent reference. */
 	rewritten: number;
-	/** Agent names of launches that cannot run locally and must be blocked. */
+	/** Agent names of launches that spend the capped provider and cannot run locally. */
 	blocked: string[];
+	/** Agent names of launches that spend another provider, left untouched. */
+	passed: string[];
 }
 
 /**
  * Rewrites subagent launch input in place at divert: local-eligible agents get the local model,
- * other launches are reported as blocked. Management actions (no agent and no task) are left alone.
+ * other launches that spend the capped provider are reported as blocked. A launch is only diverted
+ * or blocked when the model it will use spends the capped provider: an explicit `model` from another
+ * provider is left alone, and so is a launch inheriting a session model from another provider. An
+ * explicit model that cannot be attributed to a known model counts as capped-provider spend, the
+ * safe reading, and one the subagent tool would reject on its own. Management actions (no agent and
+ * no task) are left alone.
  */
-export function applyDivert(input: unknown, localSubagents: string[], subagentRef: string): DivertResult {
+export function applyDivert(input: unknown, opts: DivertOptions): DivertResult {
 	type Launch = { agent?: unknown; task?: unknown; model?: unknown };
 	const root = (input ?? {}) as Launch & { tasks?: unknown };
 	const launches: Launch[] = Array.isArray(root.tasks) ? (root.tasks as Launch[]) : [root];
-	const result: DivertResult = { rewritten: 0, blocked: [] };
+	const result: DivertResult = { rewritten: 0, blocked: [], passed: [] };
 	for (const l of launches) {
 		const agent = typeof l.agent === "string" ? l.agent : undefined;
 		if (agent === undefined && l.task === undefined) continue;
-		if (agent !== undefined && localSubagents.includes(agent)) {
-			l.model = subagentRef;
+		const label = agent ?? "(no agent)";
+		const ref = typeof l.model === "string" ? l.model : undefined;
+		const provider = ref !== undefined ? providerForModelRef(ref, opts.models ?? []) : opts.sessionProvider;
+		if (provider !== undefined && provider !== opts.budgetProvider) {
+			result.passed.push(label);
+			continue;
+		}
+		if (agent !== undefined && opts.localSubagents.includes(agent)) {
+			l.model = opts.subagentRef;
 			result.rewritten++;
 		} else {
-			result.blocked.push(agent ?? "(no agent)");
+			result.blocked.push(label);
 		}
 	}
 	return result;

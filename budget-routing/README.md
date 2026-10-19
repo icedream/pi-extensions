@@ -10,7 +10,7 @@ fills.
 | nudge | 70% | Advisory section added to the system prompt: prefer the local model for light subagents |
 | warn | 80% | Notification |
 | prepare | 95% | Compacts the main session while the provider still works, between agent runs |
-| divert | 100% | Rewrites launches of `localSubagents` to the local model. Blocks other launches for the provider. Offers to switch the main session to the local model (confirmation required) |
+| divert | 100% | Rewrites launches of `localSubagents` to the local model. Blocks other launches that would spend the capped provider. Launches naming a model from another provider are left alone. Offers to switch the main session to the local model (confirmation required) |
 
 The footer also carries a compact indicator next to the session cost — `copilot 92%`, coloured by
 tier. A leading `~` means the figure is estimated from Pi's own logs rather than the provider's seat
@@ -98,6 +98,7 @@ npm run typecheck              # after npm install
 - Spend is Pi's estimate at API list prices, not the invoice. Without a current seat figure — from `seat`, or from a hand-written `observed` — the meter sees only this machine's logs, so usage on other machines or in the IDE is missed and the estimate can read low.
 - Subagent child sessions are counted from their own session files. Transcripts under `subagent-artifacts/` are skipped because they duplicate those files.
 - Divert sees top-level `subagent` launches and `tasks` arrays only. Launches inside workflow scripts are not rewritten.
+- Divert attributes a launch to the capped provider by its `model` argument: an exact `provider/id` match, or a bare id that only one known model has. A launch with no `model` is attributed to the session model's provider. It cannot see a default model coming from `subagents.agentOverrides` in Pi's settings, so such a launch is judged by the session model, and an unresolvable `model` string counts as capped-provider spend.
 - `prepare` runs between agent runs. A single long run can jump from below `prepare` to `divert` without compacting first.
 - Local models have a smaller context window and cold-start slowly. Switching mid-task is risky.
 - Only unit tests and a typecheck have been run so far. Check the live behavior in Pi before relying on it.
