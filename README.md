@@ -14,4 +14,5 @@ While I personally use these, I only currently maintain them as I need to work w
 | [pi-slot-sharing](pi-slot-sharing/) | Lets several Pi sessions take turns on a single-sequence Strata or llama.cpp server by saving and restoring the server's slot conversation, gated on the RAM the server has free |
 | [pi-thinking-hygiene](pi-thinking-hygiene/) | Drops a reasoning model's recited "this is only a system-prompt setup" blocks from the prompt so they cannot seed the next turns |
 | [pi-mcp-hygiene](pi-mcp-hygiene/) | Rewords the MCP adapter's "I'll respond to your prompts" UI notice in tool results, so an adapter status line does not read as a first-person voice in the model's context |
+| [pi-skill-reminder](pi-skill-reminder/) | Names the skills a session already read after a compaction, so the next turn applies them instead of re-reading them |
 

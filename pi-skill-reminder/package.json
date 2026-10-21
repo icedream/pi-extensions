@@ -1,0 +1,21 @@
+{
+	"name": "pi-skill-reminder",
+	"type": "module",
+	"version": "0.1.0",
+	"description": "Pi extension: name the skills a session already read after a compaction, so the next turn applies them instead of re-reading them",
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"scripts": {
+		"test": "node --test index.test.ts",
+		"typecheck": "tsc -p tsconfig.json",
+		"e2e": "PI_SKILL_REMINDER_E2E=1 node --test session.test.ts"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^1.1.0",
+		"@types/node": "^26.1.1",
+		"typescript": "^6.0.3"
+	}
+}
