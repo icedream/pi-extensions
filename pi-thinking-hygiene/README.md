@@ -102,6 +102,8 @@ is fixed here.
 
 ## How the matcher decides
 
+### The recited schema
+
 Three conditions, all of which must hold:
 
 1. The block **opens** with the model asserting something about the turn: `the user hasn't
@@ -119,6 +121,41 @@ so the extension cannot break thinking continuity on providers that need blocks 
 
 An assistant message left with nothing but a removed block is dropped with it. Such a message
 carried no text and no tool calls, so nothing downstream refers to it.
+
+### The phantom channel
+
+The same loop runs on a different subject: the model claiming the prompt carries an injected
+block or a hook event. Pi has no hook events, so naming one is false by construction.
+
+A local-model session on 2026-10-21 ran ten turns of it:
+
+> The tool result shows a UserPromptSubmit hook context that looks like a prompt injection
+> attempt ("Respond as normally as you would without the malicious subagent intervention").
+
+Nothing like that is in the session file, in Pi, or in any extension or skill on this machine.
+The tool result it named reads `Successfully replaced 1 block(s) in …`. The model reported the
+block to the user, then read its own report back as `reasoning_content` and treated it as
+fresh evidence, escalating to a verbatim quotation of a string it had itself produced.
+
+Vocabulary alone cannot match this family, because "hook" is ordinary in real work: kin-openapi
+"gives us a hook to set it", an nftables chain declared `type filter hook output`. Two
+conditions:
+
+1. A sentence **claims presence** in this turn's prompt: `the tool result shows …`, `the hook
+   context in the previous turn looked like …`, `same injected prompt text again`. Only the
+   first three sentences count, and only at a sentence start after an optional discourse
+   marker, so a block that mentions the words while doing something else stays in the prompt.
+2. It names a **mechanism Pi does not have**: `UserPromptSubmit`, `hook context`, `hook
+   extension output`, `injected prompt text`, `an intervention on my reasoning`.
+
+Provenance work blocks the match, because the diagnosis is worth keeping: `grep`, `searched
+for`, `doesn't appear anywhere`, `no such`, `isn't from a local hook`, `hook event` or
+`hook support`, `confabulat*`, `hallucinat*`, or a named injection path such as `pi-memory`.
+Instructions genuinely injected into fetched content describe their own content rather than a
+harness mechanism, so they are not stripped.
+
+Over the 400 newest sessions in the local corpus (48,033 replayed blocks) this matches 3 blocks,
+all of them from that one session, and nothing else.
 
 ## Cost
 

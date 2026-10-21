@@ -36,6 +36,40 @@ const OPEN_ASSERT: RegExp[] = [
 const SETUP_REF = /system (?:prompt|instructions?|context|reminder)|environment\/context setup|environment and instructions/i;
 
 /**
+ * The second family is a phantom channel rather than the recited schema: the block asserts that
+ * the prompt carries an injected block or a hook event. Pi has no hook events, so naming one is
+ * false by construction, and Pi replaying the block seeds the next turn exactly as the schema
+ * does. Instructions that really are injected into fetched content describe their own content
+ * instead of a harness mechanism, and reasoning about Pi's own injection paths names the path it
+ * checked, so neither is caught here.
+ */
+const HARNESS_MECHANISM_REF: RegExp[] = [
+	/\buserpromptsubmit\b|\bpre[- ]?tool[- ]?use\b|\bsubagent[- ]?stop\b/i,
+	/\bhook (?:context|extension|output that|fires)\b/i,
+	/\binjected (?:hook |prompt )?(?:text|context|block|message)\b/i,
+	/\bintervention (?:on|in) (?:my|the) (?:reasoning|thinking|context)\b/i,
+];
+
+/** The claim stated as its own sentence, so a block that only mentions the words while doing something else stays. */
+const CLAIM_SENTENCE =
+	/^(?:(?:also |separately |additionally |note|one more thing|and|but|so|then)[^a-z0-9]{0,4}){0,2}(?:the |this |that )?(?:tool result|prompt|user(?:'s)? (?:message|turn)|turn|message|context|block|text|hook context)\b[^.]{0,48}\b(?:shows?|showed|contains?|contained|includes?|included|carries|carried|displays?|says|appears?|appeared|appended|arrives?|arrived|again|looked like|seems? to)\b/i;
+
+/** ...and the recurring form, which claims the same block arrived again. */
+const RECURRING_CLAIM = /^(?:the )?(?:same|that|this)\b[^.]{0,20}\b(?:injected|hook)\b[^.]{0,24}\bagain\b/i;
+
+/** Reasoning that asks where the text came from, or that no such mechanism exists, is diagnosis and stays. */
+const PROVENANCE_WORK: RegExp[] = [
+	/\bgrep\b|\bsearch(?:ed|ing)? for\b/i,
+	/\b(?:doesn'?t|does not|didn'?t) appear\b|\bnowhere in\b|\bno such\b|\bisn'?t from\b|\bnot (?:found|present|produced by)\b/i,
+	/\bno extension\b|\bhook (?:event|mechanism|support|name)\b/i,
+	/\b(?:confabulat|hallucinat|fabricat|invent(?:ed|ion))\b/i,
+	/\bpi-memory\b|\bmemory (?:block|context|injection)\b|\bcustom_message\b/i,
+];
+
+/** Sentence boundaries for the claim test: a period, question mark, exclamation or newline ends one. */
+const SENTENCE = /[^.!?\n]+/g;
+
+/**
  * ...and it always lands on the same two claims: the turn carries no request, or there was
  * no reasoning before it worth continuing. A block that genuinely reads an odd prompt, one
  * that really is missing what it asks for, reasons about what to do next instead and does
@@ -67,9 +101,21 @@ export function isReplayedThinking(block: ThinkingBlockLike): boolean {
 	return typeof block.thinkingSignature === "string" && REPLAYED_SIGNATURES.has(block.thinkingSignature);
 }
 
-/** Is this reasoning the recited session-opening schema rather than reasoning about the turn? */
+/** Is this reasoning claiming an injected block or a hook event in the prompt that Pi did not put there? */
+export function isPhantomInjection(thinking: string): boolean {
+	const body = thinking.trimStart();
+	if (PROVENANCE_WORK.some((pattern) => pattern.test(body))) return false;
+	for (const sentence of (body.match(SENTENCE) ?? []).slice(0, 3)) {
+		const claim = sentence.trimStart();
+		if (HARNESS_MECHANISM_REF.some((pattern) => pattern.test(sentence)) && (CLAIM_SENTENCE.test(claim) || RECURRING_CLAIM.test(claim))) return true;
+	}
+	return false;
+}
+
+/** Is this reasoning the recited session-opening schema or a phantom channel, rather than reasoning about the turn? */
 export function isConfabulatedThinking(thinking: string, extraPatterns: RegExp[] = []): boolean {
 	const opening = thinking.trimStart();
+	if (isPhantomInjection(opening)) return true;
 	if (!OPEN_ASSERT.some((pattern) => pattern.test(opening)) && !extraPatterns.some((pattern) => pattern.test(opening))) {
 		return false;
 	}

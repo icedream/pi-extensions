@@ -8,6 +8,10 @@
  * continues it. 60 such blocks were found across seven sessions, six of them consecutive in
  * one session, all on one local model.
  *
+ * A second family is matched the same way: the model claiming the prompt carries an injected
+ * block or a hook event. Pi has no hook events, so a block naming one is false by construction,
+ * and replay seeds it identically. One local-model session ran ten turns of it.
+ *
  * So this extension runs on the request-time context transform and drops those blocks from
  * the transcript Pi is about to send. The session file and the UI are untouched: the
  * reasoning is still visible, it just stops being fed back.
