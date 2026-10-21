@@ -1,0 +1,20 @@
+{
+	"name": "pi-mcp-hygiene",
+	"type": "module",
+	"version": "0.1.0",
+	"description": "Pi extension: rewrite the MCP adapter's first-person UI notice out of tool results so it stops reading as a voice inside the model's context",
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"scripts": {
+		"test": "node --test notices.test.ts",
+		"typecheck": "tsc -p tsconfig.json"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^1.1.0",
+		"@types/node": "^26.1.1",
+		"typescript": "^6.0.3"
+	}
+}
