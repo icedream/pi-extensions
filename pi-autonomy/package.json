@@ -1,0 +1,20 @@
+{
+	"name": "pi-autonomy",
+	"type": "module",
+	"version": "0.1.0",
+	"description": "Pi extension: run a goal autonomously with a pre-flight check-in, an explicit completion marker, and runaway guards",
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"scripts": {
+		"test": "node --test protocol.test.ts index.test.ts",
+		"typecheck": "tsc -p tsconfig.json"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^1.1.0",
+		"@types/node": "^26.1.1",
+		"typescript": "^6.0.3"
+	}
+}
