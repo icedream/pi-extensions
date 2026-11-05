@@ -57,11 +57,13 @@ contains. Git cannot see that history, so a session that runs a file-changing to
 `Assisted-by:` line to `<git common dir>/pi-attribution/ledger.jsonl`. The hook intersects that ledger
 with `git diff --cached --name-only -z` and drops entries older than the commit being replaced.
 
-Pi subagent children write the same ledger from their own sessions, which is what puts a subagent's model
-on a commit the parent made. A background child loads this extension through pi-subagents'
-`registerRequiredChildExtensions`; a local foreground child runs inside the parent process and does not
-load ambient extensions, so that registration is what makes the child's line appear. Without pi-subagents
-installed, a commit credits only the models of the session that made it.
+Two kinds of Pi subagent child get credited, by different routes. A child in its own process (a background
+run, or any run that loads this extension) writes its own line from its own session; the session registers
+itself with pi-subagents' `registerRequiredChildExtensions` so that loading happens. A foreground child is
+a session inside the parent's Pi process and loads no ambient extensions, so the parent covers it: it
+snapshots the working tree when the delegation call starts and again when it returns, and claims the
+difference under its own key, credited to the model the parent named in the call. The two routes cannot
+double-count, because a path another session already claimed is dropped.
 
 ## Install
 
@@ -108,8 +110,10 @@ Known and measured, not hypothetical.
   its own hook of those names during a Pi session. `/attribution` lists them when it finds them.
 - **Human edits made while a session sits idle are credited to the model.** A snapshot cannot tell who
   changed a path. A file two models touched credits both, which is the intent.
-- **Subagent attribution needs pi-subagents.** Without it, or in a runner that does not load Pi
-  extensions, a child's work is credited to the session that committed it.
+- **A foreground child is credited from the parent's view of it.** Several children in one call credit
+  every model the parent named with every file that call changed, since a working-tree snapshot cannot say
+  which child wrote which file. A child whose model the parent did not name is credited to the parent's
+  model, and a child working in a separate worktree is invisible to the parent's snapshot.
 - **A commit costs about 125 ms more.** Measured: 159 ms with the hooks against 33 ms without. Two Node
   starts for the message hooks, plus `git interpret-trailers`. Chained hooks are sh and cost a few
   milliseconds each.

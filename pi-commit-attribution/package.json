@@ -9,7 +9,7 @@
 		]
 	},
 	"scripts": {
-		"test": "node --test config.test.ts format.test.mjs inject.test.ts hooks.test.ts ledger.test.ts",
+		"test": "node --test config.test.ts delegate.test.ts format.test.mjs inject.test.ts hooks.test.ts ledger.test.ts",
 		"test:git": "sh commit-paths.test.sh",
 		"typecheck": "tsc -p tsconfig.json"
 	},

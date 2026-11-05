@@ -27,6 +27,8 @@
 		"hooks.test.ts",
 		"ledger.test.ts",
 		"format.test.mjs",
-		"farm-cli.ts"
+		"farm-cli.ts",
+		"delegate.ts",
+		"delegate.test.ts"
 	]
 }

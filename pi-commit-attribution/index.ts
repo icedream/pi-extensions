@@ -20,7 +20,7 @@ import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "nod
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { VERSION } from "@earendil-works/pi-coding-agent";
 import { assistedBy, finalizeLines, resolveModel } from "./format.mjs";
 import type { ModelCatalog } from "./format.mjs";
@@ -29,6 +29,7 @@ import { git } from "./git.ts";
 import { CHAINED_HOOKS, farmIsCurrent, inventory, repoHookDirs, writeFarm, type HookInventory } from "./hooks.ts";
 import { applyInjection, MARKER, planInjection, readInjection } from "./inject.ts";
 import { appendEntries, diffSnapshot, ledgerTarget, prune, readEntries, snapshot, unclaimedPaths } from "./ledger.ts";
+import { DELEGATION_TOOL, delegatedModels, delegatedSessionId, splitModelSpec } from "./delegate.ts";
 import { attributionHome, hooksDir, writeState } from "./state.ts";
 
 const STATUS_KEY = "pi-commit-attribution";
@@ -49,8 +50,13 @@ interface Session {
 	/** Last snapshot per repository, so the next one yields a delta rather than the whole working tree. */
 	baselines: Map<string, Map<string, string>>;
 	lastSnapshotAt: number;
+	/** Working tree as it looked when each delegation call started, so a child's files can be claimed. */
+	delegations: Map<string, { cwd: string; before: Map<string, string>; models: string[] }>;
+	catalog?: ModelCatalog;
 	/** Only ledger observations made during this session can outrank its own claims. */
 	startedAt: number;
+	/** Whether a child session in its own process was told to load this extension too. */
+	childrenRegistered: boolean;
 	checkedCommits: Set<string>;
 	disabled: boolean;
 }
@@ -63,8 +69,10 @@ export default function (pi: ExtensionAPI) {
 		farmDir: hooksDir(),
 		applyPath: join(HERE, "apply.mjs"),
 		baselines: new Map(),
+		delegations: new Map(),
 		lastSnapshotAt: 0,
 		startedAt: Date.now(),
+		childrenRegistered: false,
 		checkedCommits: new Set(),
 		disabled: false,
 	};
@@ -117,7 +125,10 @@ export default function (pi: ExtensionAPI) {
 		}
 		restore = applyInjection(process.env, plan.vars);
 
-		children = await registerChildExtensions(ctx.sessionManager.getSessionId());
+		children = await registerChildExtensions(ctx.sessionManager.getSessionId(), HERE);
+		session.childrenRegistered = Boolean(children);
+		if (!children) session.problems.push("pi-subagents' required-child-extension API was not reached, so a background subagent will not record its own line");
+		session.catalog = catalogFromRegistry(ctx.modelRegistry);
 		const common = ledgerTarget(ctx.cwd);
 		if (common) prune(common);
 		// The baseline is taken before anything can change, so the first observation after a write is a
@@ -131,6 +142,12 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => teardown());
 
 	pi.on("tool_call", async (event, ctx) => {
+		if (event.toolName === DELEGATION_TOOL) {
+			// A foreground child shares this process and loads no extensions of its own, so this is the only
+			// place its work can be seen: the tree before the call and the tree after it.
+			session.delegations.set(event.toolCallId, { cwd: ctx.cwd, before: snapshot(ctx.cwd), models: delegatedModels(event.input) });
+			return;
+		}
 		if (event.toolName !== "bash") return;
 		const command = commandOf(event.input);
 		// Snapshot before a commit rather than after it: once the commit is made the working tree is
@@ -139,6 +156,14 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
+		if (event.toolName === DELEGATION_TOOL) {
+			const pending = session.delegations.get(event.toolCallId);
+			session.delegations.delete(event.toolCallId);
+			// An async child returns here long before it has written anything, which is correct: it records
+			// its own line from its own session, and an empty diff keeps this bridge out of the way.
+			if (pending && !event.isError) recordDelegated(ctx, pending, event.toolCallId);
+			return;
+		}
 		if (event.toolName === "bash") {
 			const command = commandOf(event.input);
 			if (/\bgit\b[^\n]*\bcommit\b/.test(command) && !event.isError) warnIfUnattributed(ctx, command);
@@ -217,6 +242,39 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/**
+	 * Credit the files a child changed to the model that was asked for, rather than to the model reading
+	 * the ledger at commit time. Only paths no other session already claimed are taken, which keeps a
+	 * background child's own, more accurate line in front.
+	 */
+	function recordDelegated(ctx: ExtensionContext, pending: { cwd: string; before: Map<string, string>; models: string[] }, callId: string): void {
+		if (session.disabled || !session.config.ledger) return;
+		const common = ledgerTarget(pending.cwd);
+		if (!common) return;
+		const after = snapshot(pending.cwd);
+		const claimed = unclaimedPaths(diffSnapshot(pending.before, after), readEntries(common, session.startedAt), ctx.sessionManager.getSessionId());
+		session.baselines.set(pending.cwd, after);
+		if (claimed.length === 0) return;
+		const trailers = pending.models.map((spec) => trailerForSpec(ctx, spec)).filter((line): line is string => line !== undefined);
+		const own = currentTrailer(ctx);
+		for (const trailer of trailers.length ? trailers : own ? [own] : []) {
+			try {
+				appendEntries(common, { t: Date.now(), session: delegatedSessionId(ctx.sessionManager.getSessionId(), callId), trailer }, claimed);
+			} catch (error) {
+				session.problems.push(`ledger write failed: ${(error as Error).message}`);
+				return;
+			}
+		}
+	}
+
+	/** The `Assisted-by:` line for a `provider/model` spec, resolved the way the git hook resolves one. */
+	function trailerForSpec(ctx: ExtensionContext, spec: string): string | undefined {
+		const catalog = session.catalog ?? catalogFromRegistry(ctx.modelRegistry);
+		const { provider, id } = splitModelSpec(spec, Object.keys(catalog.providers ?? {}));
+		const resolved = resolveModel({ provider, id }, { catalog, providers: session.config.providers, models: session.config.models, localDomains: session.config.localDomains });
+		return assistedBy(resolved, { name: "pi", version: VERSION });
+	}
+
+	/**
 	 * A commit whose message carries no `Assisted-by:` means the injection did not reach git. The usual
 	 * reason is that the command overrode it (`-c core.hooksPath=...`, its own `GIT_CONFIG_COUNT`), and
 	 * nothing here can survive that, so the session says so instead of trying to rewrite the commit.
@@ -265,6 +323,7 @@ export default function (pi: ExtensionAPI) {
 		lines.push(`this model: ${trailer ?? "no model resolved"}`);
 		const configured = session.config.operator;
 		const identity = configured ?? identityOf(ctx.cwd);
+		lines.push(`subagent children: ${session.childrenRegistered ? "record their own lines in their own sessions, and this session covers the ones that run inside it" : "covered by this session's snapshots around each delegation call"}`);
 		lines.push(`operator: ${identity ?? "not resolved, so no Operated-by line"}${configured ? " (from attribution.json)" : " (the identity this repository authors with, so Operated-by appears only when the author is overridden)"}`);
 		const found = repoInventory(ctx.cwd);
 		lines.push(`repository hooks: ${found.declared.length ? found.declared.map((name) => `${name} (${found.paths[name]})`).join(", ") : "the repository declares none"}`);
@@ -319,7 +378,7 @@ interface RequiredChildExtensions {
 	registerRequiredChildExtensions?: (input: { sessionId: string; extensions: Array<{ id: string; path: string }> }) => { dispose: () => void } | undefined;
 }
 
-async function registerChildExtensions(sessionId: string): Promise<{ dispose: () => void } | undefined> {
+async function registerChildExtensions(sessionId: string, here: string): Promise<{ dispose: () => void } | undefined> {
 	let target: string | undefined;
 	try {
 		// pi-subagents is a sibling extension, not a dependency of this one: resolve it from the package
@@ -335,4 +394,18 @@ async function registerChildExtensions(sessionId: string): Promise<{ dispose: ()
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * Pi's own view of the models, shaped like the catalog file the git hook reads. A delegation names a model
+ * by spec, and the registry is where the human-readable name and the provider address live, including for
+ * models Pi knows without a `models.json` entry.
+ */
+function catalogFromRegistry(registry: ModelRegistry): ModelCatalog {
+	const providers: Record<string, { baseUrl?: string; models: { id: string; name?: string; baseUrl?: string }[] }> = {};
+	for (const model of registry.getAll()) {
+		const entry = (providers[model.provider] ??= { baseUrl: model.baseUrl, models: [] });
+		entry.models.push({ id: model.id, name: model.name, baseUrl: model.baseUrl });
+	}
+	return { providers };
 }
