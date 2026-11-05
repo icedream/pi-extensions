@@ -65,7 +65,8 @@ function attribute() {
 
 	const state = readState();
 	const catalog = readCatalog();
-	const authorEmail = gitConfig("user.email");
+	const repoName = gitConfig("user.name");
+	const repoEmail = gitConfig("user.email");
 
 	const lines = [];
 	const model = resolveModel({ provider: process.env.PI_PROVIDER ?? "", id: process.env.PI_MODEL }, { catalog, providers: config.providers, models: config.models, localDomains: Array.isArray(config.localDomains) ? config.localDomains : [] });
@@ -74,7 +75,13 @@ function attribute() {
 	for (const entry of fromLedger) lines.push(entry);
 	debug(`ledger contributed ${fromLedger.length} line(s)`);
 
-	const operator = operatedBy(config.operator, authorEmail);
+	// The person driving the session is the identity the repository is configured with. `--author` and
+	// GIT_AUTHOR_* change who a commit is credited to without changing who ran it, and a repository may be
+	// set to a work address while the same person owns a personal one, so the line is only worth writing
+	// when those two disagree.
+	const authorEmail = process.env.GIT_AUTHOR_EMAIL || repoEmail;
+	const configured = typeof config.operator === "string" && config.operator.trim() ? config.operator.trim() : undefined;
+	const operator = operatedBy(configured ?? (repoName && repoEmail ? `${repoName} <${repoEmail}>` : undefined), authorEmail);
 	if (operator) lines.push(operator);
 
 	const wanted = finalizeLines(lines, config.maxModels ?? 8);

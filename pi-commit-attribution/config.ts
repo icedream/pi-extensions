@@ -21,7 +21,13 @@ export type InjectRoute = "process-env" | "off";
 export interface AttributionConfig {
 	enabled: boolean;
 	inject: InjectRoute;
-	/** `Name <address>`. Emitted as `Operated-by:` only when it differs from the commit author. */
+	/**
+	 * `Name <address>` for the `Operated-by:` line. Unset means the identity the repository is configured
+	 * with, which makes the line appear only when `--author` or `GIT_AUTHOR_EMAIL` credits the commit to
+	 * somebody else. Set it when the person driving is not the identity the repositories are set to, and
+	 * it is written whenever that differs from the author address, including where the same person uses a
+	 * work address in one group of repositories and a personal one in another.
+	 */
 	operator?: string;
 	/** Cap on `Assisted-by:` lines per commit, so a long session cannot write an unreadable block. */
 	maxModels: number;

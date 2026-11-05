@@ -263,12 +263,21 @@ export default function (pi: ExtensionAPI) {
 		lines.push(`farm: ${farmIsCurrent(session.farmDir, { applyPath: session.applyPath, home: session.home, configPath: configPath(), modelsPath: modelsPath() }) ? "current" : "not installed"}`);
 		const trailer = currentTrailer(ctx);
 		lines.push(`this model: ${trailer ?? "no model resolved"}`);
-		lines.push(`operator: ${session.config.operator ?? "not configured, so no Operated-by line"}`);
+		const configured = session.config.operator;
+		const identity = configured ?? identityOf(ctx.cwd);
+		lines.push(`operator: ${identity ?? "not resolved, so no Operated-by line"}${configured ? " (from attribution.json)" : " (the identity this repository authors with, so Operated-by appears only when the author is overridden)"}`);
 		const found = repoInventory(ctx.cwd);
 		lines.push(`repository hooks: ${found.declared.length ? found.declared.map((name) => `${name} (${found.paths[name]})`).join(", ") : "the repository declares none"}`);
 		for (const [name, reason] of Object.entries(found.unchained)) lines.push(`not chained: ${name} - ${reason}`);
 		for (const problem of session.problems) lines.push(`problem: ${problem}`);
 		ctx.ui.notify(lines.join("\n"), "info");
+	}
+
+	/** The identity git would author with in this repository, which is what Operated-by falls back to. */
+	function identityOf(cwd: string): string | undefined {
+		const name = git(["config", "user.name"], cwd).stdout.trim();
+		const email = git(["config", "user.email"], cwd).stdout.trim();
+		return name && email ? `${name} <${email}>` : undefined;
 	}
 
 	function repoInventory(cwd: string): HookInventory {

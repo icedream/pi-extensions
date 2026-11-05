@@ -1,7 +1,6 @@
 {
   "enabled": true,
   "inject": "process-env",
-  "operator": "Your Name <you@example.com>",
   "maxModels": 8,
   "ledger": true,
   "chainRepoHooks": true,

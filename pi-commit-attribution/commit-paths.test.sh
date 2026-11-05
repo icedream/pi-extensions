@@ -348,6 +348,45 @@ printf '{\n  "operator": "Author Person <author@example.com>"\n}\n' >"$CONFIG"
 m=$(msg_of "$WORK/ledger")
 ! has "$m" "Operated-by:" && ok "no Operated-by when the operator is the commit author" || no "no Operated-by when the operator is the author" "$m"
 
+# ---------------------------------------------------------------- who operated the commit
+
+# With no `operator` in config the operator is the identity the repository authors with, so the line only
+# appears when the commit was deliberately credited to someone else. Two machines or two addresses for the
+# same person therefore write nothing.
+printf '{}\n' >"$WORK/plain-config.json"
+PLAIN_FARM="$WORK/plain-hooks"
+node "$HERE/farm-cli.ts" "$PLAIN_FARM" "$HERE/apply.mjs" "$HOME_DIR" "$WORK/plain-config.json" "$MODELS" >/dev/null
+
+new_repo "$WORK/operator-normal"
+(
+	cd "$WORK/operator-normal"
+	echo a >f.txt
+	git add f.txt
+	GIT_CONFIG_VALUE_0="$PLAIN_FARM" git commit -q -m "feat: author and operator agree"
+)
+m=$(msg_of "$WORK/operator-normal")
+! has "$m" "Operated-by:" && ok "the repository's own identity writes no Operated-by" || no "the repository's own identity writes no Operated-by" "$m"
+has "$m" "$CLOUD_LINE" && ok "and the model line is still written" || no "and the model line is still written" "$m"
+
+new_repo "$WORK/operator-author"
+(
+	cd "$WORK/operator-author"
+	echo a >f.txt
+	git add f.txt
+	git commit -q --author="Someone Else <else@example.com>" -m "feat: credited to someone else"
+)
+m=$(msg_of "$WORK/operator-author")
+has "$m" "Operated-by: Author Person <author@example.com>" && ok "an --author override writes the driving identity" || no "an --author override writes the driving identity" "$m"
+[ "$(git -C "$WORK/operator-author" log -1 --format=%ae)" = "else@example.com" ] && ok "and the author stays the one that was asked for" || no "and the author stays the one that was asked for" "$(git -C "$WORK/operator-author" log -1 --format=%ae)"
+(
+	cd "$WORK/operator-author"
+	echo b >>f.txt
+	git add f.txt
+	GIT_AUTHOR_EMAIL=env@example.com GIT_AUTHOR_NAME="Env Person" git commit -q -m "feat: author from the environment"
+)
+m=$(msg_of "$WORK/operator-author")
+has "$m" "Operated-by: Author Person <author@example.com>" && ok "a GIT_AUTHOR_EMAIL override writes it as well" || no "a GIT_AUTHOR_EMAIL override writes it as well" "$m"
+
 # ---------------------------------------------------------------- signing
 
 # A replayed commit is not a written one: cherry-pick does not run the message hooks at all.

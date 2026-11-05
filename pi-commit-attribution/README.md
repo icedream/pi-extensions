@@ -14,9 +14,10 @@ Assisted-by: pi 1.4.0 / Qwen 3.8 Flash Next (local, self-hosted, Strata)
 Operated-by: Carl Kittelberger <icedream@icedream.pw>
 ```
 
-One line per model that influenced the files in the commit. `Operated-by:` appears when the person
-driving the session is not the address the commit is authored with. Existing `Co-authored-by` lines are
-kept.
+One line per model that influenced the files in the commit. `Operated-by:` appears when the commit is
+credited to someone other than the identity the repository authors with, which by default means a
+`--author` or `GIT_AUTHOR_EMAIL` override. Two addresses for the same person in different repositories
+write nothing. Existing `Co-authored-by` lines are kept.
 
 ## How it reaches the commit
 
@@ -75,7 +76,7 @@ Configuration lives in `~/.pi/agent/attribution.json`; a missing or empty file i
 |---|---|---|
 | `enabled` | `true` | `false` injects nothing. `/attribution disable` does the same for one session. |
 | `inject` | `process-env` | `off` skips injection. |
-| `operator` | unset | `Name <address>` for `Operated-by:`, emitted only when it differs from the commit author. |
+| `operator` | the repository's git identity | `Name <address>` for `Operated-by:`. Written only when it differs from the commit author, so by default only when the author was overridden. |
 | `localDomains` | `[]` | Domains on your own network whose names resolve publicly, so models served there read as local. |
 | `providers` | `{}` | Per provider: `placement`, `label`, `engine`. |
 | `models` | `{}` | Per `provider/modelId`: `name`, plus the provider fields. |
@@ -114,6 +115,9 @@ Known and measured, not hypothetical.
   milliseconds each.
 - **The ledger is kept in `.git/`.** `<git common dir>/pi-attribution/ledger.jsonl` holds model names and
   changed paths for a week, then is pruned. Nothing goes into a tracked file.
+- **A shared or machine identity in a repository becomes the operator.** The default operator is what the
+  repository authors with, so a repository set to a team account or a machine user reports that as
+  `Operated-by:` on an overridden author. Set `operator` there.
 - **A hand-written trailer can end up beside the session's.** With `merge`, a line the model wrote naming
   a different model stays and the accurate line is added next to it; identical lines are never duplicated.
   `onExistingTrailer: "keep"` leaves the message alone once any `Assisted-by:` is present.
