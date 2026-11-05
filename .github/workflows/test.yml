@@ -80,6 +80,25 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
+  pi-commit-attribution:
+    name: pi-commit-attribution
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pi-commit-attribution
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: pi-commit-attribution/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: Commit paths against real git
+        run: sh commit-paths.test.sh
+
   pi-symbol-index:
     name: pi-symbol-index
     runs-on: ubuntu-latest

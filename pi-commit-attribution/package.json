@@ -1,0 +1,21 @@
+{
+	"name": "pi-commit-attribution",
+	"type": "module",
+	"version": "0.1.0",
+	"description": "Pi extension: add the Assisted-by trailer to commits an agent makes through git hooks that exist only for the lifetime of the Pi session",
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"scripts": {
+		"test": "node --test config.test.ts format.test.mjs inject.test.ts hooks.test.ts ledger.test.ts",
+		"test:git": "sh commit-paths.test.sh",
+		"typecheck": "tsc -p tsconfig.json"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^1.1.0",
+		"@types/node": "^26.1.1",
+		"typescript": "^6.0.3"
+	}
+}

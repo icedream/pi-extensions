@@ -1,0 +1,28 @@
+{
+  "enabled": true,
+  "inject": "process-env",
+  "operator": "Your Name <you@example.com>",
+  "maxModels": 8,
+  "ledger": true,
+  "chainRepoHooks": true,
+  "onExistingTrailer": "merge",
+  "localDomains": [
+    "lan.example.net"
+  ],
+  "providers": {
+    "lan-proxy": {
+      "placement": "cloud",
+      "label": "Lan Proxy",
+      "engine": "LiteLLM"
+    },
+    "strata": {
+      "engine": "Strata"
+    }
+  },
+  "models": {
+    "local/qwen-x-y-iq3_s": {
+      "name": "Qwen X Y"
+    }
+  },
+  "skipRepos": []
+}

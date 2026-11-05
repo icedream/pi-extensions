@@ -17,6 +17,7 @@ The badge on each row says how much of my own work the extension has carried. ![
 | [pi-thinking-hygiene](pi-thinking-hygiene/) | ![Experimental][experimental-badge] | Drops a reasoning model's recited "this is only a system-prompt setup" blocks from the prompt so they cannot seed the next turns |
 | [pi-mcp-hygiene](pi-mcp-hygiene/) | ![Experimental][experimental-badge] | Rewords the MCP adapter's "I'll respond to your prompts" UI notice in tool results, so an adapter status line does not read as a first-person voice in the model's context |
 | [pi-skill-reminder](pi-skill-reminder/) | ![Experimental][experimental-badge] | Names the skills a session already read after a compaction, so the next turn applies them instead of re-reading them |
+| [pi-commit-attribution](pi-commit-attribution/) | ![Experimental][experimental-badge] | Adds the `Assisted-by:` trailer to commits an agent makes, through a hook directory Pi owns, leaving every repository untouched |
 
 pi-symbol-index is demoted from daily driver rather than newly written. `symbol_index_build` can hang a session outright when Pi was launched outside the project it should scan, and the models driving it have not taken to the tools often enough to depend on them. Tracked in [#31](https://github.com/icedream/pi-extensions/issues/31).
 
