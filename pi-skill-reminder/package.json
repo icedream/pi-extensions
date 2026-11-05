@@ -14,7 +14,7 @@
 		"e2e": "PI_SKILL_REMINDER_E2E=1 node --test session.test.ts"
 	},
 	"devDependencies": {
-		"@earendil-works/pi-coding-agent": "^1.1.0",
+		"@earendil-works/pi-coding-agent": "^1.5.0",
 		"@types/node": "^26.1.1",
 		"typescript": "^6.0.3"
 	}
