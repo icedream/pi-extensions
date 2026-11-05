@@ -73,7 +73,7 @@ new_repo() { # new_repo <dir> [author-email]
 	mkdir -p "$1"
 	(
 		cd "$1"
-		git init -q .
+		git init -q -b main .
 		git config user.name "Author Person"
 		git config user.email "${2:-author@example.com}"
 		git config commit.gpgsign false
@@ -387,26 +387,32 @@ grep -q "default pre-commit ran" "$WORK/defaulthooks.log" 2>/dev/null && ok "and
 
 echo
 echo "signing"
-key=$(gpg --list-secret-keys --with-colons 2>/dev/null | awk -F: '/^sec/ { print $5; exit }')
-if [ -n "$key" ]; then
+# The key is generated for the fixture rather than looked for in a keyring: ssh-keygen is present
+# wherever git is, so this runs on a CI machine with no gpg agent and no passphrase.
+SIGNKEY="$WORK/signing"
+if ssh-keygen -q -t ed25519 -N "" -C author@example.com -f "$SIGNKEY" 2>/dev/null; then
+	printf 'author@example.com namespaces="git" %s\n' "$(cut -d' ' -f1,2 "$SIGNKEY.pub")" > "$WORK/signers"
 	new_repo "$WORK/signed"
 	(
 		cd "$WORK/signed"
-		git config user.signingkey "$key"
+		git config gpg.format ssh
+		git config user.signingkey "$SIGNKEY"
+		git config gpg.ssh.allowedSignersFile "$WORK/signers"
 		git config commit.gpgsign true
 		echo a >f.txt
 		git add f.txt
-		git commit -q -m "feat: signed commit" 2>/dev/null
+		git commit -q -m "feat: signed commit"
 	)
 	if [ -n "$(msg_of "$WORK/signed")" ]; then
 		has "$(msg_of "$WORK/signed")" "$CLOUD_LINE" && ok "a signed commit carries the trailer" || no "a signed commit carries the trailer" "$(msg_of "$WORK/signed")"
-		git verify-commit HEAD >/dev/null 2>&1 && ok "and the signature still verifies" || no "and the signature still verifies" "$(cd "$WORK/signed" && git verify-commit HEAD 2>&1)"
+		git -C "$WORK/signed" verify-commit HEAD >/dev/null 2>&1 && ok "and the signature still verifies" || no "and the signature still verifies" "$(git -C "$WORK/signed" verify-commit HEAD 2>&1)"
 	else
-		NOTE="signing skipped: the key could not sign non-interactively"
-		printf '  --   signing skipped (key needs a passphrase or agent)\n'
+		NOTE="signing skipped: the signed commit did not happen"
+		printf '  --   signing skipped (the signed commit failed)\n'
 	fi
 else
-	printf '  --   no signing key available, signing not exercised\n'
+	NOTE="signing not exercised: no ssh-keygen"
+	printf '  --   no ssh-keygen available, signing not exercised\n'
 fi
 
 # ---------------------------------------------------------------- cost
