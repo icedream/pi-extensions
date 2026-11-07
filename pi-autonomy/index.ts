@@ -13,7 +13,10 @@
  *   /autonomy now <goal>   work autonomously immediately (skip the check-in)
  *   /autonomy go           start now (after a check-in) or resume (after a pause)
  *   /autonomy stop         end the session (aborts the current run)
- *   /autonomy status       show the current state
+ *   /autonomy status       show the current state and the effective guard values
+ *
+ * The guard values come from autonomy.json: the agent dir, plus a project file in a trusted
+ * project. Read once at session start, so editing the file wants a /reload. See config.ts.
  *
  * State is per session in memory; a reload or session switch resets it to idle.
  */
@@ -30,54 +33,54 @@ import type {
 	TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import {
-	type AutonomyConfig,
 	type HaltReason,
 	type WorkingState,
-	DEFAULT_CONFIG,
-	DONE_MARKER,
 	READY_MARKER,
 	checkinMessage,
 	decideWorkingTurn,
 	endsWithMarker,
 	freshWorkingState,
+	haltReasons,
 	resumeMessage,
 	systemPromptSection,
 	toolCallSignature,
+	usageText,
 	workStartMessage,
 } from "./protocol.ts";
+import { describeConfig, resolveConfig, type ResolvedConfig } from "./config.ts";
 
-const CONFIG: AutonomyConfig = DEFAULT_CONFIG;
 const STATUS_KEY = "pi-autonomy";
 const SECTION_KEY = "autonomy";
 
 type Phase = "idle" | "checkin" | "working" | "paused";
 
-const HALT_REASONS: Record<HaltReason, string> = {
-	aborted: "interrupted",
-	error: "the model run ended in an error",
-	"max-continuations": `the continuation cap of ${CONFIG.maxContinuations} was reached without a completion marker`,
-	"max-stall-turns": `no tool activity on ${CONFIG.maxStallTurns} consecutive turns`,
-	"repeated-tool-calls": `the same tool call repeated ${CONFIG.repeatLimit} times`,
-	"max-time": `the ${CONFIG.maxMinutes}-minute time cap was reached`,
-};
-
-const USAGE = [
-	"Usage:",
-	"/autonomy <goal>          check-in with the user, then work on the goal autonomously",
-	"/autonomy now <goal>      work on the goal autonomously immediately (skip the check-in)",
-	"/autonomy go              start working now (after a check-in) or resume after a pause",
-	"/autonomy stop            end the autonomous session (aborts the current run)",
-	"/autonomy status          show the current state",
-	"",
-	`The session runs until the agent ends a message with ${DONE_MARKER} (goal complete) or a safety guard stops it (continuation cap, stall, repeated tool calls, ${CONFIG.maxMinutes} minutes).`,
-].join("\n");
-
 export default function (pi: ExtensionAPI) {
+	// Global layer at load, project layer added by session_start: the project file needs
+	// ctx.cwd and the trust decision, which do not exist yet here.
+	let resolved: ResolvedConfig = resolveConfig({});
+	let reasons: Record<HaltReason, string> = haltReasons(resolved.config);
+	const usage = () => usageText(resolved.config);
+
+	/**
+	 * Re-read the config files. Only called from session_start: `repeatLimit` is baked into
+	 * the RepeatDetector when a working phase starts while the other budgets are read per
+	 * turn, so reloading mid-session would run one session under mixed numbers. /reload
+	 * re-emits session_start, which is the documented way in.
+	 */
+	function refreshConfig(ctx: ExtensionContext) {
+		resolved = resolveConfig({ cwd: ctx.cwd, projectTrusted: ctx.isProjectTrusted() });
+		reasons = haltReasons(resolved.config);
+		for (const problem of resolved.problems) ctx.ui.notify(`autonomy: ignoring config — ${problem}`, "warning");
+		if (resolved.projectSkipped) {
+			ctx.ui.notify(`autonomy: found ${resolved.projectSkipped} but the project is not trusted, using the global config`, "info");
+		}
+	}
+
 	let phase: Phase = "idle";
 	let goal = "";
 	let pauseReason = "";
 	let startedAt = 0;
-	let work: WorkingState = freshWorkingState(CONFIG);
+	let work: WorkingState = freshWorkingState(resolved.config);
 	let pendingWorkStart = false;
 	let workingRunActive = false;
 
@@ -85,9 +88,10 @@ export default function (pi: ExtensionAPI) {
 
 	function status(ctx: ExtensionContext) {
 		const t = ctx.ui.theme;
+		const max = resolved.config.maxContinuations;
 		if (phase === "checkin") ctx.ui.setStatus(STATUS_KEY, t.fg("muted", `autonomy: check-in — ${truncate(goal, 44)}`));
 		else if (phase === "working")
-			ctx.ui.setStatus(STATUS_KEY, t.fg("warning", `autonomy: working (${work.continuations}/${CONFIG.maxContinuations}) — ${truncate(goal, 36)}`));
+			ctx.ui.setStatus(STATUS_KEY, t.fg("warning", `autonomy: working (${work.continuations}/${max}) — ${truncate(goal, 36)}`));
 		else if (phase === "paused") ctx.ui.setStatus(STATUS_KEY, t.fg("error", `autonomy: paused (${pauseReason})`));
 		else ctx.ui.setStatus(STATUS_KEY, undefined);
 	}
@@ -97,7 +101,7 @@ export default function (pi: ExtensionAPI) {
 		goal = "";
 		pauseReason = "";
 		startedAt = 0;
-		work = freshWorkingState(CONFIG);
+		work = freshWorkingState(resolved.config);
 		pendingWorkStart = false;
 		workingRunActive = false;
 	}
@@ -109,10 +113,10 @@ export default function (pi: ExtensionAPI) {
 		}
 		goal = goalText.trim();
 		if (!goal) {
-			ctx.ui.notify(USAGE, "warning");
+			ctx.ui.notify(usage(), "warning");
 			return;
 		}
-		work = freshWorkingState(CONFIG);
+		work = freshWorkingState(resolved.config);
 		pauseReason = "";
 		startedAt = Date.now();
 		phase = immediate ? "working" : "checkin";
@@ -121,7 +125,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function beginWorking() {
-		work = freshWorkingState(CONFIG);
+		work = freshWorkingState(resolved.config);
 		pauseReason = "";
 		startedAt = Date.now();
 		phase = "working";
@@ -169,16 +173,27 @@ export default function (pi: ExtensionAPI) {
 
 	function reportStatus(ctx: ExtensionContext) {
 		if (phase === "idle") {
-			ctx.ui.notify(USAGE, "info");
+			ctx.ui.notify(`${usage()}\n\n${describeConfig(resolved)}`, "info");
+			reportProblems(ctx);
 			return;
 		}
 		const parts = [`phase: ${phase}`, `goal: ${truncate(goal, 60)}`];
 		if (phase === "working") {
 			const minutes = Math.floor((Date.now() - startedAt) / 60_000);
-			parts.push(`forced continuations: ${work.continuations}/${CONFIG.maxContinuations}`, `turns: ${work.turns}`, `running: ${minutes} min`);
+			parts.push(
+				`forced continuations: ${work.continuations}/${resolved.config.maxContinuations}`,
+				`turns: ${work.turns}`,
+				`running: ${minutes}/${resolved.config.maxMinutes} min`,
+			);
 		}
 		if (phase === "paused") parts.push(`reason: ${pauseReason}`, "resume with /autonomy go");
-		ctx.ui.notify(`autonomy — ${parts.join(" · ")}`, "info");
+		ctx.ui.notify(`autonomy — ${parts.join(" · ")}\n${describeConfig(resolved)}`, "info");
+		reportProblems(ctx);
+	}
+
+	function reportProblems(ctx: ExtensionContext) {
+		for (const problem of resolved.problems) ctx.ui.notify(`autonomy: ignoring config — ${problem}`, "warning");
+		if (resolved.projectSkipped) ctx.ui.notify(`autonomy: project config skipped (untrusted project): ${resolved.projectSkipped}`, "info");
 	}
 
 	pi.registerCommand("autonomy", {
@@ -218,6 +233,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", (_event: SessionStartEvent, ctx: ExtensionContext) => {
+		refreshConfig(ctx);
 		resetSession();
 		status(ctx);
 	});
@@ -258,7 +274,7 @@ export default function (pi: ExtensionAPI) {
 
 		const decision = decideWorkingTurn(
 			work,
-			CONFIG,
+			resolved.config,
 			event.outcome,
 			toolCalls.length > 0 ? { kind: "tool", signatures: toolCalls.map((c) => toolCallSignature(c.name, c.arguments)) } : { kind: "text", text },
 			goal,
@@ -274,7 +290,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (decision.action === "halt") {
-			pauseReason = HALT_REASONS[decision.reason];
+			pauseReason = reasons[decision.reason];
 			phase = "paused";
 			pendingWorkStart = false;
 			status(ctx);

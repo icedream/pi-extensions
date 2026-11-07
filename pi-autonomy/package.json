@@ -9,7 +9,7 @@
 		]
 	},
 	"scripts": {
-		"test": "node --test protocol.test.ts index.test.ts",
+		"test": "node --test protocol.test.ts config.test.ts index.test.ts",
 		"typecheck": "tsc -p tsconfig.json"
 	},
 	"devDependencies": {

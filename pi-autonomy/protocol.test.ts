@@ -9,6 +9,7 @@ import test from "node:test";
 import {
 	DONE_MARKER,
 	type AutonomyConfig,
+	type HaltReason,
 	type WorkingState,
 	DEFAULT_CONFIG,
 	READY_MARKER,
@@ -16,12 +17,14 @@ import {
 	decideWorkingTurn,
 	endsWithMarker,
 	freshWorkingState,
+	haltReasons,
 	nudgeMessage,
 	RepeatDetector,
 	resumeMessage,
 	stableStringify,
 	systemPromptSection,
 	toolCallSignature,
+	usageText,
 	workStartMessage,
 } from "./protocol.ts";
 
@@ -122,7 +125,8 @@ test("decideWorkingTurn: text-only turns nudge up to the stall cap, then halt", 
 	assert.equal(first.action, "nudge");
 	assert.equal(state.continuations, 1);
 	assert.equal(state.stallTurns, 1);
-	assert.ok(first.action === "nudge" && first.text.includes("forced continuation 1 of 40"), first.text);
+	assert.ok(first.action === "nudge", `expected a nudge, got ${first.action}`);
+	assert.ok(first.text.includes("forced continuation 1 of 40"), first.text);
 
 	const second = decideWorkingTurn(state, cfg, "completed", text("more thinking"), goal, 0);
 	assert.equal(second.action, "nudge", "second consecutive text turn still nudged (cap is 2)");
@@ -170,4 +174,21 @@ test("the messages and system sections carry the right markers", () => {
 	assert.ok(!systemPromptSection("checkin", "g").includes(DONE_MARKER));
 	assert.ok(systemPromptSection("working", "g").includes(DONE_MARKER));
 	assert.ok(!systemPromptSection("working", "g").includes(READY_MARKER));
+});
+
+test("halt reasons and usage text name the configured values, not the defaults", () => {
+	const HALT_REASONS_EXPECTED: HaltReason[] = ["aborted", "error", "max-continuations", "max-stall-turns", "repeated-tool-calls", "max-time"];
+	const configured: AutonomyConfig = { maxContinuations: 5, maxStallTurns: 1, repeatLimit: 4, maxMinutes: 360 };
+	const reasons = haltReasons(configured);
+	assert.match(reasons["max-continuations"], /cap of 5/);
+	assert.match(reasons["max-stall-turns"], /2 consecutive turns/, "the halting turn is maxStallTurns + 1");
+	assert.match(reasons["repeated-tool-calls"], /repeated 4 times/);
+	assert.match(reasons["max-time"], /360-minute/);
+	assert.equal(reasons.aborted, "interrupted", "reasons that carry no budget stay fixed");
+	assert.deepEqual(Object.keys(reasons).sort(), [...HALT_REASONS_EXPECTED].sort(), "every HaltReason has text");
+
+	const usage = usageText(configured);
+	for (const value of ["5", "1", "4", "360"]) assert.ok(usage.includes(value), `usage mentions ${value}`);
+	assert.ok(usage.includes(DONE_MARKER));
+	assert.ok(!usage.includes(String(DEFAULT_CONFIG.maxContinuations)), "the default is not baked in");
 });

@@ -9,5 +9,5 @@
 		"noEmit": true,
 		"allowImportingTsExtensions": true
 	},
-	"include": ["index.ts", "protocol.ts", "protocol.test.ts", "index.test.ts"]
+	"include": ["index.ts", "protocol.ts", "config.ts", "protocol.test.ts", "config.test.ts", "index.test.ts"]
 }

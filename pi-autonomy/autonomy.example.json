@@ -1,0 +1,6 @@
+{
+	"maxContinuations": 40,
+	"maxStallTurns": 2,
+	"repeatLimit": 3,
+	"maxMinutes": 60
+}

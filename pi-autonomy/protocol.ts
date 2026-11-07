@@ -15,7 +15,10 @@ export const DONE_MARKER = "[autonomy:done]";
 export interface AutonomyConfig {
 	/** Forced continuations per working phase before a hard stop. */
 	maxContinuations: number;
-	/** Consecutive tool-free turns that get nudged before a hard stop (stall). */
+	/**
+	 * Tool-free turns that get nudged before a hard stop: the first `maxStallTurns`
+	 * text-only turns are nudged and the turn after them halts the run.
+	 */
 	maxStallTurns: number;
 	/** The same tool call repeated this many times in a row trips the loop guard. */
 	repeatLimit: number;
@@ -29,6 +32,13 @@ export const DEFAULT_CONFIG: AutonomyConfig = {
 	repeatLimit: 3,
 	maxMinutes: 60,
 };
+
+/**
+ * How far back {@link RepeatDetector} remembers tool calls. A run of identical calls can
+ * only be detected inside the window, so `repeatLimit` is capped at it — the config layer
+ * refuses a higher value instead of accepting a guard that can never trip.
+ */
+export const REPEAT_WINDOW = 6;
 
 /**
  * A marker only counts when it ends the message: everything after the last occurrence
@@ -89,9 +99,9 @@ export class RepeatDetector {
 	/** Record one tool call; true when the loop guard just tripped. */
 	add(signature: string): boolean {
 		this.recent.push(signature);
-		if (this.recent.length > 6) this.recent.shift();
+		if (this.recent.length > REPEAT_WINDOW) this.recent.shift();
 		const n = this.recent.length;
-		if (n >= this.limit && this.limit <= 6) {
+		if (n >= this.limit && this.limit <= REPEAT_WINDOW) {
 			const tail = this.recent.slice(n - this.limit);
 			if (tail.every((s) => s === tail[0])) return true;
 		}
@@ -99,7 +109,7 @@ export class RepeatDetector {
 			const [a, b, c, d] = this.recent;
 			if (a === c && b === d && a !== b) return true;
 		}
-		if (n >= 6) {
+		if (n >= REPEAT_WINDOW) {
 			const [a, b, c, d, e, f] = this.recent;
 			if (a === d && b === e && c === f && !(a === b && b === c)) return true;
 		}
@@ -224,5 +234,35 @@ export function systemPromptSection(phase: "checkin" | "working", goal: string):
 		"- Make reasonable decisions yourself. If you are genuinely blocked on a decision only the user can make, ask once with the ask_user_question tool; the session waits for the answer.",
 		"- Do not rework finished parts and do not start work that is not part of the goal.",
 		`- When and only when the goal is fully complete and verified, end your message with a short summary of what you did and how you verified it, followed by ${DONE_MARKER} as the final line. Do not emit the marker earlier, and do not keep working after it.`,
+	].join("\n");
+}
+
+/**
+ * Halt reasons as readable sentences. They name the configured budget, so a pause tells the
+ * user which guard fired and what number it was set to — the values come from the config file
+ * once there is one, so this cannot be a module constant.
+ */
+export function haltReasons(config: AutonomyConfig): Record<HaltReason, string> {
+	return {
+		aborted: "interrupted",
+		error: "the model run ended in an error",
+		"max-continuations": `the continuation cap of ${config.maxContinuations} was reached without a completion marker`,
+		"max-stall-turns": `no tool activity on ${config.maxStallTurns + 1} consecutive turns`,
+		"repeated-tool-calls": `the same tool call repeated ${config.repeatLimit} times`,
+		"max-time": `the ${config.maxMinutes}-minute time cap was reached`,
+	};
+}
+
+/** Command usage, with the guard that will end a run named by its configured value. */
+export function usageText(config: AutonomyConfig): string {
+	return [
+		"Usage:",
+		"/autonomy <goal>          check-in with the user, then work on the goal autonomously",
+		"/autonomy now <goal>      work on the goal autonomously immediately (skip the check-in)",
+		"/autonomy go              start working now (after a check-in) or resume after a pause",
+		"/autonomy stop            end the autonomous session (aborts the current run)",
+		"/autonomy status          show the current state and the effective guard values",
+		"",
+		`The session runs until the agent ends a message with ${DONE_MARKER} (goal complete) or a safety guard stops it (continuation cap ${config.maxContinuations}, stall after ${config.maxStallTurns} tool-free turns, ${config.repeatLimit} identical tool calls, ${config.maxMinutes} minutes).`,
 	].join("\n");
 }

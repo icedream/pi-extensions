@@ -6,6 +6,13 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+/** Points the config layer at a file that never exists, so the developer's own config is ignored. */
+const ABSENT_CONFIG = join(tmpdir(), "pi-autonomy-absent-config.json");
+process.env.PI_AUTONOMY_CONFIG = ABSENT_CONFIG;
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
@@ -39,6 +46,8 @@ async function stub(): Promise<Stub> {
 	let idle = true;
 
 	const ctx = {
+		cwd: process.cwd(),
+		isProjectTrusted: () => false,
 		ui: {
 			setStatus(_key: string, v?: string) {
 				statuses.push(v);
@@ -102,6 +111,25 @@ async function stub(): Promise<Stub> {
 	extend(pi as never);
 
 	return s;
+}
+
+/**
+ * Build a stub whose config comes from a throwaway file, and run the test body while the env
+ * var still points at it — `index.ts` re-reads the files at session_start, which happens in
+ * the body, so the var cannot be restored when this helper returns.
+ */
+async function withConfig(contents: string, body: (s: Stub) => Promise<void>): Promise<void> {
+	const dir = mkdtempSync(join(tmpdir(), "pi-autonomy-config-"));
+	const path = join(dir, "autonomy.json");
+	writeFileSync(path, contents);
+	process.env.PI_AUTONOMY_CONFIG = path;
+	try {
+		const s = await stub();
+		await s.emit("session_start");
+		await body(s);
+	} finally {
+		process.env.PI_AUTONOMY_CONFIG = ABSENT_CONFIG;
+	}
 }
 
 function textTurn(text: string): Record<string, unknown> {
@@ -238,4 +266,34 @@ test("a queued working start does not hijack the run that is in flight", async (
 	await s.emit("agent_start");
 	const turn = (await s.turnEnd(textTurn("Starting the migration…"))) as { continue?: boolean };
 	assert.equal(turn?.continue, true, "the session's own run is governed");
+});
+
+test("a configured maxStallTurns is what stops the run, not the built-in default", async () => {
+	// The file is wired through to behaviour, not merely parsed: with the cap at 1 the second
+	// tool-free turn halts, where the default of 2 would still have nudged.
+	await withConfig(JSON.stringify({ maxStallTurns: 1 }), async (s) => {
+		await s.command("now trim the log");
+		await s.emit("agent_start");
+
+		assert.equal((await s.turnEnd(textTurn("hmm")))?.continue, true, "first tool-free turn still nudges");
+		const second = await s.turnEnd(textTurn("hmm again"));
+		assert.equal(second?.continue, undefined, "the configured cap stops the second one");
+		assert.match(s.notices.at(-1) ?? "", /paused/);
+		assert.match(s.notices.at(-1) ?? "", /2 consecutive turns/, "the halt names the configured budget");
+	});
+});
+
+test("an invalid config file keeps the defaults and says so in /autonomy status", async () => {
+	await withConfig(JSON.stringify({ maxMinutes: 0 }), async (s) => {
+		assert.ok(
+			s.notices.some((n) => n.includes("ignoring config") && n.includes("maxMinutes")),
+			`session_start warns about the rejected key: ${JSON.stringify(s.notices)}`,
+		);
+
+		const before = s.notices.length;
+		await s.command("status");
+		const reported = s.notices.slice(before).join("\n");
+		assert.match(reported, /ignoring config/, "status repeats the problem so it can be read back");
+		assert.match(reported, /maxMinutes 60/, "and shows the default that is in force");
+	});
 });
