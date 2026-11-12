@@ -1,0 +1,1007 @@
+/**
+ * pi-memory — Persistent memory extension for pi.
+ *
+ * Learns corrections, preferences, and patterns from sessions.
+ * Injects relevant memory into future conversations.
+ *
+ * Lifecycle:
+ * - session_start: open store, inject memory as a one-shot custom message
+ * - (memory context is no longer injected per-turn — see v1.2.0 changelog)
+ * - agent_end: queue messages for consolidation
+ * - session_shutdown: consolidate and close store
+ *
+ * Tools:
+ * - memory_search: search semantic memory
+ * - memory_remember: manually add a memory
+ * - memory_forget: delete a memory
+ * - memory_lessons: list learned corrections
+ * - memory_stats: show memory statistics
+ */
+import type { ExtensionAPI, AgentToolResult, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { Type, type TSchema } from "typebox";
+import { join, resolve } from "node:path";
+import { homedir } from "node:os";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { SqliteStore, type MemoryStore, type SemanticEntry } from "./store.js";
+import { PostgresStore, parseDsn } from "./pg-store.js";
+import { buildContextBlock, projectSlug, type InjectorConfig } from "./injector.js";
+import {
+  createEmbedder,
+  diagnoseEmbedderError,
+  type Embedder,
+  type EmbedderDiagnosis,
+} from "./embedder.js";
+import { reciprocalRankFusion } from "./hybrid.js";
+
+// Re-export internals so consumers (e.g. pi-dashboard's system-prompt route)
+// can build their own context blocks without reaching into ./dist/store.js.
+// The bundled `dist/index.js` inlines these, so prior `req('./dist/store.js')`
+// callers were always broken.
+export type { MemoryStore } from "./store.js";
+export { buildContextBlock, projectSlug, type InjectorConfig } from "./injector.js";
+
+type ToolResult = AgentToolResult<unknown>;
+type MemorySearchParams = { query: string; limit?: number };
+type MemoryRememberParams = {
+  type: string;
+  key?: string;
+  value?: string;
+  rule?: string;
+  category?: string;
+  negative?: boolean;
+};
+type MemoryForgetParams = { type: string; key?: string; id?: string };
+type MemoryLessonsParams = { category?: string; limit?: number };
+function ok(text: string): ToolResult { return { content: [{ type: "text", text }], details: {} }; }
+
+/**
+ * Strip one layer of surrounding quotes from a string value.
+ * Some local models (e.g. Qwen on certain runners) double-JSON-encode tool
+ * arguments, emitting `"\"fact\""` instead of `"fact"`. We defensively
+ * unwrap so these calls don't fail schema validation / equality checks.
+ */
+function stripQuotes<T>(v: T): T {
+  if (typeof v !== "string") return v;
+  const s = v.trim();
+  if (s.length >= 2) {
+    const first = s[0];
+    const last = s[s.length - 1];
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      try {
+        // Prefer JSON.parse for double-quoted (handles escapes)
+        if (first === '"') return JSON.parse(s) as unknown as T;
+      } catch { /* fall through */ }
+      return s.slice(1, -1) as unknown as T;
+    }
+  }
+  return v;
+}
+import {
+  buildConsolidationPrompt,
+  parseConsolidationResponse,
+  applyExtracted,
+  type ConsolidationInput,
+} from "./consolidator.js";
+
+/** Package root: dist/ and src/ both sit one level below it. */
+const PACKAGE_ROOT = (() => {
+  try {
+    return resolve(fileURLToPath(new URL("..", import.meta.url)));
+  } catch {
+    return "the pi-memory package directory";
+  }
+})();
+
+const DEFAULT_MEMORY_DIR = join(homedir(), ".pi", "memory");
+const DEFAULT_DB_PATH = join(DEFAULT_MEMORY_DIR, "memory.db");
+const GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
+
+/**
+ * Default model used for session-end consolidation when no user override is
+ * present in settings.json.  Preserves the historical behavior for existing
+ * users — overridable via `memory.consolidationModel` (global or project).
+ */
+export const DEFAULT_CONSOLIDATION_MODEL = "claude-sonnet-4-20250514";
+
+/**
+ * Resolve the memory DB path for a given working directory.
+ *
+ * Priority (highest first):
+ *   1. "pi-memory".localPath from {cwd}/.pi/settings.json → {localPath}/memory.db
+ *   2. "pi-total-recall".localPath cascade → {localPath}/memory/memory.db
+ *   3. Global default: ~/.pi/memory/memory.db  (preserves existing behavior)
+ */
+/**
+ * Emit a warning when a settings block contains keys outside a known
+ * schema. Catches silent typos like `LocalPath` vs `localPath` — an unknown
+ * key is usually a misspelled known key that got silently ignored, leaving
+ * the user wondering why their config didn't take effect.
+ *
+ * Logs to stderr (console.error) since this runs inside module-level code
+ * at session_start; ctx.ui isn't reliably available yet.
+ */
+function warnUnknownKeys(block: unknown, blockName: string, knownKeys: readonly string[]): void {
+  if (!block || typeof block !== "object") return;
+  const unknown = Object.keys(block as Record<string, unknown>).filter((k) => !knownKeys.includes(k));
+  if (unknown.length === 0) return;
+  console.error(
+    `pi-memory: ignoring unknown key(s) in settings.json "${blockName}" block: ${unknown.join(", ")} (expected: ${knownKeys.join(", ")})`,
+  );
+}
+
+const PI_MEMORY_KNOWN_KEYS = ["localPath", "dsn", "lessonInjection", "consolidationModel", "perTurnInjection", "injectionMode", "embedding"] as const;
+const PI_TOTAL_RECALL_KNOWN_KEYS = ["localPath"] as const;
+
+/**
+ * Pick a Postgres DSN if one is configured. Precedence: PI_MEMORY_DSN, then global settings,
+ * then project settings. Undefined means use the local file, which is the historical behaviour.
+ * Once a DSN is set there is deliberately no fallback to the file: a session that quietly
+ * resumed writing to a stale local copy would fork the store.
+ */
+export function resolveDsn(cwd: string): string | undefined {
+  const fromEnv = process.env.PI_MEMORY_DSN?.trim();
+  if (fromEnv) return fromEnv;
+  const read = (path: string): string | undefined => {
+    try {
+      const s = JSON.parse(readFileSync(path, "utf8"));
+      const d = s?.["pi-memory"]?.dsn ?? s?.memory?.dsn;
+      return typeof d === "string" && d.trim() ? d.trim() : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  return read(GLOBAL_SETTINGS_PATH) ?? read(join(cwd, ".pi", "settings.json"));
+}
+
+export function resolveDbPath(cwd: string): string {
+  // Try reading the local project settings for an explicit localPath override
+  try {
+    const localSettingsPath = join(cwd, ".pi", "settings.json");
+    const raw = readFileSync(localSettingsPath, "utf-8");
+    const settings = JSON.parse(raw);
+
+    // Package-specific override wins.
+    const piMemory = settings?.["pi-memory"];
+    warnUnknownKeys(piMemory, "pi-memory", PI_MEMORY_KNOWN_KEYS);
+    if (piMemory && typeof piMemory === "object" && typeof piMemory.localPath === "string" && piMemory.localPath) {
+      // resolve() handles both absolute and relative localPath values:
+      // absolute: resolve(cwd, '/abs/path', 'memory.db') → '/abs/path/memory.db'
+      // relative: resolve(cwd, '.pi/local', 'memory.db') → '{cwd}/.pi/local/memory.db'
+      return resolve(cwd, piMemory.localPath, "memory.db");
+    }
+
+    // pi-total-recall cascade.
+    const piTotalRecall = settings?.["pi-total-recall"];
+    warnUnknownKeys(piTotalRecall, "pi-total-recall", PI_TOTAL_RECALL_KNOWN_KEYS);
+    if (piTotalRecall && typeof piTotalRecall === "object" && typeof piTotalRecall.localPath === "string" && piTotalRecall.localPath) {
+      return resolve(cwd, piTotalRecall.localPath, "memory", "memory.db");
+    }
+  } catch {
+    // No local settings or parse error — use global default
+  }
+  // Default: global shared memory (preserves existing behavior)
+  return DEFAULT_DB_PATH;
+}
+
+/**
+ * Apply a single settings-block (the object under `memory` / `pi-memory`) to
+ * `config`.  Invalid fields are ignored so a malformed value for one key
+ * cannot clobber a valid value already set by a higher-priority source.
+ */
+function mergeMemorySettings(config: InjectorConfig, memorySettings: unknown): void {
+  if (!memorySettings || typeof memorySettings !== "object") return;
+  const m = memorySettings as Record<string, unknown>;
+
+  if (m.lessonInjection === "all" || m.lessonInjection === "selective") {
+    config.lessonInjection = m.lessonInjection;
+  }
+  if (typeof m.perTurnInjection === "boolean") {
+    config.perTurnInjection = m.perTurnInjection;
+  }
+  if (m.injectionMode === "system-prompt" || m.injectionMode === "context-hook") {
+    config.injectionMode = m.injectionMode;
+  }
+  if (typeof m.consolidationModel === "string" && m.consolidationModel.trim()) {
+    config.consolidationModel = m.consolidationModel.trim();
+  }
+  config.embedding = parseEmbeddingSettings(m.embedding) ?? config.embedding;
+}
+
+const EMBEDDER_TYPES = ["openai", "bedrock", "ollama", "mistral", "openai-compatible"] as const;
+const EMBEDDING_KNOWN_KEYS = [
+  "type", "apiKey", "model", "baseUrl", "sendDimensions", "profile", "region", "url", "dimensions",
+] as const;
+
+/**
+ * Validate an `embedding` settings block. Returns undefined -- leaving search
+ * on FTS5 -- rather than throwing, so a malformed block degrades instead of
+ * breaking session startup. An unusable `type` is the only hard requirement.
+ */
+function parseEmbeddingSettings(raw: unknown): InjectorConfig["embedding"] | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const e = raw as Record<string, unknown>;
+
+  warnUnknownKeys(e, "pi-memory.embedding", EMBEDDING_KNOWN_KEYS);
+
+  const type = typeof e.type === "string" ? e.type.trim() : "";
+  if (!(EMBEDDER_TYPES as readonly string[]).includes(type)) {
+    console.error(
+      `pi-memory: ignoring embedding block, "type" must be one of ${EMBEDDER_TYPES.join(", ")} (got ${JSON.stringify(e.type)})`,
+    );
+    return undefined;
+  }
+
+  const out: NonNullable<InjectorConfig["embedding"]> = { type: type as typeof EMBEDDER_TYPES[number] };
+  for (const k of ["apiKey", "model", "baseUrl", "profile", "region", "url"] as const) {
+    const v = e[k];
+    if (typeof v === "string" && v.trim()) out[k] = v.trim();
+  }
+  if (typeof e.dimensions === "number" && Number.isFinite(e.dimensions) && e.dimensions > 0) {
+    out.dimensions = e.dimensions;
+  }
+  if (typeof e.sendDimensions === "boolean") out.sendDimensions = e.sendDimensions;
+  return out;
+}
+
+/**
+ * Read pi-memory config from settings.json.
+ * Looks for a "memory" (or project-local "pi-memory") key with
+ * extension-specific settings.
+ *
+ * Example settings.json:
+ * {
+ *   "memory": {
+ *     "perTurnInjection": true,
+ *     "lessonInjection": "selective",
+ *     "consolidationModel": "openai/gpt-4.1-mini"
+ *   }
+ * }
+ *
+ * Exported for tests.
+ */
+export function readSettingsConfig(cwd?: string): InjectorConfig {
+  const config: InjectorConfig = {};
+
+  // Read global settings
+  try {
+    const raw = readFileSync(GLOBAL_SETTINGS_PATH, "utf-8");
+    const settings = JSON.parse(raw);
+    mergeMemorySettings(config, settings?.memory);
+  } catch {
+    // no global settings
+  }
+
+  // Override with local project settings if available
+  if (cwd) {
+    try {
+      const raw = readFileSync(join(cwd, ".pi", "settings.json"), "utf-8");
+      const settings = JSON.parse(raw);
+      // Accept either `memory` (preferred) or `pi-memory` (package-scoped).
+      mergeMemorySettings(config, settings?.memory ?? settings?.["pi-memory"]);
+    } catch {
+      // no local settings
+    }
+  }
+
+  return config;
+}
+
+export default function (pi: ExtensionAPI) {
+  let store: MemoryStore | null = null;
+  let pendingUserMessages: string[] = [];
+  let pendingAssistantMessages: string[] = [];
+  let sessionCwd: string = "";
+  let sessionId: string | undefined;
+  let cachedCtx: any = null;
+  let resolvedDbPath: string = DEFAULT_DB_PATH;
+  let backend = "sqlite";
+  let injectorConfig: InjectorConfig = readSettingsConfig();
+
+  // Embedder is built lazily on first use and cached per session. `false` means
+  // "tried and failed" so a broken provider is not retried on every query.
+  let embedder: Embedder | null | false = null;
+
+  // Most recent embedding failure (shown by memory_stats), and the reasons the
+  // user has already been told about this session.
+  let embedFailure: EmbedderDiagnosis | null = null;
+  let notifiedReasons = new Set<string>();
+
+  /**
+   * Record an embedding failure and tell the user once per distinct cause.
+   * Search still falls back to FTS5; the point is that semantic search is
+   * never switched off silently (#30).
+   */
+  function reportEmbedFailure(err: unknown, ctx: any = cachedCtx): void {
+    const cfg = injectorConfig.embedding;
+    if (!cfg) return;
+    embedFailure = diagnoseEmbedderError(err, cfg, PACKAGE_ROOT);
+    if (notifiedReasons.has(embedFailure.reason)) return;
+    notifiedReasons.add(embedFailure.reason);
+
+    const text =
+      `pi-memory: semantic search unavailable: ${embedFailure.reason}. ` +
+      `${embedFailure.hint} Keyword search still works.`;
+    try {
+      if (ctx?.hasUI) {
+        ctx.ui.notify(text, "warning");
+        return;
+      }
+    } catch {
+      /* stale ctx: fall through to stderr */
+    }
+    console.error(text);
+  }
+
+  function getEmbedder(): Embedder | null {
+    if (embedder !== null) return embedder || null;
+    const cfg = injectorConfig.embedding;
+    if (!cfg) {
+      embedder = false;
+      return null;
+    }
+    try {
+      embedder = createEmbedder(cfg);
+      return embedder;
+    } catch (err) {
+      reportEmbedFailure(err);
+      embedder = false;
+      return null;
+    }
+  }
+
+  /**
+   * Embed one entry and persist the vector. Fire-and-forget: a failure leaves
+   * the entry lexically searchable, which is the pre-embedding behaviour.
+   *
+   * The key's leading namespace segment is dropped from the embedded text --
+   * "pref.editor" contributes "editor", not "pref" -- because the namespace is
+   * a storage convention and embedding it clusters unrelated facts that merely
+   * share a prefix.
+   */
+  function embedEntry(key: string, value: string, ctx?: unknown): void {
+    const emb = getEmbedder();
+    if (!emb || !store) return;
+    const text = `${key.split(".").slice(1).join(" ")} ${value}`.trim();
+    emb.embed(text)
+      .then((vec) => {
+        embedFailure = null;
+        if (vec && vec.length > 0 && store) store.setEmbedding(key.toLowerCase(), Float32Array.from(vec));
+      })
+      // Lexical search still covers this entry; backfill retries next session.
+      .catch((err) => reportEmbedFailure(err, ctx));
+  }
+
+  /** Titan v2 default; keep in sync with DEFAULTS in ./embedder.ts. */
+  const DEFAULT_EMBED_DIMENSIONS = 512;
+
+  /**
+   * Embed entries that have no usable vector yet, in the background.
+   *
+   * Runs after session_start rather than at write time because the main writer
+   * is session-end consolidation, and a fire-and-forget promise started during
+   * shutdown is killed before it resolves. Deferring to the next session's
+   * start is the only place the work reliably completes.
+   *
+   * Batched and capped so a large store does not issue hundreds of provider
+   * calls at once; the remainder is picked up on subsequent starts.
+   */
+  async function backfillEmbeddings(ctx?: unknown, max: number = 64, batch: number = 16): Promise<void> {
+    const emb = getEmbedder();
+    if (!emb || !store) return;
+
+    const dims = injectorConfig.embedding?.dimensions ?? DEFAULT_EMBED_DIMENSIONS;
+    const todo = await store.entriesNeedingEmbedding(dims, max);
+    if (todo.length === 0) return;
+
+    for (let i = 0; i < todo.length; i += batch) {
+      const slice = todo.slice(i, i + batch);
+      const texts = slice.map((e) => `${e.key.split(".").slice(1).join(" ")} ${e.value}`.trim());
+      try {
+        const vectors = await emb.embedBatch(texts);
+        embedFailure = null;
+        vectors.forEach((vec, j) => {
+          const entry = slice[j];
+          if (vec && vec.length > 0 && entry && store) {
+            store.setEmbedding(entry.key.toLowerCase(), Float32Array.from(vec));
+          }
+        });
+      } catch (err) {
+        reportEmbedFailure(err, ctx);
+        return; // provider is unhappy; try again next session
+      }
+    }
+  }
+
+  /**
+   * Search memory, fusing FTS5 lexical hits with cosine-ranked semantic hits.
+   *
+   * Over-fetches each path (2x limit) before fusing, because an entry ranked
+   * just outside the lexical top-N can still win overall once the semantic
+   * path agrees with it -- truncating to `limit` first would discard exactly
+   * the agreements RRF exists to reward.
+   */
+  async function searchMemory(query: string, limit: number, ctx?: unknown): Promise<SemanticEntry[]> {
+    if (!store) return [];
+    const pool = Math.max(limit * 2, 20);
+    const lexical = await store.searchSemantic(query, pool);
+
+    const emb = getEmbedder();
+    if (!emb) return lexical.slice(0, limit);
+
+    let semantic: SemanticEntry[] = [];
+    try {
+      const vec = await emb.embed(query);
+      embedFailure = null;
+      if (vec && vec.length > 0) {
+        semantic = await store.searchSemanticByVector(Float32Array.from(vec), pool);
+      }
+    } catch (err) {
+      reportEmbedFailure(err, ctx);
+      return lexical.slice(0, limit); // lexical results are still correct
+    }
+    if (semantic.length === 0) return lexical.slice(0, limit);
+
+    return reciprocalRankFusion(lexical, semantic, (e) => e.key)
+      .slice(0, limit)
+      .map((r) => r.item);
+  }
+
+  // Per-turn memory block computed by before_agent_start and spliced into the
+  // LLM request by the "context" hook (context-hook injection mode). Ephemeral:
+  // never persisted to session history or the consolidation queue.
+  let pendingContextBlock: string | null = null;
+
+  // ─── Lifecycle ───────────────────────────────────────────────────
+
+  pi.on("session_start", async (_event, ctx) => {
+    try {
+      sessionCwd = ctx.cwd;
+      cachedCtx = ctx;
+      sessionId = (ctx as any).sessionId ?? (ctx as any).session?.id;
+
+      // Resolve per-agent DB path from local settings or cwd
+      resolvedDbPath = resolveDbPath(sessionCwd);
+      injectorConfig = readSettingsConfig(sessionCwd);
+
+      const dsn = resolveDsn(sessionCwd);
+      if (dsn) {
+        const host = new URL(dsn).host;
+        try {
+          store = await PostgresStore.connect(parseDsn(dsn));
+          backend = `postgres ${host}`;
+        } catch (err) {
+          // Fail closed on purpose, see resolveDsn.
+          store = null;
+          backend = `postgres ${host} UNREACHABLE`;
+          const msg = `pi-memory: Postgres store at ${host} is unreachable, and no local file was `
+            + `used as a fallback. ${(err as Error).message}`;
+          console.error(msg);
+          try { ctx.ui?.notify?.(msg, "error"); } catch { /* ui may not be ready */ }
+        }
+      } else {
+        store = new SqliteStore(resolvedDbPath);
+        backend = `sqlite ${resolvedDbPath}`;
+      }
+
+      // Embedder is per-session; a new session may have different settings.
+      embedder = null;
+      embedFailure = null;
+      notifiedReasons = new Set();
+      // Deliberately not awaited: startup must not block on a provider call.
+      void backfillEmbeddings(ctx);
+
+      // Seed pending messages from existing session history so that
+      // /memory-consolidate works even when resuming a session (the
+      // historical messages never fire agent_end).  See #5.
+      pendingUserMessages = [];
+      pendingAssistantMessages = [];
+      try {
+        const branch = ctx.sessionManager.getBranch();
+        for (const entry of branch) {
+          if (entry.type !== "message") continue;
+          const msg = (entry as any).message;
+          if (!msg) continue;
+          if (msg.role === "user") {
+            const text = extractText(msg.content);
+            if (text) pendingUserMessages.push(text);
+          } else if (msg.role === "assistant") {
+            const text = extractText(msg.content);
+            if (text) pendingAssistantMessages.push(text);
+          }
+        }
+      } catch {
+        // Session may not have entries yet (brand-new session)
+      }
+
+      const stats = store ? await store.stats() : null;
+      if (stats && stats.semantic + stats.lessons > 0) {
+        ctx.ui.setStatus("pi-memory", `Memory: ${stats.semantic} facts, ${stats.lessons} lessons`);
+        // The captured ctx may be stale by the time this fires (resume,
+        // /new, /fork, /reload). Stale-ctx access throws synchronously;
+        // swallow it — by then the new session has set its own status.
+        setTimeout(() => {
+          try { ctx.ui.setStatus("pi-memory", ""); } catch { /* ctx stale: harmless */ }
+        }, 5000);
+      }
+
+      // Inject stored memory as a one-shot custom message BEFORE any user
+      // message arrives. Only used when `perTurnInjection: false` is explicitly
+      // configured (session_start mode, opt-out from adaptive injection).
+      //
+      // Historical note: v1.0.x mutated event.systemPrompt in before_agent_start.
+      // That broke provider prefix caches on every turn boundary (any drift in
+      // the system block re-writes the conversation suffix at cacheWrite rates).
+      //
+      // v1.1.x returned { message } from before_agent_start. That was worse: the
+      // custom message landed AFTER the user's question in history, so the model
+      // responded to the memory block instead of the user.
+      //
+      // v1.2.0 injects once at session_start using fallback mode (all facts +
+      // lessons, 8KB cap). Correct ordering, stable cache, simpler model.
+      //
+      // v1.3.x adds `perTurnInjection: true` as an opt-in to restore v1.0.x
+      // per-turn selective behavior.
+      //
+      // v1.4.0 flips the default: per-turn semantic injection via systemPrompt
+      // mutation in before_agent_start.
+      //
+      // v1.5.0 introduces injectionMode: "context-hook" as the new default.
+      // Memory is injected as an ephemeral message via the context hook instead
+      // of mutating systemPrompt. System prompt is now permanently stable,
+      // guaranteeing cache hits on the system prompt prefix regardless of topic.
+      // The session_start fallback dump is opt-in via `perTurnInjection: false`.
+      const activeStore = store;
+      if (activeStore && injectorConfig.perTurnInjection === false) {
+        try {
+          const alreadyInjected = ctx.sessionManager
+            .getEntries()
+            .some(
+              (e: SessionEntry) =>
+                e.type === "custom_message" && e.customType === "pi-memory-context",
+            );
+          if (!alreadyInjected) {
+            const { text, stats: injStats } = await buildContextBlock(
+              activeStore,
+              sessionCwd,
+              undefined, // no prompt → fallback: dump all relevant memory
+              injectorConfig,
+            );
+            if (text) {
+              pi.sendMessage({
+                customType: "pi-memory-context",
+                content: text,
+                display: false,
+                details: injStats,
+              });
+            }
+          }
+        } catch {
+          // Injection is nice-to-have; never break startup over it.
+        }
+      }
+    } catch (err: any) {
+      ctx.ui.notify(`pi-memory: failed to open store: ${err.message}`, "warning");
+    }
+  });
+
+  // ----------------------------------------------------------------
+  // Per-turn semantic injection (default). Runs on every user turn, searching
+  // memory relevant to the current prompt. Two injection strategies, selected
+  // by `injectionMode`:
+  //
+  //   "context-hook" (default) — stash the block here; the pi.on("context")
+  //     handler below splices it as an ephemeral message just before the
+  //     latest user message. The system prompt is NEVER modified, so its
+  //     prefix caches unconditionally; a memory change only misses the cache
+  //     from the injection point forward, not from the system-prompt root.
+  //
+  //   "system-prompt" (legacy v1.4.0) — append the block to event.systemPrompt.
+  //     Cache-stable only while the retrieved memory is unchanged; any change
+  //     (e.g. a topic shift retrieving different entries) invalidates the
+  //     prefix at the system-prompt root and rewrites the entire suffix at
+  //     cacheWrite rates.
+  //
+  // Correctness holds either way: systemPrompt is a separate field from the
+  // messages list, and the ephemeral recall message is inserted BEFORE the
+  // user's message, so the user's question remains the final user-role turn.
+  // ----------------------------------------------------------------
+  pi.on("before_agent_start", async (event, ctx) => {
+    if (!store) return;
+    if (injectorConfig.perTurnInjection === false) return;
+
+    const { text } = await buildContextBlock(store, ctx.cwd, event.prompt, injectorConfig);
+    const mode = injectorConfig.injectionMode ?? "context-hook";
+
+    if (mode === "system-prompt") {
+      pendingContextBlock = null;
+      if (!text) return;
+      return { systemPrompt: `${event.systemPrompt}\n\n${text}` };
+    }
+
+    // context-hook: never touch the system prompt; hand off to the context hook.
+    pendingContextBlock = text || null;
+    return;
+  });
+
+  // context-hook injection. Fires on every LLM call within a turn; splices the
+  // cached memory block as an ephemeral user message immediately BEFORE the
+  // latest user message — on every call, including tool-call continuations.
+  // Keeping the block at a stable position (just before the user turn) means
+  // the persisted history never contains it, so the prefix caches and each
+  // continuation grows append-only. The injected message is not written to
+  // agent.state.messages, session history, or the consolidation queue.
+  pi.on("context", async (event, _ctx) => {
+    if (!store) return;
+    if (injectorConfig.perTurnInjection === false) return;
+    if ((injectorConfig.injectionMode ?? "context-hook") !== "context-hook") return;
+    if (!pendingContextBlock) return;
+
+    const msgs = event.messages;
+    if (!msgs || msgs.length === 0) return;
+
+    // Insert before the latest user message (not merely the last message):
+    // on continuations the last message is a tool result, but the user turn
+    // is still where the memory belongs.
+    let idx = -1;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if ((msgs[i] as any).role === "user") { idx = i; break; }
+    }
+    if (idx === -1) return;
+
+    const recallMessage = {
+      role: "user",
+      content: pendingContextBlock,
+      timestamp: Date.now(),
+    } as any;
+    return { messages: [...msgs.slice(0, idx), recallMessage, ...msgs.slice(idx)] };
+  });
+
+
+  pi.on("agent_end", async (event, _ctx) => {
+    // Collect messages for consolidation at shutdown
+    for (const msg of event.messages) {
+      if (msg.role === "user" && "content" in msg) {
+        const text = extractText(msg.content);
+        if (text) {
+          pendingUserMessages.push(text);
+          if (pendingUserMessages.length > 60) pendingUserMessages.shift();
+        }
+      } else if (msg.role === "assistant" && "content" in msg) {
+        const text = extractText(msg.content);
+        if (text) {
+          pendingAssistantMessages.push(text);
+          if (pendingAssistantMessages.length > 60) pendingAssistantMessages.shift();
+        }
+      }
+    }
+  });
+
+  // Consolidate memory when switching sessions (/new, /resume)
+  pi.on("session_before_switch", async (_event, ctx) => {
+    if (!store) return;
+
+    if (pendingUserMessages.length >= 3) {
+      ctx.ui.setStatus("pi-memory", "🧠 Consolidating memory...");
+      try {
+        await consolidateSession();
+      } catch {
+        // Best-effort
+      } finally {
+        // Always clear — even if consolidateSession threw synchronously or
+        // ctx went stale. Stuck indicator otherwise pins for the rest of
+        // the session. See samfoy/pi-total-recall#5.
+        try { ctx.ui.setStatus("pi-memory", ""); } catch { /* ctx stale: harmless */ }
+      }
+    }
+
+    // Reset for the next session
+    pendingUserMessages = [];
+    pendingAssistantMessages = [];
+  });
+
+  pi.on("session_shutdown", async () => {
+    if (!store) return;
+
+    try {
+      // Immediate visual feedback — user sees this as soon as C-c C-c fires
+      if (cachedCtx && pendingUserMessages.length >= 3) {
+        cachedCtx.ui.setStatus("pi-memory", "🧠 Consolidating memory...");
+      }
+
+      // Consolidate if we have enough conversation
+      if (pendingUserMessages.length >= 3) {
+        try {
+          await consolidateSession();
+        } catch {
+          // Best-effort — don't crash on shutdown
+        }
+      }
+    } finally {
+      if (cachedCtx) {
+        try { cachedCtx.ui.setStatus("pi-memory", ""); } catch { /* ctx stale: harmless */ }
+      }
+      store.close();
+      store = null;
+    }
+  });
+
+  // ─── Consolidation ──────────────────────────────────────────────
+
+  async function consolidateSession(): Promise<void> {
+    if (!store) return;
+
+    const input: ConsolidationInput = {
+      userMessages: pendingUserMessages,
+      assistantMessages: pendingAssistantMessages,
+      cwd: sessionCwd,
+      sessionId,
+    };
+
+    const currentFacts = (await store.listSemantic(undefined, 200)).map(f => ({ key: f.key, value: f.value }));
+    const currentLessons = (await store.listLessons(undefined, 100)).map(l => ({ rule: l.rule, category: l.category }));
+    const prompt = buildConsolidationPrompt(input, currentFacts, currentLessons);
+
+    // Use pi's exec to call the LLM via a lightweight pi session.
+    // Use a fast model to avoid blocking shutdown for too long.
+    //
+    // Defence in depth: pi.exec has a 45s timeout, but we also wrap the
+    // whole call in a hard 60s backstop. If pi.exec's timeout ever fails
+    // to kill the child (e.g. stuck in syscall), the Promise.race below
+    // still rejects and lets the caller clear its status indicator.
+    const EXEC_TIMEOUT_MS = 45_000;
+    const HARD_TIMEOUT_MS = 60_000;
+    let backstopHandle: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const execPromise = pi.exec("pi", [
+        "-p", prompt,
+        "--print",
+        "--no-extensions",
+        "--no-tools",
+        "--no-session",
+        "--model", injectorConfig.consolidationModel ?? DEFAULT_CONSOLIDATION_MODEL,
+      ], {
+        timeout: EXEC_TIMEOUT_MS,
+        cwd: sessionCwd,
+      });
+
+      const result = await Promise.race([
+        execPromise,
+        new Promise<never>((_, reject) => {
+          backstopHandle = setTimeout(
+            () => reject(new Error("consolidation backstop timeout")),
+            HARD_TIMEOUT_MS,
+          );
+        }),
+      ]);
+
+      if (result.code === 0 && result.stdout) {
+        const extracted = parseConsolidationResponse(result.stdout);
+        const slug = sessionCwd ? projectSlug(sessionCwd) : undefined;
+        const applied = await applyExtracted(store!, extracted, `session:${sessionId ?? "unknown"}`, slug || undefined);
+        if (applied.semantic + applied.lessons > 0) {
+          // Log but don't notify — we're shutting down
+          console.error(`pi-memory: consolidated ${applied.semantic} facts, ${applied.lessons} lessons`);
+        }
+      }
+    } catch {
+      // Timeout or exec failure — skip consolidation this session
+    } finally {
+      if (backstopHandle) clearTimeout(backstopHandle);
+    }
+  }
+
+  // ─── Tools ──────────────────────────────────────────────────────
+
+  pi.registerTool({
+    name: "memory_search",
+    label: "Memory Search",
+    description: "Search persistent memory for facts, preferences, and project patterns the user has established across sessions.",
+    parameters: Type.Object({
+      query: Type.String({ description: "Search query" }),
+      limit: Type.Optional(Type.Number({ description: "Max results (default 10)" })),
+    }) as any,
+    async execute(_id, params, _signal, _update, ctx) {
+      if (!store) return ok("Memory store not initialized");
+
+      const searchParams = params as MemorySearchParams;
+      const results = await searchMemory(searchParams.query, searchParams.limit ?? 10, ctx);
+      if (results.length === 0) {
+        return ok("No matching memories found.");
+      }
+
+      const text = results.map(r =>
+        `${r.key}: ${r.value} (confidence: ${r.confidence}, source: ${r.source})`
+      ).join("\n");
+
+      return ok(text);
+    },
+  });
+
+  pi.registerTool({
+    name: "memory_remember",
+    label: "Memory Remember",
+    description: "Store a fact, preference, or lesson in persistent memory. Use dotted keys like pref.editor, project.rosie.lang, tool.sed.usage. For corrections, use type='lesson'.",
+    parameters: Type.Object({
+      type: Type.String({ description: "'fact' for key-value, 'lesson' for a correction" }),
+      key: Type.Optional(Type.String({ description: "Dotted key for facts (e.g. pref.commit_style)" })),
+      value: Type.Optional(Type.String({ description: "Value for facts" })),
+      rule: Type.Optional(Type.String({ description: "Rule text for lessons" })),
+      category: Type.Optional(Type.String({ description: "Category for lessons (default: general)" })),
+      negative: Type.Optional(Type.Boolean({ description: "True if this is something to AVOID" })),
+    }) as any,
+    async execute(_id, params, _signal, _update, ctx) {
+      if (!store) return ok("Memory store not initialized");
+
+      const input = params as MemoryRememberParams;
+      // Defensively unwrap double-quoted string args from misbehaving model runners.
+      const rememberParams: MemoryRememberParams = {
+        ...input,
+        type: stripQuotes(input.type),
+        key: stripQuotes(input.key),
+        value: stripQuotes(input.value),
+        rule: stripQuotes(input.rule),
+        category: stripQuotes(input.category),
+      };
+
+      if (rememberParams.type !== "fact" && rememberParams.type !== "lesson") {
+        return ok(`Invalid type: ${rememberParams.type}. Must be 'fact' or 'lesson'.`);
+      }
+
+      if (rememberParams.type === "fact") {
+        if (!rememberParams.key || !rememberParams.value) {
+          return ok("Both key and value required for facts");
+        }
+        store.setSemantic(rememberParams.key, rememberParams.value, 0.95, "user");
+        embedEntry(rememberParams.key, rememberParams.value, ctx);
+        return ok(`Remembered: ${rememberParams.key} = ${rememberParams.value}`);
+      }
+
+      if (rememberParams.type === "lesson") {
+        if (!rememberParams.rule) {
+          return ok("Rule text required for lessons");
+        }
+        const result = await store.addLesson(rememberParams.rule, rememberParams.category ?? "general", "user", rememberParams.negative ?? false);
+        if (result.success) {
+          return ok(`Lesson learned: ${rememberParams.rule}`);
+        }
+        return ok(`Already known (${result.reason}): ${rememberParams.rule}`);
+      }
+
+      return ok("Unknown type");
+    },
+  });
+
+  pi.registerTool({
+    name: "memory_forget",
+    label: "Memory Forget",
+    description: "Remove a fact or lesson from persistent memory.",
+    parameters: Type.Object({
+      type: Type.String(),
+      key: Type.Optional(Type.String({ description: "Key for facts" })),
+      id: Type.Optional(Type.String({ description: "ID for lessons" })),
+    }) as any,
+    async execute(_id, params, _signal, _update, _ctx) {
+      if (!store) return ok("Memory store not initialized");
+
+      const input = params as MemoryForgetParams;
+      const forgetParams: MemoryForgetParams = {
+        ...input,
+        type: stripQuotes(input.type),
+        key: stripQuotes(input.key),
+        id: stripQuotes(input.id),
+      };
+
+      if (forgetParams.type !== "fact" && forgetParams.type !== "lesson") {
+        return ok(`Invalid type: ${forgetParams.type}. Must be 'fact' or 'lesson'.`);
+      }
+
+      if (forgetParams.type === "fact" && forgetParams.key) {
+        const deleted = await store.deleteSemantic(forgetParams.key);
+        return ok(deleted ? `Forgot: ${forgetParams.key}` : `Not found: ${forgetParams.key}`);
+      }
+
+      if (forgetParams.type === "lesson" && forgetParams.id) {
+        const deleted = await store.deleteLesson(forgetParams.id);
+        return ok(deleted ? `Forgot lesson ${forgetParams.id}` : `Not found: ${forgetParams.id}`);
+      }
+
+      return ok("Provide key (for facts) or id (for lessons)");
+    },
+  });
+
+  pi.registerTool({
+    name: "memory_lessons",
+    label: "Memory Lessons",
+    description: "List learned corrections and lessons from past sessions.",
+    parameters: Type.Object({
+      category: Type.Optional(Type.String({ description: "Filter by category" })),
+      limit: Type.Optional(Type.Number({ description: "Max results (default 50)" })),
+    }) as any,
+    async execute(_id, params, _signal, _update, _ctx) {
+      if (!store) return ok("Memory store not initialized");
+
+      const lessonsParams = params as MemoryLessonsParams;
+      const lessons = await store.listLessons(lessonsParams.category, lessonsParams.limit ?? 50);
+      if (lessons.length === 0) {
+        return ok("No lessons learned yet.");
+      }
+
+      const text = lessons.map(l =>
+        `${l.negative ? "❌" : "✅"} [${l.category}] ${l.rule} (id: ${l.id.slice(0, 8)})`
+      ).join("\n");
+
+      return ok(text);
+    },
+  });
+
+  pi.registerTool({
+    name: "memory_stats",
+    label: "Memory Stats",
+    description: "Show memory statistics — how many facts, lessons, and events are stored.",
+    parameters: Type.Object({}) as any,
+    async execute(_id, _params, _signal, _update, _ctx) {
+      if (!store) return ok("Memory store not initialized");
+
+      const stats = await store.stats();
+      const lines = [
+        `Memory: ${stats.semantic} semantic facts, ${stats.lessons} active lessons, ${stats.events} events logged`,
+        `Backend: ${backend}`,
+      ];
+      const cfg = injectorConfig.embedding;
+      if (cfg) {
+        const cov = await store.embeddingCoverage();
+        lines.push(
+          `Search: hybrid (FTS5 + ${cfg.type}${cfg.model ? `/${cfg.model}` : ""}), ${cov.embedded}/${cov.total} embedded`,
+        );
+        if (embedFailure) {
+          lines.push(
+            `Semantic search is failing: ${embedFailure.reason}. ${embedFailure.hint} Results come from keyword search until this is fixed.`,
+          );
+        }
+      } else {
+        lines.push("Search: FTS5 keyword only (set memory.embedding to enable semantic search)");
+      }
+      return ok(lines.join("\n"));
+    },
+  });
+
+  // ─── Commands ──────────────────────────────────────────────────
+
+  pi.registerCommand("memory-consolidate", {
+    description: "Manually trigger memory consolidation for the current session",
+    async handler(_args, ctx) {
+      if (!store) {
+        ctx.ui.notify("Memory store not initialized", "warning");
+        return;
+      }
+
+      if (pendingUserMessages.length < 2) {
+        ctx.ui.notify("Not enough conversation to consolidate (need at least 2 user messages)", "warning");
+        return;
+      }
+
+      ctx.ui.notify("Consolidating session memory...", "info");
+      try {
+        await consolidateSession();
+        const stats = await store.stats();
+        ctx.ui.notify(`Memory updated: ${stats.semantic} facts, ${stats.lessons} lessons`, "info");
+      } catch (err: any) {
+        ctx.ui.notify(`Consolidation failed: ${err.message}`, "error");
+      }
+    },
+  });
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────
+
+function extractText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((c: any) => c.type === "text" && typeof c.text === "string")
+      .map((c: any) => c.text)
+      .join("\n");
+  }
+  return "";
+}
