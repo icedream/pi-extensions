@@ -11,6 +11,7 @@ import {
 	discoveryFlag,
 	fetchModels,
 	groupRejections,
+	hasNoTextOutput,
 	isDecisionModel,
 	modelsUrlFor,
 	parseModelsPayload,
@@ -98,6 +99,7 @@ test("accepts the OpenAI-style keys as fallbacks", () => {
 	assert.equal(reportedContextWindow({ context_window: 131072 }), 131072);
 	assert.equal(reportedContextWindow({ contextWindow: 65536 }), 65536);
 	assert.equal(reportedContextWindow({ n_ctx: 32768 }), 32768);
+	assert.equal(reportedContextWindow({ context_length: 1048576 }), 1048576);
 	// meta.n_ctx wins when a server sends both.
 	assert.equal(reportedContextWindow({ meta: { n_ctx: 393216 }, context_window: 1000000 }), 393216);
 });
@@ -137,6 +139,70 @@ test("decision models are skipped rather than registered as chat models", () => 
 	const { models, rejected } = parseModelsPayload({ data: [decision] });
 	assert.equal(models.length, 0);
 	assert.match(rejected[0].reason, /classifier/);
+});
+
+test("reads the context window from context_length, as OpenRouter-style lists send it", () => {
+	const { models, rejected } = parseModelsPayload({
+		object: "list",
+		data: [
+			{
+				id: "alibaba:global/deepseek-v4-pro",
+				object: "model",
+				context_length: 1048576,
+				architecture: { modality: "text->text", input_modalities: ["text"], output_modalities: ["text"] },
+				vendor: { type: "llm", max_output_tokens: 393216 },
+			},
+		],
+	});
+	assert.equal(rejected.length, 0);
+	assert.equal(models[0].contextWindow, 1048576);
+	assert.equal(models[0].maxTokens, 393216);
+	assert.equal(models[0].maxTokensReported, true);
+});
+
+test("maxTokens comes from the nested max_output_tokens, clamped to the context window", () => {
+	const { models } = parseModelsPayload({
+		data: [
+			{ id: "gemma", context_length: 262144, vendor: { max_output_tokens: 8192 } },
+			{ id: "tiny", context_length: 4096, vendor: { max_output_tokens: 8192 } },
+		],
+	});
+	assert.equal(models[0].maxTokens, 8192);
+	assert.equal(models[1].maxTokens, 4096);
+});
+
+test("max_output_tokens is read from any object-valued field, and endpoint-level keys still win", () => {
+	const { models } = parseModelsPayload({
+		data: [
+			{ id: "any-name", context_length: 262144, acme: { max_output_tokens: 8192 } },
+			{ id: "endpoint-wins", context_length: 262144, meta: { n_predict: 2048 }, billing: { max_output_tokens: 4096 } },
+			{ id: "array-ignored", context_length: 262144, list: [{ max_output_tokens: 1024 }] },
+		],
+	});
+	assert.equal(models[0].maxTokens, 8192);
+	assert.equal(models[1].maxTokens, 2048);
+	assert.equal(models[2].maxTokens, DEFAULT_MAX_TOKENS);
+});
+
+test("embedding and image-only models are skipped rather than registered as chat models", () => {
+	const embedding = { id: "deepinfra/BAAI/bge-m3", context_length: 8192, architecture: { output_modalities: ["embeddings"] } };
+	const image = { id: "novita/ming-image-0.1-design", context_length: 4096, architecture: { output_modalities: ["image"] } };
+	const { models, rejected } = parseModelsPayload({ data: [embedding, image] });
+	assert.equal(models.length, 0);
+	assert.deepEqual(
+		rejected.map((r) => r.cause),
+		["no text output", "no text output"],
+	);
+	assert.match(rejected[0].reason, /\["embeddings"\]; not a chat model/);
+});
+
+test("only a declared output without text is treated as non-chat", () => {
+	assert.equal(hasNoTextOutput({ architecture: { output_modalities: ["text", "image"] } }), false);
+	assert.equal(hasNoTextOutput({ architecture: { output_modalities: ["embeddings"] } }), true);
+	// Silence about outputs is kept as a chat model, as before.
+	assert.equal(hasNoTextOutput({ architecture: {} }), false);
+	assert.equal(hasNoTextOutput({ architecture: { output_modalities: [] } }), false);
+	assert.equal(hasNoTextOutput({}), false);
 });
 
 test("maxTokens comes from the endpoint when reported", () => {

@@ -36,10 +36,11 @@ hand survives every refresh.
 |---|---|---|
 | `id` | Model id | entry skipped if missing |
 | `name` | Display name | `id` |
-| `meta.n_ctx`, `n_ctx`, `context_window`, `contextWindow`, `max_model_len` | `contextWindow` | **none** - the model is skipped |
-| `meta.n_predict`, `max_tokens`, `maxTokens` | `maxTokens` | 65,536, clamped to the context window, with a notice |
+| `meta.n_ctx`, `n_ctx`, `context_window`, `contextWindow`, `max_model_len`, `context_length` | `contextWindow` | **none** - the model is skipped |
+| `meta.n_predict`, `max_tokens`, `maxTokens`, then `max_output_tokens` inside any object-valued field | `maxTokens` | 65,536, clamped to the context window, with a notice |
 | `architecture.input_modalities` | `input` | `["text"]` |
 | `architecture.output_modalities` containing `decisions` | classifier marker | entry skipped with a notice |
+| `architecture.output_modalities` declared but without `text` (embeddings, image-only) | not a chat model | entry skipped with a notice |
 
 ## Commands
 

@@ -37,6 +37,7 @@ export interface EndpointModel {
 	context_window?: number | string;
 	contextWindow?: number | string;
 	max_model_len?: number | string;
+	context_length?: number | string;
 	max_tokens?: number | string;
 	maxTokens?: number | string;
 	meta?: { n_ctx?: number | string; n_predict?: number | string; [key: string]: unknown };
@@ -78,9 +79,10 @@ function positiveNumber(value: unknown): number | undefined {
  * The context window the endpoint reports, or undefined when it reports none.
  *
  * `meta.n_ctx` first: that is what llama.cpp and Strata send. `max_model_len` is what
- * vLLM sends. Neither is an OpenAI-style key, so a client that only reads
- * `context_window` sees nothing. Never guess a number here - a made-up window is worse
- * than no window, because Pi then keeps growing the session past what the server accepts.
+ * vLLM sends, and `context_length` is what OpenRouter-style lists send. None of these is
+ * an OpenAI-style key, so a client that only reads `context_window` sees nothing.
+ * Never guess a number here: a made-up window is worse than no window, because Pi then
+ * keeps growing the session past what the server accepts.
  */
 export function reportedContextWindow(model: EndpointModel): number | undefined {
 	const candidates = [
@@ -89,6 +91,7 @@ export function reportedContextWindow(model: EndpointModel): number | undefined 
 		model.context_window,
 		model.contextWindow,
 		model.max_model_len,
+		model.context_length,
 	];
 	for (const candidate of candidates) {
 		const n = positiveNumber(candidate);
@@ -97,11 +100,20 @@ export function reportedContextWindow(model: EndpointModel): number | undefined 
 	return undefined;
 }
 
-/** The output limit the endpoint reports, or undefined. */
+/**
+ * The output limit the endpoint reports, or undefined. Endpoint-level keys win. Otherwise
+ * `max_output_tokens` inside any object-valued field counts: providers that nest their own
+ * metadata report the real cap per model there, and some caps are well below DEFAULT_MAX_TOKENS.
+ */
 export function reportedMaxTokens(model: EndpointModel): number | undefined {
 	const candidates = [model.meta?.n_predict, model.max_tokens, model.maxTokens];
 	for (const candidate of candidates) {
 		const n = positiveNumber(candidate);
+		if (n !== undefined) return n;
+	}
+	for (const value of Object.values(model)) {
+		if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
+		const n = positiveNumber((value as { max_output_tokens?: unknown }).max_output_tokens);
 		if (n !== undefined) return n;
 	}
 	return undefined;
@@ -125,6 +137,16 @@ export function isDecisionModel(model: EndpointModel): boolean {
 	return Array.isArray(outputs) && outputs.includes("decisions");
 }
 
+/**
+ * Embedding and image-only models list an output modality other than text, so they cannot
+ * answer a chat request. An endpoint that declares no output modalities is taken at its word
+ * and kept, as before.
+ */
+export function hasNoTextOutput(model: EndpointModel): boolean {
+	const outputs = model.architecture?.output_modalities;
+	return Array.isArray(outputs) && outputs.length > 0 && !outputs.includes("text");
+}
+
 /** Parse a GET /models payload into models to register, plus what was skipped and why. */
 export function parseModelsPayload(payload: unknown): { models: DiscoveredModel[]; rejected: RejectedModel[] } {
 	const entries = Array.isArray(payload)
@@ -143,6 +165,15 @@ export function parseModelsPayload(payload: unknown): { models: DiscoveredModel[
 				id,
 				cause: "decision model",
 				reason: "reports output modality 'decisions'; register it as a classifier instead",
+			});
+			continue;
+		}
+
+		if (hasNoTextOutput(entry)) {
+			rejected.push({
+				id,
+				cause: "no text output",
+				reason: `reports output modalities ${JSON.stringify(entry.architecture?.output_modalities)}; not a chat model`,
 			});
 			continue;
 		}
