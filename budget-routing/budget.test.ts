@@ -6,18 +6,30 @@ import os from "node:os";
 import path from "node:path";
 import { utimes } from "node:fs/promises";
 import {
+	advisorySection,
 	applyDivert,
+	billingFor,
+	buildRoutes,
+	costTable,
 	DEFAULT_SEAT,
 	DEFAULT_THRESHOLDS,
+	formatCost,
+	menuModelRefs,
 	monthSpend,
+	monthSpendAll,
 	monthStartMs,
+	parseAgentOverrideModels,
 	parseConfig,
 	parseSeatFigure,
 	preSwitchCompactionStep,
 	providerForModelRef,
+	providerStatus,
+	rejectReason,
+	spendByWindow,
 	spendSince,
 	statusLabel,
 	tierFor,
+	type ProviderStatus,
 	type Tier,
 } from "./budget.ts";
 import { pickGitHubToken } from "./credential.ts";
@@ -101,31 +113,45 @@ const REGISTRY = [
 	{ provider: "icedream-homepc/strata", id: "qwen3.8-flash-next-iq3_s" },
 ];
 
-// Simulate one crossing: each agent_end feeds its returned flag back in, exactly like index.ts.
+const st = (tier: Tier, provider = COPILOT, capUsd = 150): ProviderStatus => ({
+	provider,
+	billing: "credits",
+	capUsd,
+	spend: 0,
+	tier,
+	source: "meter",
+	observationIgnored: false,
+});
+
+// Simulate one crossing: each agent_end feeds its returned flag back in, exactly like index.ts,
+// and each provider keeps its own flag.
 function crossing(steps: Array<[Tier | undefined, string | undefined]>): boolean[] {
-	let compacted = false;
+	const flags = new Map<string, boolean>();
 	const compact: boolean[] = [];
 	for (const [tier, sessionProvider] of steps) {
-		const step = preSwitchCompactionStep(tier, sessionProvider, COPILOT, compacted);
-		compacted = step.compacted;
+		const mine = tier !== undefined && sessionProvider === COPILOT ? st(tier) : undefined;
+		const step = preSwitchCompactionStep(mine, flags.get(sessionProvider ?? "") ?? false);
+		if (step.compacted) flags.set(sessionProvider ?? "", true);
+		else flags.delete(sessionProvider ?? "");
 		compact.push(step.compact);
 	}
 	return compact;
 }
 
-test("preSwitchCompactionStep compacts only at prepare/divert while on the budget provider", () => {
-	assert.deepEqual(preSwitchCompactionStep("prepare", COPILOT, COPILOT, false), { compact: true, compacted: true });
-	assert.deepEqual(preSwitchCompactionStep("divert", COPILOT, COPILOT, false), { compact: true, compacted: true });
+test("preSwitchCompactionStep compacts only at prepare/divert for the provider being spent", () => {
+	assert.deepEqual(preSwitchCompactionStep(st("prepare"), false), { compact: true, compacted: true });
+	assert.deepEqual(preSwitchCompactionStep(st("divert"), false), { compact: true, compacted: true });
 	for (const tier of ["ok", "nudge", "warn"] as const) {
-		assert.deepEqual(preSwitchCompactionStep(tier, COPILOT, COPILOT, false), { compact: false, compacted: false });
+		assert.deepEqual(preSwitchCompactionStep(st(tier), false), { compact: false, compacted: false });
 	}
-	assert.deepEqual(preSwitchCompactionStep(undefined, COPILOT, COPILOT, false), { compact: false, compacted: false });
-	assert.deepEqual(preSwitchCompactionStep("prepare", COPILOT, undefined, false), { compact: false, compacted: false });
+	// A session on a provider that is not tracked at all neither compacts nor consumes the flag.
+	assert.deepEqual(preSwitchCompactionStep(undefined, false), { compact: false, compacted: false });
+	assert.deepEqual(preSwitchCompactionStep(undefined, true), { compact: false, compacted: true });
 });
 
-test("preSwitchCompactionStep skips a local session model without consuming the once-per-crossing flag", () => {
-	assert.deepEqual(preSwitchCompactionStep("prepare", LOCAL, COPILOT, false), { compact: false, compacted: false });
-	assert.deepEqual(preSwitchCompactionStep("prepare", LOCAL, COPILOT, true), { compact: false, compacted: true });
+test("preSwitchCompactionStep skips an untracked session model without consuming the once-per-crossing flag", () => {
+	assert.deepEqual(preSwitchCompactionStep(undefined, false), { compact: false, compacted: false });
+	assert.deepEqual(preSwitchCompactionStep(undefined, true), { compact: false, compacted: true });
 });
 
 test("a local-model agent_end does not block a later Copilot compaction in the same crossing", () => {
@@ -140,53 +166,80 @@ test("divert does not compact again after prepare already compacted in the same 
 	assert.deepEqual(crossing([["prepare", COPILOT], ["divert", COPILOT]]), [true, false]);
 });
 
-test("applyDivert rewrites local-eligible launches and blocks the rest", () => {
+test("an over-cap provider elsewhere does not compact a session spending a healthy one", () => {
+	const anthropic = st("ok", "anthropic", 60);
+	assert.deepEqual(preSwitchCompactionStep(anthropic, false), { compact: false, compacted: false });
+});
+
+test("each provider gets its own once-per-crossing flag", () => {
+	const flags = new Map<string, boolean>();
+	const seen: boolean[] = [];
+	for (const [tier, provider] of [["divert", COPILOT], ["divert", "anthropic"], ["divert", COPILOT]] as [Tier, string][]) {
+		const step = preSwitchCompactionStep(st(tier, provider, 150), flags.get(provider) ?? false);
+		flags.set(provider, step.compacted);
+		seen.push(step.compact);
+	}
+	assert.deepEqual(seen, [true, true, false]);
+});
+
+test("applyDivert in rewrite mode rewrites local-eligible launches and rejects the rest", () => {
 	const ref = "llama-server=http://x:1/qwen";
-	const local = ["scout", "Plan"];
-	const opts = { localSubagents: local, subagentRef: ref, budgetProvider: COPILOT };
+	const opts = { mode: "rewrite" as const, localSubagents: ["scout", "Plan"], subagentRef: ref, tiers: { [COPILOT]: "divert" as Tier }, sessionProvider: COPILOT };
 
 	const single = { agent: "scout", task: "find X" };
-	assert.deepEqual(applyDivert(single, opts), { rewritten: 1, blocked: [], passed: [] });
+	assert.deepEqual(applyDivert(single, opts), { rewritten: 1, rejected: [], passed: [] });
 	assert.equal((single as { model?: string }).model, ref);
 
-	const blockedSingle = { agent: "worker", task: "implement" };
-	assert.deepEqual(applyDivert(blockedSingle, opts), { rewritten: 0, blocked: ["worker"], passed: [] });
-	assert.equal((blockedSingle as { model?: string }).model, undefined);
+	const rejectedSingle = { agent: "worker", task: "implement" };
+	assert.deepEqual(applyDivert(rejectedSingle, opts), { rewritten: 0, rejected: [{ label: "worker", provider: COPILOT }], passed: [] });
+	assert.equal((rejectedSingle as { model?: string }).model, undefined);
 
 	const batch = { tasks: [{ agent: "Plan", task: "a" }, { agent: "reviewer", task: "b" }, { task: "no agent" }] };
 	const r = applyDivert(batch, opts);
-	assert.deepEqual(r, { rewritten: 1, blocked: ["reviewer", "(no agent)"], passed: [] });
+	assert.deepEqual(r.rewritten, 1);
+	assert.deepEqual(r.rejected, [{ label: "reviewer", provider: COPILOT }, { label: "(no agent)", provider: COPILOT }]);
 	assert.equal((batch.tasks[0] as { model?: string }).model, ref);
 	assert.equal((batch.tasks[1] as { model?: string }).model, undefined);
 });
 
+test("applyDivert in reject mode rewrites nothing and reports every over-cap launch", () => {
+	const opts = { mode: "reject" as const, localSubagents: ["scout"], subagentRef: LOCAL_REF, tiers: { [COPILOT]: "divert" as Tier } };
+	const scout = { agent: "scout", task: "look" };
+	assert.deepEqual(applyDivert(scout, opts), { rewritten: 0, rejected: [{ label: "scout", provider: undefined }], passed: [] });
+	assert.equal((scout as { model?: string }).model, undefined);
+});
+
+test("applyDivert in off mode touches nothing even at divert", () => {
+	const opts = { mode: "off" as const, localSubagents: ["scout"], subagentRef: LOCAL_REF, tiers: { [COPILOT]: "divert" as Tier } };
+	assert.deepEqual(applyDivert({ agent: "scout", task: "look" }, opts), { rewritten: 0, rejected: [], passed: [] });
+});
+
 test("applyDivert leaves management actions untouched", () => {
 	const status = { action: "status", id: "abc" };
-	assert.deepEqual(applyDivert(status, { localSubagents: ["scout"], subagentRef: "ref", budgetProvider: COPILOT }), {
-		rewritten: 0,
-		blocked: [],
-		passed: [],
-	});
+	assert.deepEqual(
+		applyDivert(status, { mode: "reject", localSubagents: ["scout"], subagentRef: "ref", tiers: { [COPILOT]: "divert" } }),
+		{ rewritten: 0, rejected: [], passed: [] },
+	);
 	assert.equal((status as { model?: string }).model, undefined);
 });
 
 test("applyDivert does not touch launches aimed at another provider", () => {
-	const opts = { localSubagents: ["scout"], subagentRef: LOCAL_REF, budgetProvider: COPILOT, models: REGISTRY };
+	const opts = { mode: "rewrite" as const, localSubagents: ["scout"], subagentRef: LOCAL_REF, tiers: { [COPILOT]: "divert" as Tier }, models: REGISTRY };
 
-	// The reported bug: a non-local agent explicitly on freellmapi is neither blocked nor rewritten.
+	// The reported bug: a non-local agent explicitly on freellmapi is neither rejected nor rewritten.
 	const researcher = { agent: "researcher", model: "freellmapi/auto", task: "critique the plan" };
-	assert.deepEqual(applyDivert(researcher, opts), { rewritten: 0, blocked: [], passed: ["researcher"] });
+	assert.deepEqual(applyDivert(researcher, opts), { rewritten: 0, rejected: [], passed: ["researcher"] });
 	assert.equal(researcher.model, "freellmapi/auto");
 
 	const advisor = { agent: "advisor", model: "hetzner/Qwen3.8-27B:xhigh", task: "critique" };
-	assert.deepEqual(applyDivert(advisor, opts), { rewritten: 0, blocked: [], passed: ["advisor"] });
+	assert.deepEqual(applyDivert(advisor, opts), { rewritten: 0, rejected: [], passed: ["advisor"] });
 
 	// A local-eligible agent that already names another provider keeps that model.
 	const scout = { agent: "scout", model: "hetzner/Qwen3.8-27B", task: "look" };
-	assert.deepEqual(applyDivert(scout, opts), { rewritten: 0, blocked: [], passed: ["scout"] });
+	assert.deepEqual(applyDivert(scout, opts), { rewritten: 0, rejected: [], passed: ["scout"] });
 	assert.equal(scout.model, "hetzner/Qwen3.8-27B");
 
-	// Mixed batch: only the copilot launch is diverted or blocked.
+	// Mixed batch: only the copilot launch is a candidate.
 	const batch = {
 		tasks: [
 			{ agent: "worker", model: "github-copilot/claude-sonnet-5.5", task: "a" },
@@ -194,26 +247,49 @@ test("applyDivert does not touch launches aimed at another provider", () => {
 			{ agent: "scout", task: "c" },
 		],
 	};
-	assert.deepEqual(applyDivert(batch, opts), { rewritten: 1, blocked: ["worker"], passed: ["delegate"] });
+	assert.deepEqual(applyDivert(batch, opts), { rewritten: 1, rejected: [{ label: "worker", provider: COPILOT }], passed: ["delegate"] });
 	assert.equal((batch.tasks[2] as { model?: string }).model, LOCAL_REF);
 });
 
-test("applyDivert treats an unattributable model as capped-provider spend", () => {
-	const opts = { localSubagents: ["scout"], subagentRef: LOCAL_REF, budgetProvider: COPILOT, models: REGISTRY };
+test("applyDivert treats an unattributable model as the worst tier among the capped providers", () => {
+	const opts = {
+		mode: "reject" as const,
+		localSubagents: ["scout"],
+		subagentRef: LOCAL_REF,
+		tiers: { [COPILOT]: "ok", anthropic: "divert" } as Record<string, Tier>,
+		models: REGISTRY,
+		sessionProvider: COPILOT,
+	};
+	// The session sits on a healthy provider, but the alias could resolve to the diverting one.
 	const unknown = { agent: "worker", model: "not-a-provider/whatever", task: "a" };
-	assert.deepEqual(applyDivert(unknown, opts), { rewritten: 0, blocked: ["worker"], passed: [] });
+	assert.deepEqual(applyDivert(unknown, opts), { rewritten: 0, rejected: [{ label: "worker", provider: undefined }], passed: [] });
 	const ambiguous = { agent: "worker", model: "claude-sonnet-5.5", task: "a" };
-	assert.deepEqual(applyDivert(ambiguous, opts), { rewritten: 0, blocked: ["worker"], passed: [] });
+	assert.deepEqual(applyDivert(ambiguous, opts), { rewritten: 0, rejected: [{ label: "worker", provider: undefined }], passed: [] });
+});
+
+test("applyDivert ignores a provider that is only at prepare", () => {
+	const opts = { mode: "reject" as const, localSubagents: ["scout"], subagentRef: LOCAL_REF, tiers: { [COPILOT]: "prepare" as Tier } };
+	assert.deepEqual(applyDivert({ agent: "worker", model: "github-copilot/claude-sonnet-5.5", task: "a" }, opts), {
+		rewritten: 0,
+		rejected: [],
+		passed: ["worker"],
+	});
 });
 
 test("applyDivert uses the session provider when a launch names no model", () => {
-	const local = { localSubagents: ["scout"], subagentRef: LOCAL_REF, budgetProvider: COPILOT, sessionProvider: "freellmapi" };
-	assert.deepEqual(applyDivert({ agent: "worker", task: "a" }, local), { rewritten: 0, blocked: [], passed: ["worker"] });
-	assert.deepEqual(applyDivert({ agent: "scout", task: "a" }, local), { rewritten: 0, blocked: [], passed: ["scout"] });
+	const local = {
+		mode: "rewrite" as const,
+		localSubagents: ["scout"],
+		subagentRef: LOCAL_REF,
+		tiers: { [COPILOT]: "divert" as Tier },
+		sessionProvider: "freellmapi",
+	};
+	assert.deepEqual(applyDivert({ agent: "worker", task: "a" }, local), { rewritten: 0, rejected: [], passed: ["worker"] });
+	assert.deepEqual(applyDivert({ agent: "scout", task: "a" }, local), { rewritten: 0, rejected: [], passed: ["scout"] });
 
-	const capped = { localSubagents: ["scout"], subagentRef: LOCAL_REF, budgetProvider: COPILOT, sessionProvider: COPILOT };
-	assert.deepEqual(applyDivert({ agent: "worker", task: "a" }, capped), { rewritten: 0, blocked: ["worker"], passed: [] });
-	assert.deepEqual(applyDivert({ agent: "scout", task: "a" }, capped), { rewritten: 1, blocked: [], passed: [] });
+	const capped = { mode: "rewrite" as const, localSubagents: ["scout"], subagentRef: LOCAL_REF, tiers: { [COPILOT]: "divert" as Tier }, sessionProvider: COPILOT };
+	assert.deepEqual(applyDivert({ agent: "worker", task: "a" }, capped), { rewritten: 0, rejected: [{ label: "worker", provider: COPILOT }], passed: [] });
+	assert.deepEqual(applyDivert({ agent: "scout", task: "a" }, capped), { rewritten: 1, rejected: [], passed: [] });
 });
 
 test("providerForModelRef resolves full ids, bare ids, and thinking suffixes", () => {
@@ -235,10 +311,12 @@ const validRaw = {
 	localSubagents: ["scout"],
 };
 
-test("parseConfig applies default thresholds", () => {
+test("parseConfig applies default thresholds and reads a v1 file as one provider", () => {
 	const c = parseConfig(validRaw);
 	assert.deepEqual(c.thresholds, DEFAULT_THRESHOLDS);
-	assert.equal(c.monthlyCapUsd, 150);
+	assert.equal(c.providers.length, 1);
+	assert.equal(c.providers[0].monthlyCapUsd, 150);
+	assert.equal(c.enforce, "reject");
 });
 
 test("parseConfig rejects bad values with a clear message", () => {
@@ -246,13 +324,14 @@ test("parseConfig rejects bad values with a clear message", () => {
 	assert.throws(() => parseConfig({ ...validRaw, thresholds: { warn: 0.9, prepare: 0.5 } }), /non-decreasing/);
 	assert.throws(() => parseConfig({ ...validRaw, localSubagents: [] }), /localSubagents/);
 	assert.throws(() => parseConfig({ ...validRaw, localModel: undefined }), /localModel is required/);
+	assert.throws(() => parseConfig({ ...validRaw, enforce: "yolo" }), /enforce must be one of/);
 	assert.throws(() => parseConfig(null), /JSON object/);
 });
 
 test("parseConfig validates the observed calibration and defaults usdPerCredit", () => {
 	const ok = parseConfig({ ...validRaw, observed: { creditsUsed: 8216, asOf: "2026-10-01T00:00:00Z" } });
-	assert.equal(ok.observed?.usdPerCredit, 0.01);
-	assert.equal(ok.observed?.asOfMs, Date.parse("2026-10-01T00:00:00Z"));
+	assert.equal(ok.providers[0].observed?.usdPerCredit, 0.01);
+	assert.equal(ok.providers[0].observed?.asOfMs, Date.parse("2026-10-01T00:00:00Z"));
 	assert.throws(() => parseConfig({ ...validRaw, observed: { creditsUsed: -1, asOf: "2026-10-01T00:00:00Z" } }), /creditsUsed must be >= 0/);
 	assert.throws(() => parseConfig({ ...validRaw, observed: { creditsUsed: 1, asOf: "not a date" } }), /asOf must be an ISO date/);
 	assert.throws(() => parseConfig({ ...validRaw, observed: { creditsUsed: 1, usdPerCredit: 0, asOf: "2026-10-01T00:00:00Z" } }), /usdPerCredit must be positive/);
@@ -271,7 +350,7 @@ test("monthSpend: calibrated baseline plus Pi spend since asOf only", async () =
 		].join("\n"),
 	);
 	const cfg = parseConfig({ ...validRaw, observed: { creditsUsed: 8216, asOf: new Date(asOf).toISOString() } });
-	const r = await monthSpend(cfg, dir, now);
+	const r = await monthSpend(cfg.providers[0], dir, now);
 	assert.equal(r.source, "calibrated");
 	assert.equal(r.observationIgnored, false);
 	assert.ok(Math.abs(r.spend - (82.16 + 1.5)) < 1e-9, `got ${r.spend}`);
@@ -280,7 +359,7 @@ test("monthSpend: calibrated baseline plus Pi spend since asOf only", async () =
 test("monthSpend: ignores an observation from a previous month", async () => {
 	const dir = await tmpSessions();
 	const cfg = parseConfig({ ...validRaw, observed: { creditsUsed: 8216, asOf: "2000-01-01T00:00:00Z" } });
-	const r = await monthSpend(cfg, dir, new Date());
+	const r = await monthSpend(cfg.providers[0], dir, new Date());
 	assert.equal(r.source, "meter");
 	assert.equal(r.observationIgnored, true);
 });
@@ -345,9 +424,9 @@ test("pickGitHubToken uses a GitHub token and never the Copilot proxy token", ()
 });
 
 test("parseConfig leaves seat off by default and validates the block", () => {
-	assert.equal(parseConfig(validRaw).seat, undefined);
-	assert.deepEqual(parseConfig({ ...validRaw, seat: {} }).seat, DEFAULT_SEAT);
-	assert.deepEqual(parseConfig({ ...validRaw, seat: { refreshMinutes: 60, credential: "gh" } }).seat, {
+	assert.equal(parseConfig(validRaw).providers[0].seat, undefined);
+	assert.deepEqual(parseConfig({ ...validRaw, seat: {} }).providers[0].seat, DEFAULT_SEAT);
+	assert.deepEqual(parseConfig({ ...validRaw, seat: { refreshMinutes: 60, credential: "gh" } }).providers[0].seat, {
 		refreshMinutes: 60,
 		credential: "gh",
 	});
@@ -363,7 +442,7 @@ test("monthSpend: a live seat figure wins over the hand-written observed", async
 	const cfg = parseConfig({ ...validRaw, observed: { creditsUsed: 999_999, asOf: new Date(now).toISOString() } });
 	const live = { ...parseSeatFigure(seatPayload), asOfMs: now.getTime() - 60_000 };
 
-	const r = await monthSpend(cfg, dir, now, live);
+	const r = await monthSpend(cfg.providers[0], dir, now, live);
 	assert.equal(r.source, "live");
 	assert.equal(r.observationIgnored, false);
 	// 15640 credits at the default 0.01, plus the 2.50 logged after the snapshot
@@ -380,7 +459,7 @@ test("monthSpend: live figure adds Pi spend since the snapshot, and usdPerCredit
 	const cfg = parseConfig({ ...validRaw, observed: { creditsUsed: 1, asOf: new Date(now).toISOString(), usdPerCredit: 0.02 } });
 	const live = { ...parseSeatFigure(seatPayload), asOfMs: now.getTime() - 5 * 60_000 };
 
-	const r = await monthSpend(cfg, dir, now, live);
+	const r = await monthSpend(cfg.providers[0], dir, now, live);
 	assert.equal(r.source, "live");
 	assert.ok(Math.abs(r.spend - (15640 * 0.02 + 1.5)) < 1e-9, `got ${r.spend}`);
 });
@@ -390,16 +469,261 @@ test("monthSpend: a live figure from another month falls back to the meter", asy
 	await fs.writeFile(path.join(dir, "s.jsonl"), [line("github-copilot", "assistant", Date.now(), 4)].join("\n") + "\n");
 	const cfg = parseConfig(validRaw);
 	const stale = { ...parseSeatFigure(seatPayload), asOfMs: new Date(2000, 0, 1).getTime() };
-	const r = await monthSpend(cfg, dir, new Date(), stale);
+	const r = await monthSpend(cfg.providers[0], dir, new Date(), stale);
 	assert.equal(r.source, "meter");
 	assert.equal(r.observationIgnored, true);
 	assert.ok(Math.abs(r.spend - 4) < 1e-9, `got ${r.spend}`);
 });
 
-test("statusLabel is compact, coloured by tier, and marks estimates", () => {
-	assert.deepEqual(statusLabel("github-copilot", 42, "ok", "live"), { text: "copilot 42%", color: "dim" });
-	assert.deepEqual(statusLabel("github-copilot", 74, "nudge", "calibrated"), { text: "copilot 74%", color: "accent" });
-	assert.deepEqual(statusLabel("github-copilot", 96, "prepare", "live"), { text: "copilot 96% !", color: "warning" });
-	assert.deepEqual(statusLabel("github-copilot", 103, "divert", "live"), { text: "copilot 103% over", color: "error" });
-	assert.deepEqual(statusLabel("litellm", 70, "warn", "meter"), { text: "litellm ~70%", color: "warning" });
+test("statusLabel is compact, coloured by tier, marks estimates, and shows spend when uncapped", () => {
+	const mk = (provider: string, pct: number, tier: Tier, source: ProviderStatus["source"], capUsd = 150): ProviderStatus => ({
+		provider,
+		billing: "credits",
+		capUsd,
+		spend: (capUsd * pct) / 100,
+		pct,
+		tier,
+		source,
+		observationIgnored: false,
+	});
+	assert.deepEqual(statusLabel(mk("github-copilot", 42, "ok", "live")), { text: "copilot 42%", color: "dim" });
+	assert.deepEqual(statusLabel(mk("github-copilot", 74, "nudge", "calibrated")), { text: "copilot 74%", color: "accent" });
+	assert.deepEqual(statusLabel(mk("github-copilot", 96, "prepare", "live")), { text: "copilot 96% !", color: "warning" });
+	assert.deepEqual(statusLabel(mk("github-copilot", 103, "divert", "live")), { text: "copilot 103% over", color: "error" });
+	assert.deepEqual(statusLabel(mk("litellm", 70, "warn", "meter")), { text: "litellm ~70%", color: "warning" });
+	assert.deepEqual(statusLabel({ ...mk("mistral", 0, "ok", "meter"), capUsd: undefined, spend: 6.46 }), { text: "mistral $6.46", color: "dim" });
+});
+
+// Today's on-disk config, verbatim, must keep parsing.
+const v1OnDisk = {
+	provider: "github-copilot",
+	monthlyCapUsd: 150,
+	thresholds: { nudge: 0.7, warn: 0.8, prepare: 0.95, divert: 1.0 },
+	localModel: { provider: "strata", modelId: "qwen3.8-flash-next-iq3_s", subagentRef: "strata/qwen3.8-flash-next-iq3_s" },
+	localSubagents: ["scout", "delegate", "Plan", "Explore"],
+	seat: { refreshMinutes: 15, credential: "auto" },
+};
+
+const v2Raw = {
+	localModel: { provider: "strata", modelId: "qwen3.8-flash-next-iq3_s", subagentRef: "strata/qwen3.8-flash-next-iq3_s" },
+	localSubagents: ["scout"],
+	thresholds: { nudge: 0.7, warn: 0.8, prepare: 0.95, divert: 1.0 },
+	providers: [
+		{ provider: "github-copilot", monthlyCapUsd: 150, seat: { refreshMinutes: 15 } },
+		{ provider: "anthropic", reset: "utc" },
+		{ provider: "mistral", monthlyCapUsd: 20 },
+	],
+};
+
+test("parseConfig reads the current on-disk v1 file as a one-entry provider list", () => {
+	const c = parseConfig(v1OnDisk);
+	assert.deepEqual(c.providers.map((p) => p.provider), [COPILOT]);
+	assert.equal(c.providers[0].monthlyCapUsd, 150);
+	assert.deepEqual(c.providers[0].seat, { refreshMinutes: 15, credential: "auto" });
+	assert.deepEqual(c.localSubagents, ["scout", "delegate", "Plan", "Explore"]);
+});
+
+test("parseConfig reads a providers array, an optional cap, and a reset zone", () => {
+	const c = parseConfig(v2Raw);
+	assert.deepEqual(c.providers.map((p) => p.provider), [COPILOT, "anthropic", "mistral"]);
+	assert.equal(c.providers[1].monthlyCapUsd, undefined);
+	assert.equal(c.providers[1].reset, "utc");
+	assert.equal(c.providers[0].reset, "local");
+	assert.equal(c.providers[2].monthlyCapUsd, 20);
+	// every entry shares the one threshold set
+	assert.deepEqual(c.providers[2].thresholds, DEFAULT_THRESHOLDS);
+});
+
+test("parseConfig rejects mixing v1 and v2 keys, duplicates, and a non-positive cap", () => {
+	assert.throws(() => parseConfig({ ...v1OnDisk, providers: [{ provider: "mistral" }] }), /either provider or providers, not both/);
+	assert.throws(
+		() => parseConfig({ ...v2Raw, providers: [{ provider: "mistral" }, { provider: "mistral", monthlyCapUsd: 5 }] }),
+		/duplicate provider mistral/,
+	);
+	assert.throws(() => parseConfig({ ...v2Raw, providers: [{ provider: "mistral", monthlyCapUsd: 0 }] }), /mistral.monthlyCapUsd must be positive/);
+	assert.throws(() => parseConfig({ ...v2Raw, providers: [] }), /providers must be a non-empty array/);
+	assert.throws(() => parseConfig({ localModel: v2Raw.localModel, localSubagents: ["scout"] }), /providers must be a non-empty array/);
+});
+
+test("monthStartMs in utc reads utc components, even when the local month differs", () => {
+	for (const iso of ["2026-11-01T00:30:00Z", "2026-10-31T23:30:00Z", "2026-01-01T00:00:00Z", "2026-12-15T12:00:00Z"]) {
+		const d = new Date(iso);
+		assert.equal(monthStartMs(d, "utc"), Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1), iso);
+	}
+	// A date that is November in UTC but still October locally must not pick the local month.
+	const boundary = new Date(Date.UTC(2026, 10, 1, 0, 30));
+	const localMonth = new Date(boundary).getMonth();
+	if (localMonth !== 10) {
+		assert.notEqual(monthStartMs(boundary, "utc"), new Date(boundary.getFullYear(), localMonth, 1).getTime());
+		assert.equal(monthStartMs(boundary, "utc"), Date.UTC(2026, 10, 1));
+	}
+});
+
+test("spendByWindow sums several providers and windows in one walk", async () => {
+	const dir = await tmpSessions();
+	const now = Date.now();
+	const monthAgo = now - 20 * 86_400_000;
+	await fs.writeFile(
+		path.join(dir, "s.jsonl"),
+		[
+			line(COPILOT, "assistant", monthAgo, 40),
+			line(COPILOT, "assistant", now, 3),
+			line("anthropic", "assistant", monthAgo, 4),
+			line("anthropic", "assistant", now, 2),
+			line("mistral", "assistant", now, 0.5),
+		].join("\n") + "\n",
+	);
+	const m = await spendByWindow(dir, [
+		{ key: "copilot:month", provider: COPILOT, sinceMs: monthAgo },
+		{ key: "copilot:tail", provider: COPILOT, sinceMs: now - 60_000 },
+		{ key: "anthropic", provider: "anthropic", sinceMs: monthAgo },
+		{ key: "mistral", provider: "mistral", sinceMs: monthAgo },
+	]);
+	assert.equal(m.get("copilot:month"), 43);
+	assert.equal(m.get("copilot:tail"), 3);
+	assert.equal(m.get("anthropic"), 6);
+	assert.equal(m.get("mistral"), 0.5);
+});
+
+test("monthSpendAll mixes a fetched baseline with plain meters in one walk", async () => {
+	const dir = await tmpSessions();
+	const now = new Date();
+	await fs.writeFile(
+		path.join(dir, "s.jsonl"),
+		[
+			line(COPILOT, "assistant", now.getTime() - 10 * 60_000, 3), // before the snapshot: already counted
+			line(COPILOT, "assistant", now.getTime() - 60_000, 1.5), // after it: counted again
+			line("anthropic", "assistant", now.getTime() - 60_000, 6.25),
+			line("mistral", "assistant", now.getTime() - 60_000, 0.2),
+		].join("\n") + "\n",
+	);
+	const cfg = parseConfig(v2Raw);
+	const live = new Map([[COPILOT, { ...parseSeatFigure(seatPayload), asOfMs: now.getTime() - 5 * 60_000 }]]);
+	const m = await monthSpendAll(cfg, dir, now, live);
+	assert.equal(m.get(COPILOT)?.source, "live");
+	assert.ok(Math.abs((m.get(COPILOT)?.spend ?? 0) - (156.4 + 1.5)) < 1e-9, `got ${m.get(COPILOT)?.spend}`);
+	assert.equal(m.get("anthropic")?.source, "meter");
+	assert.ok(Math.abs((m.get("anthropic")?.spend ?? 0) - 6.25) < 1e-9);
+	assert.ok(Math.abs((m.get("mistral")?.spend ?? 0) - 0.2) < 1e-9);
+});
+
+test("an entry without a cap is tracked but never tiered", () => {
+	const c = parseConfig(v2Raw);
+	const s = providerStatus(c.providers[1], { spend: 6.46, source: "meter", observationIgnored: false }, "metered");
+	assert.equal(s.capUsd, undefined);
+	assert.equal(s.pct, undefined);
+	assert.equal(s.tier, "ok");
+	assert.equal(s.headroomUsd, undefined);
+	assert.equal(s.spend, 6.46);
+});
+
+test("billingFor derives the shape from the provider and the registry, and config wins", () => {
+	const models = [
+		{ provider: COPILOT, id: "claude-sonnet-5.5", cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } },
+		{ provider: "strata", id: "qwen3.8-flash-next-iq3_s", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+		{ provider: "mistral", id: "magistral-medium-latest", cost: { input: 2, output: 5, cacheRead: 0, cacheWrite: 0.6 } },
+	];
+	assert.equal(billingFor({ provider: COPILOT, thresholds: DEFAULT_THRESHOLDS, reset: "local" }, models), "credits");
+	assert.equal(billingFor({ provider: "strata", thresholds: DEFAULT_THRESHOLDS, reset: "local" }, models), "free");
+	assert.equal(billingFor({ provider: "mistral", thresholds: DEFAULT_THRESHOLDS, reset: "local" }, models), "metered");
+	assert.equal(billingFor({ provider: "strata", thresholds: DEFAULT_THRESHOLDS, reset: "local", billing: "metered" }, models), "metered");
+});
+
+test("formatCost labels the three registry shapes apart", () => {
+	assert.equal(formatCost({ provider: "mistral", id: "m", cost: { input: 2, output: 5, cacheRead: 0, cacheWrite: 0.6 } }), "$2/$5 per Mtok, cache r0/w0.6");
+	assert.equal(formatCost({ provider: "strata", id: "s", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }), "no per-token charge");
+	assert.equal(formatCost({ provider: "x", id: "x" }), "no per-token charge");
+	assert.equal(formatCost(undefined), "price unknown");
+});
+
+test("advisorySection carries tiers, not numbers, and only changes at a tier change", () => {
+	const statuses = [providerStatus({ provider: COPILOT, monthlyCapUsd: 150, thresholds: DEFAULT_THRESHOLDS, reset: "local" }, { spend: 100, source: "live", observationIgnored: false }, "credits")];
+	const later = providerStatus({ provider: COPILOT, monthlyCapUsd: 150, thresholds: DEFAULT_THRESHOLDS, reset: "local" }, { spend: 104, source: "live", observationIgnored: false }, "credits");
+	const a = advisorySection(statuses, "strata/qwen", "budget");
+	const b = advisorySection([later], "strata/qwen", "budget");
+	assert.equal(a, b, "spend moved 18 USD inside one tier band and the text must not change");
+	assert.ok(!/%\)/.test(a) && !/\d+\.\d+/.test(a), `no live numbers expected: ${a}`);
+	const crossed = advisorySection(
+		[providerStatus({ provider: COPILOT, monthlyCapUsd: 150, thresholds: DEFAULT_THRESHOLDS, reset: "local" }, { spend: 151, source: "live", observationIgnored: false }, "credits")],
+		"strata/qwen",
+		"budget",
+	);
+	assert.notEqual(a, crossed);
+	assert.match(crossed, /copilot credits, over cap/);
+	assert.match(crossed, /budget/);
+});
+
+test("costTable shows every provider and prices the routes, seat providers by their seat", () => {
+	const cfg = parseConfig(v2Raw);
+	const statuses = [
+		providerStatus(cfg.providers[0], { spend: 151, source: "live", observationIgnored: false }, "credits"),
+		providerStatus(cfg.providers[1], { spend: 6.46, source: "meter", observationIgnored: false }, "metered"),
+		providerStatus(cfg.providers[2], { spend: 19.9, source: "meter", observationIgnored: false }, "metered"),
+	];
+	const models = [
+		{ provider: COPILOT, id: "claude-sonnet-5.5", cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 }, contextWindow: 1_000_000 },
+		{ provider: "anthropic", id: "claude-sonnet-5-5", cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 }, contextWindow: 1_000_000 },
+		{ provider: "mistral", id: "magistral-medium-latest", cost: { input: 2, output: 5, cacheRead: 0, cacheWrite: 0.6 }, contextWindow: 128_000 },
+		{ provider: "strata", id: "qwen3.8-flash-next-iq3_s", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 393_216 },
+	];
+	const routes = buildRoutes(["strata/qwen3.8-flash-next-iq3_s", "anthropic/claude-sonnet-5-5", "mistral/magistral-medium-latest", "github-copilot/claude-sonnet-5.5"], models, statuses, "strata/qwen3.8-flash-next-iq3_s");
+	const table = costTable(statuses, routes);
+	assert.match(table, /copilot *credits *\$150\.00 *\$151\.00 *101% *over cap *live/);
+	assert.match(table, /anthropic *metered *none *\$6\.46 *- *no cap/);
+	assert.match(table, /mistral\/magistral-medium-latest *metered *2\/5 *0\/0\.6 *128k/);
+	// the local route comes before a route that is over its cap, which is listed last
+	assert.ok(table.indexOf("anthropic/claude-sonnet-5-5") < table.indexOf("strata/qwen3.8-flash-next-iq3_s"));
+	assert.ok(table.indexOf("strata/qwen3.8-flash-next-iq3_s") < table.indexOf("github-copilot/claude-sonnet-5.5"));
+	assert.match(table, /last resort/);
+});
+
+test("buildRoutes keeps a reference the registry does not know, priced as unknown", () => {
+	const models = [{ provider: "anthropic", id: "claude-sonnet-5-5", cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } }];
+	const routes = buildRoutes(["anthropic/claude-sonnet-5-5", "anthropic/claud-sonnet-5-5"], models, [], "anthropic/claud-sonnet-5-5");
+	assert.equal(routes.length, 2);
+	const typo = routes.find((r) => r.ref === "anthropic/claud-sonnet-5-5");
+	assert.equal(typo?.price, "price unknown");
+	assert.match(costTable([], routes), /not in the model registry/);
+});
+
+test("rejectReason names the cap and lists open routes so the task can be re-queued", () => {
+	const cfg = parseConfig(v2Raw);
+	const statuses = [
+		providerStatus(cfg.providers[0], { spend: 151, source: "live", observationIgnored: false }, "credits"),
+		providerStatus(cfg.providers[1], { spend: 6.46, source: "meter", observationIgnored: false }, "metered"),
+	];
+	const models = [
+		{ provider: "anthropic", id: "claude-sonnet-5-5", cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } },
+		{ provider: COPILOT, id: "claude-sonnet-5.5", cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } },
+	];
+	const routes = buildRoutes(["anthropic/claude-sonnet-5-5", "strata/qwen3.8-flash-next-iq3_s"], models, statuses, "strata/qwen3.8-flash-next-iq3_s");
+	const plan = applyDivert({ agent: "worker", model: "github-copilot/claude-sonnet-5.5", task: "a" }, {
+		mode: "reject",
+		localSubagents: ["scout"],
+		subagentRef: "strata/qwen3.8-flash-next-iq3_s",
+		tiers: { [COPILOT]: "divert", anthropic: "ok" },
+		models,
+	});
+	const reason = rejectReason(plan, statuses, routes, "strata/qwen3.8-flash-next-iq3_s");
+	assert.match(reason, /over the monthly cap on copilot 101%/);
+	assert.match(reason, /worker -> github-copilot/);
+	assert.match(reason, /anthropic\/claude-sonnet-5-5 \(\$3\/\$15 per Mtok/);
+	assert.match(reason, /Local fallback: strata\/qwen3\.8-flash-next-iq3_s/);
+	assert.ok(reason.split("\n").length <= 3, "reason stays one paragraph");
+});
+
+test("menuModelRefs prefers the configured list, else the agent settings, and dedupes", () => {
+	const cfg = parseConfig(v2Raw);
+	const overrides = parseAgentOverrideModels({ subagents: { agentOverrides: { oracle: { model: "github-copilot/claude-sonnet-5.5" }, scout: { model: "strata/qwen3.8-flash-next-iq3_s" }, broken: {} } } });
+	assert.deepEqual(overrides, ["github-copilot/claude-sonnet-5.5", "strata/qwen3.8-flash-next-iq3_s"]);
+	assert.deepEqual(parseAgentOverrideModels(undefined), []);
+	assert.deepEqual(parseAgentOverrideModels({ subagents: "nope" }), []);
+
+	const refs = menuModelRefs(cfg, overrides, "strata/qwen3.8-flash-next-iq3_s:xhigh");
+	assert.deepEqual(refs, ["strata/qwen3.8-flash-next-iq3_s", "github-copilot/claude-sonnet-5.5"]);
+
+	const pinned = parseConfig({ ...v2Raw, advisory: { models: ["mistral/magistral-medium-latest", "anthropic/claude-sonnet-5-5", "mistral/other"] } });
+	assert.deepEqual(menuModelRefs(pinned, overrides, undefined), ["mistral/magistral-medium-latest", "anthropic/claude-sonnet-5-5", "mistral/other"]);
+	const tight = parseConfig({ ...v2Raw, advisory: { models: ["a/x", "b/y", "c/z"], maxModels: 2 } });
+	assert.deepEqual(menuModelRefs(tight, [], undefined), ["a/x", "b/y"]);
 });

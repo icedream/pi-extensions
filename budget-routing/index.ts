@@ -1,50 +1,62 @@
 /**
- * Budget routing for a monthly spend cap on one provider (default: GitHub Copilot).
+ * Budget routing for monthly spend caps on one or more paid providers at the same time.
  *
- * Tiers, by fraction of monthlyCapUsd (thresholds are configurable):
- *   nudge   - advisory prompt section: prefer the local model for light subagents
+ * Tiers, by fraction of a provider's monthlyCapUsd (thresholds are configurable):
+ *   nudge   - advisory prompt section: name the priced routes before work is fanned out
  *   warn    - notification
- *   prepare - compact the main session while the provider still works (between agent runs)
- *   divert  - rewrite light subagent launches to the local model; block other launches for the
- *             provider; offer to switch the main session to the local model (confirmation required)
+ *   prepare - compact the main session while that provider still works (between agent runs)
+ *   divert  - launches that would spend that provider are rejected with the open routes listed
+ *             (`enforce: "reject"`), or local-eligible launches are rewritten to the local model
+ *             (`enforce: "rewrite"`), or nothing is done (`enforce: "off"`)
+ *
+ * A provider entry with no monthlyCapUsd is tracked and priced but never capped.
  *
  * Config: ~/.pi/agent/budget-routing.json (override with PI_BUDGET_ROUTING_CONFIG). Without a config
  * file the extension does nothing. See budget-routing.example.json and README.md.
  */
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	applyDivert,
+	advisorySection,
+	billingFor,
+	buildRoutes,
+	costTable,
 	DEFAULT_SEAT,
 	loadConfig,
-	monthSpend,
+	menuModelRefs,
+	monthSpendAll,
+	parseAgentOverrideModels,
 	preSwitchCompactionStep,
+	providerStatus,
+	rejectReason,
 	statusLabel,
-	tierFor,
 	type BudgetConfig,
 	type CredentialSource,
 	type MonthSpend,
+	type ProviderStatus,
+	type RegistryModelLike,
 	type SeatFigure,
 	type Tier,
 } from "./budget.ts";
 import { fetchCopilotSeat, isCopilotProvider } from "./seat.ts";
 import { resolveGitHubToken } from "./credential.ts";
 
-const AGENT_DIR = join(homedir(), ".pi", "agent");
+const AGENT_DIR = process.env.PI_BUDGET_ROUTING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 const SESSIONS_DIR = join(AGENT_DIR, "sessions");
 const CONFIG_PATH = process.env.PI_BUDGET_ROUTING_CONFIG ?? join(AGENT_DIR, "budget-routing.json");
 const CACHE_MS = 120_000;
-const STATUS_KEY = "budget-routing";
+const STATUS_PREFIX = "budget-routing";
+const SECTION_TAG = "budget";
+const TOOL_NAME = "budget";
 
-interface State {
-	tier: Tier;
-	pct: number;
-	spend: number;
+interface Snapshot {
 	cfg: BudgetConfig;
-	observationIgnored: boolean;
-	source: MonthSpend["source"];
+	statuses: ProviderStatus[];
 }
 
 interface SeatResult {
@@ -54,40 +66,42 @@ interface SeatResult {
 	note: string;
 }
 
-let cache: { at: number; key: string; result: MonthSpend } | undefined;
+/** One slot for the whole provider set: the tree is walked once, so partial caching would cost more walks. */
+let cache: { at: number; key: string; spend: Map<string, MonthSpend> } | undefined;
 
-/** Last figure fetched from GitHub. In memory only: the config file is never written. */
-let seatFigure: SeatFigure | undefined;
-let seatFetchMs = 0;
+/** Figures fetched from providers this session. In memory only: the config file is never written. */
+const seatFigures = new Map<string, SeatFigure>();
+const seatFetchMs = new Map<string, number>();
 
-async function cachedSpend(cfg: BudgetConfig): Promise<MonthSpend> {
-	const key = JSON.stringify([cfg.provider, cfg.observed ?? null, seatFigure ?? null]);
-	if (cache && cache.key === key && Date.now() - cache.at < CACHE_MS) return cache.result;
-	const result = await monthSpend(cfg, SESSIONS_DIR, new Date(), seatFigure);
-	cache = { at: Date.now(), key, result };
-	return result;
+function configKey(cfg: BudgetConfig): string {
+	const entries = cfg.providers.map((pb) => [pb.provider, pb.monthlyCapUsd ?? null, pb.reset, pb.observed?.asOfMs ?? null, pb.observed?.creditsUsed ?? null]);
+	return JSON.stringify([entries, [...seatFigures.entries()].map(([p, f]) => [p, f.creditsUsed, f.asOfMs])]);
+}
+
+async function spendAll(cfg: BudgetConfig): Promise<Map<string, MonthSpend>> {
+	const key = configKey(cfg);
+	if (cache && cache.key === key && Date.now() - cache.at < CACHE_MS) return cache.spend;
+	const spend = await monthSpendAll(cfg, SESSIONS_DIR, new Date(), seatFigures);
+	cache = { at: Date.now(), key, spend };
+	return spend;
 }
 
 /** undefined when no config file exists. Throws when the config is invalid or logs cannot be read. */
-async function currentState(): Promise<State | undefined> {
+async function currentSnapshot(models: readonly RegistryModelLike[]): Promise<Snapshot | undefined> {
 	if (!existsSync(CONFIG_PATH)) return undefined;
 	const cfg = await loadConfig(CONFIG_PATH);
-	const m = await cachedSpend(cfg);
-	const frac = m.spend / cfg.monthlyCapUsd;
-	return {
-		tier: tierFor(frac, cfg.thresholds),
-		pct: Math.round(frac * 100),
-		spend: m.spend,
-		cfg,
-		observationIgnored: m.observationIgnored,
-		source: m.source,
-	};
+	const spend = await spendAll(cfg);
+	const statuses = cfg.providers.map((pb) =>
+		providerStatus(pb, spend.get(pb.provider) ?? { spend: 0, source: "meter", observationIgnored: false }, billingFor(pb, models)),
+	);
+	return { cfg, statuses };
 }
 
 export default function (pi: ExtensionAPI) {
 	const announced = new Set<string>();
-	let compactedThisCrossing = false;
-	let seatInFlight: Promise<SeatResult> | undefined;
+	const compacted = new Map<string, boolean>();
+	let seatInFlight: Promise<SeatResult[]> | undefined;
+	const activeStatusKeys = new Set<string>();
 
 	function notifyOnce(ctx: ExtensionContext, key: string, message: string, severity: "info" | "warning" | "error" = "warning") {
 		if (announced.has(key)) return;
@@ -95,90 +109,101 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(`budget-routing: ${message}`, severity);
 	}
 
-	/** Footer indicator next to the session cost, coloured by tier. Cleared when there is no config. */
-	function updateStatus(ctx: ExtensionContext, st: State | undefined): void {
-		if (!st) {
-			ctx.ui.setStatus(STATUS_KEY, undefined);
-			return;
+	/** One footer indicator per provider, coloured by tier. Cleared for providers no longer configured. */
+	function updateStatus(ctx: ExtensionContext, snap: Snapshot | undefined): void {
+		const seen = new Set<string>();
+		for (const s of snap?.statuses ?? []) {
+			const key = `${STATUS_PREFIX}/${s.provider}`;
+			const label = statusLabel(s);
+			ctx.ui.setStatus(key, ctx.ui.theme.fg(label.color, label.text));
+			seen.add(key);
 		}
-		const label = statusLabel(st.cfg.provider, st.pct, st.tier, st.source);
-		ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg(label.color, label.text));
+		for (const stale of activeStatusKeys) if (!seen.has(stale)) ctx.ui.setStatus(stale, undefined);
+		activeStatusKeys.clear();
+		for (const k of seen) activeStatusKeys.add(k);
 	}
 
 	function refreshStatus(ctx: ExtensionContext): Promise<void> {
-		return safeState(ctx).then((st) => updateStatus(ctx, st));
+		return safeSnapshot(ctx).then((snap) => updateStatus(ctx, snap));
 	}
 
 	/** Fetch at most once at a time; a second caller joins the run already in flight. */
-	function refreshSeat(ctx: ExtensionContext, force = false): Promise<SeatResult> {
+	function refreshSeats(ctx: ExtensionContext, force = false): Promise<SeatResult[]> {
 		if (seatInFlight) return seatInFlight;
-		seatInFlight = doRefreshSeat(ctx, force).finally(() => {
+		seatInFlight = doRefreshSeats(ctx, force).finally(() => {
 			seatInFlight = undefined;
 		});
 		return seatInFlight;
 	}
 
 	/**
-	 * Fetches the seat figure and, when the config's `seat` block allows it, writes it into that file
-	 * and commits. Never throws: it runs off the agent path, so every failure resolves with ok:false
-	 * and a note. GitHub is contacted only while the configured provider is github-copilot.
+	 * Refreshes every provider whose entry has a `seat` block. Never throws: it runs off the agent
+	 * path, so each failure resolves with ok:false and a note. GitHub is contacted only for Copilot.
 	 */
-	async function doRefreshSeat(ctx: ExtensionContext, force: boolean): Promise<SeatResult> {
-		if (!existsSync(CONFIG_PATH)) return { ok: false, note: "no config file" };
+	async function doRefreshSeats(ctx: ExtensionContext, force: boolean): Promise<SeatResult[]> {
+		if (!existsSync(CONFIG_PATH)) return [{ ok: false, note: "no config file" }];
 		let cfg: BudgetConfig;
 		try {
 			cfg = await loadConfig(CONFIG_PATH);
 		} catch (err) {
-			return { ok: false, note: (err as Error).message };
+			return [{ ok: false, note: (err as Error).message }];
 		}
-		if (!isCopilotProvider(cfg.provider)) {
-			return { ok: false, note: `provider is ${cfg.provider}, so the GitHub credential is not used` };
-		}
-		if (!cfg.seat && !force) return { ok: false, note: "no seat block in the config: automatic refresh is off" };
-		const seat = cfg.seat ?? DEFAULT_SEAT;
-		if (!force && Date.now() - seatFetchMs < seat.refreshMinutes * 60_000) return { ok: true, note: "figure is fresh" };
+		const out: SeatResult[] = [];
+		for (const pb of cfg.providers) {
+			if (!isCopilotProvider(pb.provider)) {
+				if (pb.seat) out.push({ ok: false, note: `${pb.provider}: the GitHub seat fetch is not used for this provider` });
+				continue;
+			}
+			if (!pb.seat && !force) continue;
+			if (!force && Date.now() - (seatFetchMs.get(pb.provider) ?? 0) < (pb.seat ?? DEFAULT_SEAT).refreshMinutes * 60_000) {
+				out.push({ ok: true, note: "figure is fresh" });
+				continue;
+			}
+			const seat = pb.seat ?? DEFAULT_SEAT;
+			let token: string;
+			let source: Exclude<CredentialSource, "auto">;
+			try {
+				({ token, source } = await resolveGitHubToken(AGENT_DIR, seat.credential, pb.provider));
+			} catch (err) {
+				notifyOnce(ctx, `seat-credential:${pb.provider}`, `seat refresh skipped: ${(err as Error).message}`);
+				out.push({ ok: false, note: (err as Error).message });
+				continue;
+			}
+			let fig: SeatFigure;
+			try {
+				fig = await fetchCopilotSeat(token);
+			} catch (err) {
+				notifyOnce(ctx, `seat-fetch:${pb.provider}`, `seat refresh failed: ${(err as Error).message}`);
+				out.push({ ok: false, note: (err as Error).message });
+				continue;
+			}
+			seatFetchMs.set(pb.provider, Date.now());
+			seatFigures.set(pb.provider, fig);
+			cache = undefined;
 
-		let token: string;
-		let source: Exclude<CredentialSource, "auto">;
-		try {
-			({ token, source } = await resolveGitHubToken(AGENT_DIR, seat.credential, cfg.provider));
-		} catch (err) {
-			notifyOnce(ctx, "seat-credential", `seat refresh skipped: ${(err as Error).message}`);
-			return { ok: false, note: (err as Error).message };
+			const usdPerCredit = pb.observed?.usdPerCredit ?? 0.01;
+			const capFromSeat = fig.entitlement * usdPerCredit;
+			if (pb.monthlyCapUsd !== undefined && Math.abs(capFromSeat - pb.monthlyCapUsd) > 0.005) {
+				notifyOnce(
+					ctx,
+					`seat-cap-drift:${pb.provider}`,
+					`seat entitlement is ${fig.entitlement} credits ($${capFromSeat.toFixed(2)}) but ${pb.provider}.monthlyCapUsd is $${pb.monthlyCapUsd}. Align the cap with the seat if you want it to track it.`,
+				);
+			}
+			const pct = Math.round((fig.creditsUsed / fig.entitlement) * 100);
+			out.push({
+				ok: true,
+				figure: fig,
+				source,
+				note: `${fig.login}: ${fig.creditsUsed}/${fig.entitlement} credits (${pct}%), ${fig.remaining} left, as of ${new Date(fig.asOfMs).toISOString()}, credential from ${source}`,
+			});
 		}
-
-		let fig: SeatFigure;
-		try {
-			fig = await fetchCopilotSeat(token);
-		} catch (err) {
-			notifyOnce(ctx, "seat-fetch", `seat refresh failed: ${(err as Error).message}`);
-			return { ok: false, note: (err as Error).message };
-		}
-		seatFetchMs = Date.now();
-		seatFigure = fig;
-
-		const usdPerCredit = cfg.observed?.usdPerCredit ?? 0.01;
-		const capFromSeat = fig.entitlement * usdPerCredit;
-		if (Math.abs(capFromSeat - cfg.monthlyCapUsd) > 0.005) {
-			notifyOnce(
-				ctx,
-				"seat-cap-drift",
-				`seat entitlement is ${fig.entitlement} credits ($${capFromSeat.toFixed(2)}) but monthlyCapUsd is $${cfg.monthlyCapUsd}. Align monthlyCapUsd with the seat if you want the cap to track it.`,
-			);
-		}
-
-		const pct = Math.round((fig.creditsUsed / fig.entitlement) * 100);
-		return {
-			ok: true,
-			figure: fig,
-			source,
-			note: `${fig.login}: ${fig.creditsUsed}/${fig.entitlement} credits (${pct}%), ${fig.remaining} left, as of ${new Date(fig.asOfMs).toISOString()}, credential from ${source}`,
-		};
+		return out;
 	}
 
-	async function safeState(ctx: ExtensionContext): Promise<State | undefined> {
+	async function safeSnapshot(ctx: ExtensionContext): Promise<Snapshot | undefined> {
 		try {
-			return await currentState();
+			return await currentSnapshot(ctx.modelRegistry.getAll());
 		} catch (err) {
 			if (!announced.has("error")) {
 				announced.add("error");
@@ -188,49 +213,102 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	/** Route menu: the configured list, or the models Pi's agent settings already point agents at. */
+	async function routesFor(ctx: ExtensionContext, snap: Snapshot): Promise<ReturnType<typeof buildRoutes>> {
+		let overrides: unknown;
+		try {
+			overrides = JSON.parse(await readFile(join(AGENT_DIR, "settings.json"), "utf8"));
+		} catch {
+			overrides = undefined;
+		}
+		const refs = menuModelRefs(snap.cfg, parseAgentOverrideModels(overrides), ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
+		return buildRoutes(refs, ctx.modelRegistry.getAll(), snap.statuses, snap.cfg.localModel.subagentRef);
+	}
+
+	function monthKey(): string {
+		const d = new Date();
+		return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+	}
+
 	pi.on("session_start", async (_event, ctx) => {
 		announced.clear();
-		compactedThisCrossing = false;
-		void refreshSeat(ctx).then(() => refreshStatus(ctx));
+		compacted.clear();
+		void refreshSeats(ctx)
+			.then(() => refreshStatus(ctx))
+			.catch(() => undefined);
+	});
+
+	pi.registerCommand("budget", {
+		description: "Spend, caps and priced routes for every tracked provider",
+		handler: async (_args, ctx) => {
+			const snap = await safeSnapshot(ctx);
+			if (!snap) {
+				ctx.ui.notify(`budget-routing: no config at ${CONFIG_PATH}`, "warning");
+				return;
+			}
+			ctx.ui.notify(costTable(snap.statuses, await routesFor(ctx, snap)), "info");
+		},
 	});
 
 	pi.registerCommand("budget-seat", {
 		description: "Fetch the GitHub Copilot seat figure now and report it",
 		handler: async (_args, ctx) => {
-			const r = await refreshSeat(ctx, true);
-			ctx.ui.notify(`Copilot seat: ${r.note}`, r.ok ? "info" : "warning");
+			const results = await refreshSeats(ctx, true);
+			const usable = results.filter((r) => r.note !== undefined);
+			ctx.ui.notify(usable.map((r) => `${r.ok ? "ok" : "failed"}: ${r.note}`).join(" | ") || "no seat block configured", usable.some((r) => r.ok) ? "info" : "warning");
 		},
 	});
 
-	// Nudge the model and notify. At divert, offer the main-session switch.
+	pi.registerTool({
+		name: TOOL_NAME,
+		label: "Budget",
+		description:
+			"Current month-to-date spend, cap state and priced route models for every provider this session is billed on. Read it before routing work to another model.",
+		promptSnippet: "Look up provider cap state and the priced model routes before orchestrating subagent work onto another model.",
+		promptGuidelines: [
+			"Use the budget tool when choosing which provider or model a subagent should run on, or when a subagent launch was rejected for spending a provider over its cap.",
+			"Do not re-read the budget tool inside one turn; its numbers only move between turns.",
+		],
+		parameters: Type.Object({
+			action: Type.Optional(Type.String({ description: `"status" for the cap table (default), "models" for the cap table plus the priced route menu` })),
+		}),
+		execute: async (_id, params, _signal, _onUpdate, ctx) => {
+			const snap = await safeSnapshot(ctx);
+			if (!snap) return { content: [{ type: "text", text: `budget-routing: no config at ${CONFIG_PATH}` }], details: undefined };
+			const withRoutes = params?.action !== "status";
+			const table = costTable(snap.statuses, withRoutes ? await routesFor(ctx, snap) : []);
+			return { content: [{ type: "text", text: table }], details: { statuses: snap.statuses } };
+		},
+	});
+
+	// Nudge the model with the quantized state, and offer the main-session switch at divert.
 	pi.on("before_agent_start", async (event, ctx) => {
-		const st = await safeState(ctx);
-		updateStatus(ctx, st);
-		if (st?.observationIgnored && !announced.has("stale-observation")) {
-			announced.add("stale-observation");
-			ctx.ui.notify(
-				"budget-routing: the seat figure is from another month and was ignored. Fix the seat fetch, or update observed.asOf.",
-				"warning",
-			);
-		}
-		if (!st || st.tier === "ok") return;
+		const snap = await safeSnapshot(ctx);
+		updateStatus(ctx, snap);
+		if (!snap) return;
+		const month = monthKey();
 
-		const t = st.cfg.localModel;
-		event.systemPromptOptions.appendSystemPrompt +=
-			`\n\n## Budget (automatic, advisory)\n` +
-			`${st.cfg.provider} spend is ${st.pct}% of the monthly cap (state: ${st.tier}, figure: ${st.source}). ` +
-			`Prefer the local model (${t.subagentRef}) for ${st.cfg.localSubagents.join(", ")}. ` +
-			`Avoid unnecessary ${st.cfg.provider} subagent launches.`;
-
-		if (!announced.has(st.tier)) {
-			announced.add(st.tier);
-			ctx.ui.notify(`${st.cfg.provider} budget at ${st.pct}% (${st.tier})`, st.tier === "nudge" ? "info" : "warning");
+		for (const s of snap.statuses) {
+			if (s.observationIgnored) {
+				notifyOnce(ctx, `stale-observation:${s.provider}:${month}`, `the figure for ${s.provider} is from another month and was ignored. Fix the seat fetch, or update observed.asOf.`);
+			}
+			if (s.tier !== "ok") {
+				const severity = s.tier === "nudge" ? "info" : "warning";
+				notifyOnce(ctx, `${s.tier}:${s.provider}:${month}`, `${s.provider} budget at ${s.pct}% (${s.tier})`, severity);
+			}
 		}
 
-		if (st.tier === "divert" && ctx.model?.provider === st.cfg.provider) {
+		event.systemPromptOptions.sections = {
+			...(event.systemPromptOptions.sections ?? {}),
+			[SECTION_TAG]: advisorySection(snap.statuses, snap.cfg.localModel.subagentRef, TOOL_NAME),
+		};
+
+		const mine = snap.statuses.find((s) => s.provider === ctx.model?.provider);
+		if (mine?.tier === "divert") {
+			const t = snap.cfg.localModel;
 			const ok = await ctx.ui.confirm(
 				"Monthly cap reached",
-				`Switch the main session to local ${t.modelId}? Pre-switch compaction ${compactedThisCrossing ? "is done" : "was NOT done"}.`,
+				`${mine.provider} is at ${mine.pct}% of its cap. Switch the main session to ${t.provider}/${t.modelId}? Pre-switch compaction ${compacted.get(mine.provider) ? "is done" : "was NOT done"}.`,
 			);
 			if (ok) {
 				const target = ctx.modelRegistry.find(t.provider, t.modelId);
@@ -243,55 +321,70 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// Compact while the provider still works, before the cap blocks calls. Runs between agent runs.
+	// Compact while the provider the session is spending still works, before its cap blocks calls.
 	pi.on("agent_end", async (_event, ctx) => {
-		const st = await safeState(ctx);
-		const step = preSwitchCompactionStep(st?.tier, ctx.model?.provider, st?.cfg.provider, compactedThisCrossing);
-		compactedThisCrossing = step.compacted;
-		if (!step.compact || !st) return;
-		ctx.ui.notify(`${st.cfg.provider} at ${st.pct}%: compacting before any local switch`, "warning");
+		const snap = await safeSnapshot(ctx);
+		if (!snap) return;
+		const provider = ctx.model?.provider;
+		if (!provider) return;
+		const mine = snap.statuses.find((s) => s.provider === provider);
+		const step = preSwitchCompactionStep(mine, compacted.get(provider) ?? false);
+		if (step.compacted) compacted.set(provider, true);
+		else compacted.delete(provider);
+		if (!step.compact || !mine) return;
+		ctx.ui.notify(`${provider} at ${mine.pct}%: compacting before any switch`, "warning");
 		ctx.compact({
 			customInstructions: "Keep the current task, decisions, file paths, and open todos. Be compact.",
 			onComplete: () => ctx.ui.notify("Pre-switch compaction complete", "info"),
 			onError: (err) => {
-				compactedThisCrossing = false;
+				compacted.delete(provider);
 				ctx.ui.notify(`Pre-switch compaction failed: ${err.message}`, "error");
 			},
 		});
 	});
 
-	// Keep the seat figure current between runs. Off the critical path: the next turn sees it because
-	// currentState() re-reads the config file.
+	// Keep the fetched figures current between runs. Off the critical path: the next turn sees it
+	// because currentSnapshot() re-reads the config file.
 	pi.on("agent_settled", async (_event, ctx) => {
-		void refreshSeat(ctx).then(() => refreshStatus(ctx));
+		void refreshSeats(ctx)
+			.then(() => refreshStatus(ctx))
+			.catch(() => undefined);
 	});
 
-	// At divert: launches that would spend the capped provider are rewritten to the local model when
-	// their agent is local-eligible, and blocked otherwise. Launches already aimed at another provider
-	// cost nothing against this cap and are left alone.
+	// A launch that would spend a provider over its cap is handled per `enforce`. Launches aimed at
+	// another provider cost nothing against that cap and are left alone.
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "subagent") return undefined;
-		const st = await safeState(ctx);
-		if (!st || st.tier !== "divert") return undefined;
+		const snap = await safeSnapshot(ctx);
+		if (!snap || snap.cfg.enforce === "off") return undefined;
+
+		const tiers: Record<string, Tier> = {};
+		for (const s of snap.statuses) if (s.capUsd !== undefined) tiers[s.provider] = s.tier;
 
 		const plan = applyDivert((event as unknown as { input?: unknown }).input, {
-			localSubagents: st.cfg.localSubagents,
-			subagentRef: st.cfg.localModel.subagentRef,
-			budgetProvider: st.cfg.provider,
+			mode: snap.cfg.enforce,
+			localSubagents: snap.cfg.localSubagents,
+			subagentRef: snap.cfg.localModel.subagentRef,
+			tiers,
 			sessionProvider: ctx.model?.provider,
 			models: ctx.modelRegistry.getAll(),
 		});
-		if (plan.blocked.length > 0) {
-			return {
-				block: true,
-				reason:
-					`${st.cfg.provider} cap reached (${st.pct}%). Blocked launches: ${plan.blocked.join(", ")}. ` +
-					`Local-eligible: ${st.cfg.localSubagents.join(", ")}. Launches with an explicit model from another ` +
-					`provider are not blocked: pass model as "<other-provider>/<model-id>". Raise monthlyCapUsd in ` +
-					`budget-routing.json to allow ${st.cfg.provider} launches again.` +
-					(plan.passed.length > 0 ? ` Already allowed: ${plan.passed.join(", ")}.` : ""),
-			};
-		}
-		return undefined;
+		if (plan.rejected.length === 0) return undefined;
+		return { block: true, reason: rejectReason(plan, snap.statuses, await routesFor(ctx, snap), snap.cfg.localModel.subagentRef) };
+	});
+
+	// The model asks for models exactly when it is about to route work. Prices belong in that answer,
+	// not in every prompt.
+	pi.on("tool_result", async (event, ctx) => {
+		if (event.toolName !== "subagent") return undefined;
+		const input = (event as unknown as { input?: { action?: unknown } }).input;
+		if (typeof input?.action !== "string" || input.action !== "models") return undefined;
+		const snap = await safeSnapshot(ctx);
+		if (!snap) return undefined;
+		const table = costTable(snap.statuses, await routesFor(ctx, snap));
+		return {
+			content: [...event.content, { type: "text", text: `budget-routing:\n${table}` }],
+			structuredContent: event.structuredContent,
+		};
 	});
 }
