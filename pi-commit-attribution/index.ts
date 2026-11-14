@@ -23,6 +23,7 @@ import { pathToFileURL, fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { VERSION } from "@earendil-works/pi-coding-agent";
 import { assistedBy, finalizeLines, resolveModel } from "./format.mjs";
+import { committedMergeState } from "./merge.mjs";
 import type { ModelCatalog } from "./format.mjs";
 import { configPath, loadConfig, type AttributionConfig } from "./config.ts";
 import { git } from "./git.ts";
@@ -30,7 +31,7 @@ import { CHAINED_HOOKS, farmIsCurrent, inventory, repoHookDirs, writeFarm, type 
 import { applyInjection, MARKER, planInjection, readInjection } from "./inject.ts";
 import { appendEntries, diffSnapshot, ledgerTarget, prune, readEntries, snapshot, unclaimedPaths } from "./ledger.ts";
 import { DELEGATION_TOOL, delegatedModels, delegatedSessionId, splitModelSpec } from "./delegate.ts";
-import { attributionHome, hooksDir, writeState } from "./state.ts";
+import { attributionHome, hooksDir, writeCatalog, writeState } from "./state.ts";
 
 const STATUS_KEY = "pi-commit-attribution";
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -129,6 +130,7 @@ export default function (pi: ExtensionAPI) {
 		session.childrenRegistered = Boolean(children);
 		if (!children) session.problems.push("pi-subagents' required-child-extension API was not reached, so a background subagent will not record its own line");
 		session.catalog = catalogFromRegistry(ctx.modelRegistry);
+		writeCatalog(session.catalog.providers ?? {}, session.home);
 		const common = ledgerTarget(ctx.cwd);
 		if (common) prune(common);
 		// The baseline is taken before anything can change, so the first observation after a write is a
@@ -286,6 +288,8 @@ export default function (pi: ExtensionAPI) {
 		const [sha, message] = head.stdout.split("\0");
 		if (message.includes("Assisted-by:") || session.checkedCommits.has(sha)) return;
 		session.checkedCommits.add(sha);
+		// A merge the agent did not touch is git's own result, and it is meant to carry no line.
+		if (committedMergeState(ctx.cwd, sha) === "clean") return;
 		ctx.ui.notify(`pi-commit-attribution: ${sha.slice(0, 8)} has no Assisted-by trailer; the command reached git without the injected hooks (${command.slice(0, 60)})`, "warning");
 	}
 

@@ -454,6 +454,69 @@ else
 	printf '  --   no ssh-keygen available, signing not exercised\n'
 fi
 
+# ---------------------------------------------------------------- merges, and the names a session uses
+
+echo
+echo "merges, and the names a session uses"
+
+# Pi's registry names a model that models.json never lists. The hook reads the session's snapshot of it.
+cat >"$HOME_DIR/catalog.json" <<'JSON'
+{"schema":1,"updatedAt":"now","providers":{"test-builtin":{"baseUrl":"https://api.example.com/v1","models":[{"id":"claude-haiku-5-5","name":"Claude Haiku 5.5"}]}}}
+JSON
+session_env claude-haiku-5-5 test-builtin
+new_repo "$WORK/names"
+(
+	cd "$WORK/names"
+	echo seed >seed.txt
+	git add seed.txt
+	git commit -q -m "chore: seed"
+	echo more >more.txt
+	git add more.txt
+	git commit -q -m "feat: named by the registry"
+)
+m=$(msg_of "$WORK/names")
+has "$m" "Assisted-by: pi 1.4.0-test / Claude Haiku 5.5 (cloud, Test Builtin)" && ok "a model models.json does not list is named as Pi's registry names it" || no "a model models.json does not list is named as Pi's registry names it" "$m"
+! has "$m" "Haiku 5 5" && ok "a hyphenated version is not split into two words" || no "a hyphenated version is not split into two words" "$m"
+
+session_env test-model-5 test-cloud
+new_repo "$WORK/merges"
+(
+	cd "$WORK/merges"
+	echo base >base.txt
+	git add base.txt
+	git commit -q -m "chore: base"
+	git checkout -q -b side
+	echo side >side.txt
+	git add side.txt
+	git commit -q -m "feat: side"
+	git checkout -q main
+	echo main >main.txt
+	git add main.txt
+	git commit -q -m "feat: main"
+	git merge -q --no-ff -m "Merge side" side
+)
+m=$(msg_of "$WORK/merges")
+[ "$(git -C "$WORK/merges" log -1 --format=%s)" = "Merge side" ] && ok "a clean merge is committed by git" || no "a clean merge is committed by git" "$m"
+! has "$m" "Assisted-by:" && ok "a clean merge the agent ran carries no Assisted-by" || no "a clean merge the agent ran carries no Assisted-by" "$m"
+
+# A conflict resolved by the agent is its work, so the merge carries the model line.
+(
+	cd "$WORK/merges"
+	base_sha=$(git rev-list --max-parents=0 HEAD)
+	git checkout -q -b clash "$base_sha"
+	echo clash >base.txt
+	git commit -q -am "feat: clash edits base"
+	git checkout -q main
+	echo main-edit >base.txt
+	git commit -q -am "feat: main edits base"
+	git merge -q --no-ff -m "Merge clash" clash >/dev/null 2>&1
+	echo resolved >base.txt
+	git add base.txt
+	git commit -q --no-edit
+)
+m=$(msg_of "$WORK/merges")
+has "$m" "$CLOUD_LINE" && ok "a merge with a conflict the agent resolved carries the model line" || no "a merge with a conflict the agent resolved carries the model line" "$m"
+
 # ---------------------------------------------------------------- cost
 
 echo

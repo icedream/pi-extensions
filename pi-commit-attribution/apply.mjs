@@ -23,6 +23,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { assistedBy, finalizeLines, operatedBy, resolveModel } from "./format.mjs";
+import { pendingMergeState } from "./merge.mjs";
 
 const hookName = process.argv[2] || "";
 const hookArgs = process.argv.slice(3);
@@ -69,11 +70,17 @@ function attribute() {
 	const repoEmail = gitConfig("user.email");
 
 	const lines = [];
-	const model = resolveModel({ provider: process.env.PI_PROVIDER ?? "", id: process.env.PI_MODEL }, { catalog, providers: config.providers, models: config.models, localDomains: Array.isArray(config.localDomains) ? config.localDomains : [] });
-	lines.push(assistedBy(model, { name: state?.tool ?? "pi", version: state?.toolVersion ?? "unknown" }));
-	const fromLedger = ledgerLines();
-	for (const entry of fromLedger) lines.push(entry);
-	debug(`ledger contributed ${fromLedger.length} line(s)`);
+	// A merge the agent did not touch is git's own result, so it gets no model line. The operator line below
+	// is about who ran the session, not what the agent wrote, and stays.
+	if (pendingMergeState(process.cwd()) !== "clean") {
+		const model = resolveModel({ provider: process.env.PI_PROVIDER ?? "", id: process.env.PI_MODEL }, { catalog, providers: config.providers, models: config.models, localDomains: Array.isArray(config.localDomains) ? config.localDomains : [] });
+		lines.push(assistedBy(model, { name: state?.tool ?? "pi", version: state?.toolVersion ?? "unknown" }));
+		const fromLedger = ledgerLines();
+		for (const entry of fromLedger) lines.push(entry);
+		debug(`ledger contributed ${fromLedger.length} line(s)`);
+	} else {
+		debug("clean merge: no model line");
+	}
 
 	// The person driving the session is the identity the repository is configured with. `--author` and
 	// GIT_AUTHOR_* change who a commit is credited to without changing who ran it, and a repository may be
@@ -189,13 +196,23 @@ function readConfig() {
 	return readJson(process.env.PI_ATTRIBUTION_CONFIG || join(homedir(), ".pi", "agent", "attribution.json")) ?? {};
 }
 
-function readState() {
-	const home = process.env.PI_ATTRIBUTION_HOME || join(homedir(), ".pi", "agent", "attribution");
-	return readJson(join(home, "state.json"));
+/** The attribution home, as the farm's hooks were written with it. */
+function attributionHome() {
+	return process.env.PI_ATTRIBUTION_HOME || join(homedir(), ".pi", "agent", "attribution");
 }
 
+function readState() {
+	return readJson(join(attributionHome(), "state.json"));
+}
+
+/**
+ * The operator's models.json, with the session's registry snapshot laid over it per provider. The snapshot
+ * is Pi's own view and names the built-in providers that models.json does not list.
+ */
 function readCatalog() {
-	return readJson(process.env.PI_ATTRIBUTION_MODELS ?? process.env.PI_MODELS_JSON ?? join(homedir(), ".pi", "agent", "models.json"));
+	const declared = readJson(process.env.PI_ATTRIBUTION_MODELS ?? process.env.PI_MODELS_JSON ?? join(homedir(), ".pi", "agent", "models.json"));
+	const snapshot = readJson(join(attributionHome(), "catalog.json"));
+	return { providers: { ...(declared?.providers ?? {}), ...(snapshot?.providers ?? {}) } };
 }
 
 /** @param {string} text */

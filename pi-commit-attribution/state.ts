@@ -5,7 +5,8 @@
  * the trailer. Getting that from `pi --version` would start another Pi per commit, so the session writes
  * it here once. The paths to config and catalog are baked into the generated hooks instead, because they
  * are fixed for the life of the farm. Everything else the hook reads from the environment Pi already
- * sets (`PI_PROVIDER`, `PI_MODEL`) and from Pi's own model catalog.
+ * sets (`PI_PROVIDER`, `PI_MODEL`), from `models.json`, and from `catalog.json`: the session's snapshot of
+ * Pi's model registry, which names the models Pi ships with.
  */
 
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -35,6 +36,21 @@ export interface SessionState {
 	/** Written by the session that wrote this file, so a status line can say which one is current. */
 	sessionId: string;
 	updatedAt: string;
+}
+
+export function catalogPath(home = attributionHome()): string {
+	return join(home, "catalog.json");
+}
+
+/**
+ * Pi's model registry, grouped by provider and shaped like `models.json`. It names the models Pi ships
+ * with, which `models.json` does not list, so the hook needs it to name them the way the session does.
+ */
+export function writeCatalog(providers: Record<string, unknown>, home = attributionHome()): string {
+	const path = catalogPath(home);
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, `${JSON.stringify({ schema: SCHEMA, updatedAt: new Date().toISOString(), providers })}\n`);
+	return path;
 }
 
 export function writeState(state: Omit<SessionState, "schema" | "updatedAt">, home = attributionHome()): string {

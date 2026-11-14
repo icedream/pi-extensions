@@ -44,8 +44,13 @@ The hooks then do two things in this order:
 2. Add the trailers with `git interpret-trailers`, and only when the process also carries Pi's
    `PI_MODEL`. A human at a terminal gets nothing, and so do Pi's own internal git calls.
 
-The model name comes from Pi's model catalog, cloud or local from the address that catalog reports, and
-the version from the running Pi. A commit that is amending an existing message (`--amend --no-edit`,
+The model name comes from Pi's model registry, which the session snapshots into the attribution home at
+start (`catalog.json`), so built-in providers are named too; `models.json` fills in what the registry
+lacks. Cloud or local comes from the address that catalog reports, and the version from the running Pi.
+
+A merge that git computed on its own carries no model line: its tree equals what `git merge-tree` gives
+for its parents. A merge with a conflict the agent resolved, or an edit made before the commit, is the
+agent's work and is credited like any other commit. The operator line is written either way. A commit that is amending an existing message (`--amend --no-edit`,
 `git commit -C <sha>`) keeps whatever trailers that message had and gets none of its own; a commit that
 writes a new message, including `--amend -m`, is credited.
 
