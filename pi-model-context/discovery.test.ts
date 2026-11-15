@@ -14,10 +14,13 @@ import {
 	hasNoTextOutput,
 	isDecisionModel,
 	modelsUrlFor,
+	parseRequire,
 	parseModelsPayload,
 	readModelsJsonProviders,
 	reportedContextWindow,
+	reportedCost,
 	reportedInput,
+	reportedReasoning,
 	resolveConfigValue,
 	setDiscoveryFlagInFile,
 	setDiscoveryFlagInText,
@@ -244,6 +247,121 @@ test("a mixed list keeps usable models and reports the skipped ones", () => {
 test("a bare array payload is accepted", () => {
 	const { models } = parseModelsPayload([{ id: "m", meta: { n_ctx: 4096 } }]);
 	assert.equal(models.length, 1);
+});
+
+test("per-token prices become per-Mtok costs", () => {
+	const { models } = parseModelsPayload({
+		data: [
+			{
+				id: "claude-sonnet-5-5",
+				context_length: 1_000_000,
+				pricing: { prompt: "0.0000022", completion: "0.000011", input_cache_read: "0.00000025", input_cache_write: "0.00000275" },
+			},
+		],
+	});
+	assert.deepEqual(models[0].cost, { input: 2.2, output: 11, cacheRead: 0.25, cacheWrite: 2.75 });
+});
+
+test("price strings are rounded, not left as float noise", () => {
+	assert.deepEqual(reportedCost({ pricing: { prompt: "0.000003", completion: "0.000015" } }), {
+		input: 3,
+		output: 15,
+		cacheRead: 0,
+		cacheWrite: 0,
+	});
+	// 1.7985600000000002 would end up in every registered model otherwise.
+	assert.equal(reportedCost({ pricing: { prompt: "0.00000179856", completion: "0.00000359712" } })?.input, 1.79856);
+});
+
+test("dynamic or one-sided pricing leaves a model unpriced", () => {
+	// OpenRouter-style lists put -1 where the price is negotiated per call.
+	assert.equal(reportedCost({ pricing: { prompt: "-1", completion: "-1" } }), undefined);
+	// Half a price would bill one side at zero, so it is not registered as a price either.
+	assert.equal(reportedCost({ pricing: { prompt: "0.000002" } }), undefined);
+	assert.equal(reportedCost({ pricing: { completion: "0.00001" } }), undefined);
+	assert.equal(reportedCost({}), undefined);
+	assert.equal(parseModelsPayload({ data: [{ id: "m", meta: { n_ctx: 4096 } }] }).models[0].cost, undefined);
+});
+
+test("discover.pricing false keeps a provider free despite prices", () => {
+	const priced = { data: [{ id: "m", meta: { n_ctx: 4096 }, pricing: { prompt: "0.000001", completion: "0.000002" } }] };
+	assert.equal(parseModelsPayload(priced, { pricing: false }).models[0].cost, undefined);
+	assert.equal(parseModelsPayload(priced, { pricing: true }).models[0].cost?.input, 1);
+});
+
+test("reportedReasoning reads the levels an endpoint names", () => {
+	assert.deepEqual(
+		reportedReasoning({ opper: { reasoning: { supported: ["low", "medium", "high"] }, capabilities: ["reasoning", "tools"] } }),
+		{ supported: true, levels: ["low", "medium", "high"] },
+	);
+	assert.deepEqual(reportedReasoning({ params: { reasoning: { supported: ["none", "low"] } } }), { supported: true, levels: ["none", "low"] });
+	// A capability list without a level list still says whether the model reasons at all.
+	assert.deepEqual(reportedReasoning({ opper: { reasoning: null, capabilities: ["text"] } }), { supported: false });
+	// Silence keeps the assumption this extension always made before.
+	assert.deepEqual(reportedReasoning({}), { supported: true });
+	assert.deepEqual(reportedReasoning({ opper: { reasoning: { supported: [] }, capabilities: ["reasoning"] } }), { supported: true });
+});
+
+test("the reasoning flag and level list reach the registered model", () => {
+	const { models } = parseModelsPayload({
+		data: [
+			{ id: "thinker", context_length: 1_000_000, opper: { reasoning: { supported: ["low", "high", "xhigh"] }, capabilities: ["reasoning"] } },
+			{ id: "plain", context_length: 8192, opper: { capabilities: ["text"] } },
+		],
+	});
+	assert.deepEqual(models[0].thinkingLevels, ["low", "high", "xhigh"]);
+	assert.equal(models[0].reasoning, true);
+	assert.equal(models[1].reasoning, false);
+	assert.equal(models[1].thinkingLevels, undefined);
+});
+
+test("discover.require narrows an aggregator list by a reported field", () => {
+	const payload = {
+		data: [
+			{ id: "eu-route", context_length: 1000, opper: { gdpr_residency: "EU" } },
+			{ id: "us-route", context_length: 1000, opper: { gdpr_residency: "US" } },
+			{ id: "silent", context_length: 1000 },
+		],
+	};
+	const { models, rejected } = parseModelsPayload(payload, { require: ["opper.gdpr_residency=EU"] });
+	assert.deepEqual(models.map((m) => m.id), ["eu-route"]);
+	assert.equal(rejected.length, 2);
+	assert.match(rejected[1].reason, /gdpr_residency/);
+	// Values compare case-insensitively, and every predicate has to hold.
+	assert.equal(parseModelsPayload(payload, { require: ["opper.gdpr_residency=eu"] }).models.length, 1);
+	assert.equal(parseModelsPayload(payload, { require: ["opper.gdpr_residency=EU", "type=llm"] }).models.length, 0);
+});
+
+test("a require predicate matches any element of an array field", () => {
+	const payload = {
+		data: [
+			{ id: "tooly", context_length: 1000, opper: { capabilities: ["text", "tools"] } },
+			{ id: "plain", context_length: 1000, opper: { capabilities: ["text"] } },
+		],
+	};
+	const { models } = parseModelsPayload(payload, { require: ["opper.capabilities=tools"] });
+	assert.deepEqual(models.map((m) => m.id), ["tooly"]);
+});
+
+test("a malformed require predicate fails instead of matching nothing", () => {
+	assert.throws(() => parseRequire("gdpr_residency"), /not path=value/);
+	assert.throws(() => parseModelsPayload({ data: [] }, { require: ["=EU"] }), /not path=value/);
+	// A value may contain `=`: the path is everything before the first one.
+	assert.deepEqual(parseRequire("a.b=x=y").value, "x=y");
+});
+
+test("a filter that rejects the whole list says the filter is what rejected it", async () => {
+	const realFetch = globalThis.fetch;
+	try {
+		globalThis.fetch = (async () =>
+			new Response(JSON.stringify({ data: [{ id: "m", context_length: 1000 }] }), { status: 200 })) as typeof fetch;
+		await assert.rejects(
+			fetchModels({ id: "p", baseUrl: "http://x/v1", discover: { require: ["opper.gdpr_residency=EU"] } }),
+			/failed discover.require/,
+		);
+	} finally {
+		globalThis.fetch = realFetch;
+	}
 });
 
 test("modelsUrl overrides the discovery URL, and a trailing slash is trimmed", () => {

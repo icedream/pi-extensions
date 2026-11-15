@@ -24,6 +24,12 @@
  * Input modalities come from `architecture.input_modalities`. A model that does not
  * declare image support is registered as text only.
  *
+ * List prices come from `pricing` and are registered as Pi's per-million-token cost, so a
+ * gateway that bills at provider rates is metered rather than showing $0.00. Thinking levels
+ * come from `opper.reasoning.supported` or `params.reasoning.supported` when the endpoint
+ * names them. `discover.require` filters which entries register at all, because a gateway can
+ * list over a thousand models and `/model` cannot show them.
+ *
  * Values written in models.json for a model override what discovery reports, so a
  * context window can be pinned there and survives a refresh.
  *
@@ -38,6 +44,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import {
 	canDiscover,
+	DEFAULT_REFRESH_MINUTES,
 	describeRejections,
 	discoveryFlag,
 	fetchModels,
@@ -72,6 +79,24 @@ interface LastDiscovery {
 	url: string;
 	models: ChatModel[];
 	skipped: RejectedModel[];
+	fetchedAtMs: number;
+}
+
+/** Levels Pi offers in /thinking, in the order it climbs them. */
+const THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+/**
+ * The thinking levels to offer for one model. xhigh and max only reach /thinking when they are
+ * mapped, so an endpoint that names its levels gets exactly those: offering a level the route
+ * rejects turns a thinking-level choice into a failed request. Naming "none" is what lets
+ * thinking be switched off; without a list the previous guess stays.
+ */
+function thinkingLevelMap(levels: string[] | undefined): ChatModel["thinkingLevelMap"] {
+	if (!levels) return { xhigh: "xhigh", max: "max" };
+	const map: Record<string, string | null> = {};
+	for (const level of THINKING_LEVELS) map[level] = levels.includes(level) ? level : null;
+	if (!levels.includes("none")) map.off = null;
+	return map as ChatModel["thinkingLevelMap"];
 }
 
 function toModelConfig(entry: ProviderEntry, model: DiscoveredModel): ChatModel {
@@ -79,14 +104,12 @@ function toModelConfig(entry: ProviderEntry, model: DiscoveredModel): ChatModel 
 		type: "chat",
 		id: model.id,
 		name: model.name,
-		reasoning: true,
+		reasoning: model.reasoning,
 		input: model.input,
-		cost: FREE_COST,
+		cost: model.cost ?? FREE_COST,
 		contextWindow: model.contextWindow,
 		maxTokens: model.maxTokens,
-		// xhigh and max only appear in /thinking when mapped; models that reject them
-		// are overridden per id with modelOverrides in models.json.
-		thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+		thinkingLevelMap: thinkingLevelMap(model.thinkingLevels),
 		...(entry.compat ? { compat: entry.compat as ChatModel["compat"] } : {}),
 	};
 }
@@ -97,6 +120,7 @@ async function registerProvider(
 	entry: ProviderEntry,
 	notify: Notify,
 	last: Map<string, LastDiscovery>,
+	force = false,
 ): Promise<boolean> {
 	let lastModels: ChatModel[] = [];
 
@@ -104,7 +128,7 @@ async function registerProvider(
 		const { models: found, rejected } = await fetchModels(entry, signal);
 		const models = found.map((model) => toModelConfig(entry, model));
 		lastModels = models;
-		last.set(entry.id, { url: modelsUrlFor(entry), models, skipped: rejected });
+		last.set(entry.id, { url: modelsUrlFor(entry), models, skipped: rejected, fetchedAtMs: Date.now() });
 		const unreported = found.filter((model) => !model.maxTokensReported);
 		if (unreported.length > 0) {
 			notify(
@@ -122,16 +146,27 @@ async function registerProvider(
 		return models;
 	};
 
+	// The factory fetch blocks startup, and session_start would fetch the same list again a second
+	// later, so a recent list in this process is reused. A forced refresh goes past it.
+	const cached = last.get(entry.id);
+	const reuseMs = (entry.discover?.refreshMinutes ?? DEFAULT_REFRESH_MINUTES) * 60_000;
+	const reused = !force && cached !== undefined && cached.models.length > 0 && Date.now() - cached.fetchedAtMs < reuseMs;
+
 	let models: ChatModel[];
-	try {
-		models = await discover();
-	} catch (err) {
-		notify(
-			`${LOG_PREFIX} ${entry.id}: discovery failed against ${modelsUrlFor(entry)}: ` +
-				`${err instanceof Error ? err.message : String(err)}`,
-			"error",
-		);
-		return false;
+	if (reused && cached) {
+		models = cached.models;
+		lastModels = models;
+	} else {
+		try {
+			models = await discover();
+		} catch (err) {
+			notify(
+				`${LOG_PREFIX} ${entry.id}: discovery failed against ${modelsUrlFor(entry)}: ` +
+					`${err instanceof Error ? err.message : String(err)}`,
+				"error",
+			);
+			return false;
+		}
 	}
 
 	pi.registerProvider(entry.id, {
@@ -157,7 +192,7 @@ async function registerProvider(
 		},
 	});
 
-	notify(`${LOG_PREFIX} ${entry.id}: ${models.length} model(s) from ${modelsUrlFor(entry)}`, "info");
+	if (!reused) notify(`${LOG_PREFIX} ${entry.id}: ${models.length} model(s) from ${modelsUrlFor(entry)}`, "info");
 	return true;
 }
 
@@ -166,9 +201,9 @@ export default async function (pi: ExtensionAPI) {
 	const lastDiscovered = new Map<string, LastDiscovery>();
 
 	/** Register or unregister one provider according to its current flag. */
-	const applyProvider = async (entry: ProviderEntry, notify: Notify): Promise<void> => {
+	const applyProvider = async (entry: ProviderEntry, notify: Notify, force = false): Promise<void> => {
 		if (entry.discoverModels === true) {
-			if (canDiscover(entry)) await registerProvider(pi, entry, notify, lastDiscovered);
+			if (canDiscover(entry)) await registerProvider(pi, entry, notify, lastDiscovered, force);
 			else notify(`${LOG_PREFIX} ${entry.id}: discovery is on but it has no baseUrl or modelsUrl`, "warning");
 		} else if (entry.discoverModels === false) {
 			// Discovery turned off on purpose: hand it back to plain models.json.
@@ -178,7 +213,7 @@ export default async function (pi: ExtensionAPI) {
 	};
 
 	/** Discover or un-discover every provider in models.json. Safe to re-run. */
-	const run = async (notify: Notify): Promise<void> => {
+	const run = async (notify: Notify, force = false): Promise<void> => {
 		let providers: ProviderEntry[];
 		try {
 			providers = await readModelsJsonProviders(MODELS_JSON);
@@ -190,7 +225,7 @@ export default async function (pi: ExtensionAPI) {
 			return;
 		}
 
-		for (const entry of providers) await applyProvider(entry, notify);
+		for (const entry of providers) await applyProvider(entry, notify, force);
 	};
 
 	// The factory is awaited before startup continues, so the model list is ready for
@@ -236,7 +271,7 @@ export default async function (pi: ExtensionAPI) {
 				const picked = await ctx.ui.select("Model discovery - choose a provider to toggle", options);
 				if (!picked) return; // Esc closes the menu
 				if (picked === refreshAll) {
-					await run(notify);
+					await run(notify, true);
 					continue;
 				}
 
@@ -260,7 +295,7 @@ export default async function (pi: ExtensionAPI) {
 						`(models.json edited in place, previous copy in models.json.bak)`,
 					"info",
 				);
-				await applyProvider({ ...target, discoverModels: enable }, notify);
+				await applyProvider({ ...target, discoverModels: enable }, notify, true);
 			}
 		},
 	});
@@ -268,7 +303,7 @@ export default async function (pi: ExtensionAPI) {
 	pi.registerCommand("model-context-refresh", {
 		description: "Re-read models.json and re-fetch every provider with discoverModels",
 		handler: async (_args, ctx) => {
-			await run((message, level) => ctx.ui.notify(message, level ?? "info"));
+			await run((message, level) => ctx.ui.notify(message, level ?? "info"), true);
 		},
 	});
 

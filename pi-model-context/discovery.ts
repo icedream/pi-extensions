@@ -16,6 +16,31 @@ export const FETCH_TIMEOUT_MS = 10_000;
  */
 export const DEFAULT_MAX_TOKENS = 65_536;
 
+/** How long a successful fetch is reused for, so one session does not fetch twice per provider. */
+export const DEFAULT_REFRESH_MINUTES = 10;
+
+/** Per-provider discovery knobs, set with the `discover` member in models.json. */
+export interface DiscoverOptions {
+	/**
+	 * false registers the provider as free even when the endpoint reports prices. Some
+	 * hosts list display prices or prices in another currency.
+	 */
+	pricing?: boolean;
+	/**
+	 * `dotted.path=value` predicates, all of which must match for a model to register.
+	 * Case-insensitive; an array on the path matches when any element matches. This is how an
+	 * aggregator with thousands of routes gets narrowed without naming every model:
+	 * `"require": ["opper.gdpr_residency=EU"]`. A path the endpoint stops sending rejects
+	 * everything, so the provider fails with a message that names the predicate.
+	 */
+	require?: string[];
+	/**
+	 * Minutes a fetched list stays good for inside one Pi process. The factory fetch already
+	 * blocks startup, so the session_start pass reuses it unless this says otherwise.
+	 */
+	refreshMinutes?: number;
+}
+
 /** A provider entry from models.json that opted into discovery. */
 export interface ProviderEntry {
 	id: string;
@@ -27,6 +52,7 @@ export interface ProviderEntry {
 	headers?: Record<string, string>;
 	compat?: Record<string, unknown>;
 	discoverModels?: boolean;
+	discover?: DiscoverOptions;
 }
 
 /** One entry of a GET /models response, typed as loosely as servers actually send it. */
@@ -41,6 +67,10 @@ export interface EndpointModel {
 	max_tokens?: number | string;
 	maxTokens?: number | string;
 	meta?: { n_ctx?: number | string; n_predict?: number | string; [key: string]: unknown };
+	pricing?: Record<string, unknown>;
+	params?: Record<string, unknown>;
+	opper?: Record<string, unknown>;
+	capabilities?: string[];
 	architecture?: {
 		input_modalities?: string[];
 		output_modalities?: string[];
@@ -59,6 +89,18 @@ export interface DiscoveredModel {
 	maxTokens: number;
 	/** True when maxTokens came from the endpoint rather than from DEFAULT_MAX_TOKENS. */
 	maxTokensReported: boolean;
+	/** List price in USD per million tokens, when the endpoint reports one. */
+	cost?: ModelCost;
+	/** Thinking levels the endpoint names; absent means it named none. */
+	thinkingLevels?: string[];
+}
+
+/** USD per million tokens, the shape Pi's model config takes. */
+export interface ModelCost {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
 }
 
 export interface RejectedModel {
@@ -147,12 +189,96 @@ export function hasNoTextOutput(model: EndpointModel): boolean {
 	return Array.isArray(outputs) && outputs.length > 0 && !outputs.includes("text");
 }
 
+/**
+ * A per-token price in USD. Aggregators send these as strings, and OpenRouter-style lists
+ * put "-1" where pricing is negotiated per call, so only a finite non-negative number counts.
+ * Multiplied into per-Mtok prices and rounded, because 0.000003 * 1e6 is 3.0000000000000004.
+ */
+function reportedPrice(value: unknown): number | undefined {
+	const n = typeof value === "string" ? Number(value) : value;
+	if (typeof n !== "number" || !Number.isFinite(n) || n < 0) return undefined;
+	const perMtok = n * 1_000_000;
+	return Number.isInteger(perMtok) ? perMtok : Math.round(perMtok * 1e6) / 1e6;
+}
+
+/**
+ * The list price to register. A model is unpriced when either side is missing: billing input
+ * against a real price and output against zero would report spend that never happened.
+ */
+export function reportedCost(model: EndpointModel): ModelCost | undefined {
+	const input = reportedPrice(model.pricing?.prompt);
+	const output = reportedPrice(model.pricing?.completion);
+	if (input === undefined || output === undefined) return undefined;
+	return {
+		input,
+		output,
+		cacheRead: reportedPrice(model.pricing?.input_cache_read) ?? 0,
+		cacheWrite: reportedPrice(model.pricing?.input_cache_write) ?? 0,
+	};
+}
+
+/** What an endpoint says about thinking. */
+export interface ReportedReasoning {
+	supported: boolean;
+	/** The levels it names, when it names any. "none" means thinking can be switched off. */
+	levels?: string[];
+}
+
+/**
+ * Opper reports thinking under `opper.reasoning.supported` and `opper.capabilities`, a model
+ * catalog under `params.reasoning.supported`. A model that reports neither keeps today's
+ * assumption that it can reason, since that is what registering it always assumed.
+ */
+export function reportedReasoning(model: EndpointModel): ReportedReasoning {
+	const block = (model.opper?.reasoning ?? model.params?.reasoning) as { supported?: unknown } | false | undefined;
+	if (block === false) return { supported: false };
+	const caps = [model.opper?.capabilities, model.capabilities].find((c) => Array.isArray(c)) as string[] | undefined;
+	const named = typeof block === "object" && block !== null && Array.isArray(block.supported) ? block.supported : [];
+	const levels = named.filter((level): level is string => typeof level === "string");
+	return { supported: caps ? caps.includes("reasoning") : true, ...(levels.length > 0 ? { levels } : {}) };
+}
+
+/** One `dotted.path=value` predicate from discover.require. */
+export interface RequirePredicate {
+	text: string;
+	path: string[];
+	value: string;
+}
+
+/**
+ * Split on the first `=`, so a value may contain one. A malformed predicate throws rather than
+ * being ignored: a filter that silently matches nothing would register an empty provider.
+ */
+export function parseRequire(text: string): RequirePredicate {
+	const at = text.indexOf("=");
+	if (at <= 0) throw new Error(`discover.require: predicate "${text}" is not path=value`);
+	return { text, path: text.slice(0, at).trim().split("."), value: text.slice(at + 1).trim() };
+}
+
+function valueAt(entry: unknown, path: string[]): unknown {
+	let value: unknown = entry;
+	for (const key of path) {
+		if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+		value = (value as Record<string, unknown>)[key];
+	}
+	return value;
+}
+
+/** A path that holds an array matches when any element matches, so capabilities read naturally. */
+function matchesRequire(entry: EndpointModel, predicate: RequirePredicate): boolean {
+	const found = valueAt(entry, predicate.path);
+	const wanted = predicate.value.toLowerCase();
+	const candidates = Array.isArray(found) ? found : [found];
+	return candidates.some((c) => c !== undefined && c !== null && String(c).toLowerCase() === wanted);
+}
+
 /** Parse a GET /models payload into models to register, plus what was skipped and why. */
-export function parseModelsPayload(payload: unknown): { models: DiscoveredModel[]; rejected: RejectedModel[] } {
+export function parseModelsPayload(payload: unknown, discover?: DiscoverOptions): { models: DiscoveredModel[]; rejected: RejectedModel[] } {
 	const entries = Array.isArray(payload)
 		? (payload as EndpointModel[])
 		: ((payload as { data?: EndpointModel[] })?.data ?? []);
 
+	const required = (discover?.require ?? []).map(parseRequire);
 	const models: DiscoveredModel[] = [];
 	const rejected: RejectedModel[] = [];
 
@@ -178,6 +304,16 @@ export function parseModelsPayload(payload: unknown): { models: DiscoveredModel[
 			continue;
 		}
 
+		const missed = required.find((predicate) => !matchesRequire(entry, predicate));
+		if (missed) {
+			rejected.push({
+				id,
+				cause: "excluded by discover.require",
+				reason: `${missed.text} did not match; the endpoint reports no such field, or a different value`,
+			});
+			continue;
+		}
+
 		const contextWindow = reportedContextWindow(entry);
 		if (contextWindow === undefined) {
 			rejected.push({
@@ -189,15 +325,19 @@ export function parseModelsPayload(payload: unknown): { models: DiscoveredModel[
 		}
 
 		const reported = reportedMaxTokens(entry);
+		const cost = discover?.pricing === false ? undefined : reportedCost(entry);
+		const thinking = reportedReasoning(entry);
 		models.push({
 			id,
 			name: typeof entry.name === "string" && entry.name ? entry.name : id,
 			type: "chat",
-			reasoning: true,
+			reasoning: thinking.supported,
 			input: reportedInput(entry),
 			contextWindow,
 			maxTokens: Math.min(reported ?? DEFAULT_MAX_TOKENS, contextWindow),
 			maxTokensReported: reported !== undefined,
+			...(cost ? { cost } : {}),
+			...(thinking.levels ? { thinkingLevels: thinking.levels } : {}),
 		});
 	}
 
@@ -294,10 +434,16 @@ export async function fetchModels(
 	const payload = await response.json().catch(() => undefined);
 	if (payload === undefined) throw new Error(`GET ${url} returned a body that is not JSON`);
 
-	const { models, rejected } = parseModelsPayload(payload);
+	const { models, rejected } = parseModelsPayload(payload, entry.discover);
 	if (models.length === 0) {
 		const detail = describeRejections(rejected);
-		throw new Error(`GET ${url} listed no usable models${detail ? ` (${rejected.length} skipped: ${detail})` : ""}`);
+		// A field the endpoint stops sending rejects everything, which is fail-closed but useless
+		// to read unless the message says where to look.
+		const filtered = rejected.length > 0 && rejected.every((r) => r.cause === "excluded by discover.require");
+		throw new Error(
+			`GET ${url} listed no usable models${detail ? ` (${rejected.length} skipped: ${detail})` : ""}` +
+				(filtered ? "; every entry failed discover.require, check it against what this endpoint reports" : ""),
+		);
 	}
 	return { models, rejected };
 }

@@ -1,7 +1,8 @@
 # pi-model-context
 
 Discovers models for `models.json` providers marked `"discoverModels": true`, and registers them
-with the **context window and input modalities the endpoint actually reports**.
+with the **context window, input modalities, list price and thinking levels the endpoint actually
+reports**.
 
 ## Configure
 
@@ -25,6 +26,7 @@ In `~/.pi/agent/models.json`:
 | `discoverModels: true` | Discover this provider at startup, on each session start, and on `/model-context-refresh`. |
 | `discoverModels: false` | Turn discovery back off for this provider; it returns to plain `models.json` handling. |
 | `modelsUrl` | Optional. Overrides the discovery URL only. Chat requests still use `baseUrl`. Use a trusted endpoint: the provider's credentials are sent to it. |
+| `discover` | Optional. Discovery knobs: `require`, `pricing`, `refreshMinutes`. See [Narrowing a large list](#narrowing-a-large-list). |
 | `apiKey` | Literal, `$NAME`, `${NAME}`, `$$`, `$!`. A leading `!command` is refused for discovery requests. |
 
 `models.json` values for a model override what discovery reports, so a context window pinned by
@@ -41,6 +43,24 @@ hand survives every refresh.
 | `architecture.input_modalities` | `input` | `["text"]` |
 | `architecture.output_modalities` containing `decisions` | classifier marker | entry skipped with a notice |
 | `architecture.output_modalities` declared but without `text` (embeddings, image-only) | not a chat model | entry skipped with a notice |
+| `pricing.prompt`, `pricing.completion`, `pricing.input_cache_read`, `pricing.input_cache_write` | `cost`, converted from USD per token to USD per million tokens | no cost, so the model stays free |
+| `opper.reasoning.supported`, `params.reasoning.supported` | `thinkingLevelMap`: only the levels named get offered | previous guess, which maps `xhigh` and `max` |
+| `opper.capabilities` or `capabilities` containing `reasoning` | `reasoning` | `true` |
+
+## Narrowing a large list
+
+A gateway can list over a thousand models. Registering all of them makes `/model` unusable, so a
+provider can filter what registers:
+
+```json
+"discover": { "require": ["opper.gdpr_residency=EU"], "pricing": true, "refreshMinutes": 10 }
+```
+
+| Key | Meaning |
+|---|---|
+| `require` | `dotted.path=value` predicates, all of which must match. Case-insensitive; an array on the path matches when any element matches, so `opper.capabilities=tools` reads as "the model can use tools". A path the endpoint does not report rejects the model, so a filter that stops matching fails the provider with a message naming the predicate instead of quietly registering nothing. |
+| `pricing` | `false` registers the provider as free even when the endpoint reports prices, for a host whose prices are display-only or in another currency. |
+| `refreshMinutes` | How long a fetched list is reused inside one Pi process. Default 10. The startup fetch already blocks, so `session_start` would otherwise fetch the same list again seconds later. `/model-context-refresh` ignores this. |
 
 ## Commands
 
@@ -88,11 +108,16 @@ the provider id skips the first pick. The list is whatever the last successful f
 
 - **No cache file.** There is nothing to go stale and no fingerprint to invalidate. The cost is
   that startup performs one request per discovery provider; an unreachable endpoint costs up to
-  10 seconds each and reports one error line instead of hanging.
+  10 seconds each and reports one error line instead of hanging. Within one process a fetched list
+  is reused for `discover.refreshMinutes` (default 10), so a session does not fetch again at
+  `session_start`.
 - A failed refresh keeps the last list it registered and warns, rather than emptying `/model`.
-- `reasoning` is registered as `true` and `thinkingLevelMap` maps `xhigh` and `max`, so those
-  levels appear in `/thinking`. For a model that rejects them, set them to `null` per id with
-  `modelOverrides` in `models.json`.
+- Thinking levels come from the endpoint when it names them, so a route without `xhigh` is not
+  offered `xhigh`. An endpoint that names none gets `xhigh` and `max` mapped as before; for a model
+  that rejects them, set them to `null` per id with `modelOverrides` in `models.json`.
+- A registered price is what Pi's cost display, and `budget-routing`'s meter, multiply tokens
+  against. A gateway that bills at provider rates with no markup is therefore metered accurately. A
+  model missing a price on either side is registered unpriced rather than half-priced.
 - `PI_MODELS_JSON` overrides the `models.json` path (default `~/.pi/agent/models.json`).
 
 ## Develop
