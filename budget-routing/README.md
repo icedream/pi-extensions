@@ -1,10 +1,11 @@
 # budget-routing
 
-Pi extension for monthly spend caps on the paid providers a session is billed on, several at once
-(GitHub Copilot, Anthropic, Mistral, ...). Month-to-date spend comes from Pi's session logs, from the
-provider's own usage API where one exists ([`seat`](#seat-figure) for Copilot), or from a hand-written
-`observed` figure. Behaviour then changes per provider by tier as its cap fills, and the model gets a
-priced route menu so it can move work to a cheaper route before it has to fall back to a local model.
+Pi extension for spend caps on the paid providers a session is billed on, several at once (GitHub
+Copilot, Anthropic, Mistral, a prepaid gateway such as Opper). Spend comes from Pi's session logs,
+from the provider's own usage API where one exists ([`seat`](#seat-figure) for Copilot,
+[`balance`](#wallet-figures) for a prepaid wallet), or from a hand-written `observed` figure.
+Behaviour then changes per provider by tier as its budget fills, and the model gets a priced route
+menu so it can move work to a cheaper route before it has to fall back to a local model.
 
 | Tier | Default | What happens, for that provider |
 |------|---------|---------------------------------|
@@ -14,9 +15,11 @@ priced route menu so it can move work to a cheaper route before it has to fall b
 | divert | 100% | Depends on `enforce`: `reject` (default) refuses launches that would spend it, with the open routes listed so the task gets re-queued elsewhere; `rewrite` points `localSubagents` at the local model and refuses the rest; `off` does nothing. Offers to switch the main session to the local model (confirmation required) |
 
 Each provider also carries a compact footer indicator next to the session cost, one per configured
-provider: `copilot 92%  anthropic $5.46  mistral $0.19`, coloured by tier. A leading `~` means the
-figure is estimated from Pi's own logs rather than the provider's own figure; `!` and `over` mark the
-prepare and divert tiers. A provider with no cap shows its spend instead of a percentage.
+provider: `copilot 92%  anthropic $5.46  opper 12% $8.77 left`, coloured by tier. A leading `~` means
+the figure is estimated from Pi's own logs rather than the provider's own figure; `!` and `over` mark
+the prepare and divert tiers. A provider with no cap shows its spend instead of a percentage, and a
+prepaid account shows what is left in it. `? balance unknown` means the wallet fetch is failing or its
+figure has aged out, so only Pi's logs are being counted.
 
 ## Install
 
@@ -54,6 +57,7 @@ Per provider entry:
 | `billing` | Optional override: `credits` (flat seat), `metered` (per token), `free`. Derived when absent: Copilot is `credits`, a provider whose models carry zero registry prices is `free`, everything else `metered` |
 | `observed` | The provider's own usage figure, copied by hand: `creditsUsed`, `asOf` (ISO time you read it), `usdPerCredit` (default `0.01`). In-month replaces the meter as the baseline, and Pi spend since `asOf` is added on top |
 | `seat` | Copilot only. Fetches the figure instead of copying it. See [Seat figure](#seat-figure) |
+| `balance` | Prepaid wallets, currently `opper` only. Fetches the account balance and period spend. See [Wallet figures](#wallet-figures) |
 
 A v1 file with a top-level `provider`, `monthlyCapUsd`, `observed` and `seat` still works: it reads as a
 one-entry `providers` list. A file that carries both forms is rejected rather than picking one.
@@ -67,7 +71,8 @@ one-entry `providers` list. A file that carries both forms is rejected rather th
   "providers": [
     { "provider": "github-copilot", "monthlyCapUsd": 150, "seat": { "refreshMinutes": 15 } },
     { "provider": "anthropic", "monthlyCapUsd": 60, "reset": "utc" },
-    { "provider": "mistral", "reset": "utc" }
+    { "provider": "mistral", "reset": "utc" },
+    { "provider": "opper", "monthlyCapUsd": 8, "reset": "utc", "billing": "metered", "balance": { "refreshMinutes": 15 } }
   ]
 }
 ```
@@ -88,10 +93,11 @@ each chosen to cost tokens only when it is worth it:
   exact moment a routing decision is made.
 
 ```
-provider        billing   cap       spent    pct   headroom  figure
-copilot         credits  $150.00   $136.50  91%    9% left    live
-anthropic       metered  $60.00     $5.46    9%    91% left   meter
+provider        billing   cap       spent    pct   headroom    figure
+copilot         credits  $150.00   $136.50  91%    9% left     live (seat)
+anthropic       metered  $60.00     $5.46    9%    91% left    meter
 mistral         metered  none       $0.19    -    no cap      meter
+opper           metered   $8.00     $1.22   15%    $8.77 left  live (balance)
 
 route                              billing  $/Mtok in/out  cache r/w   ctx     provider room
 mistral/magistral-medium-latest    metered  2/5            -/0.6       128k    no cap
@@ -127,8 +133,10 @@ is what separates a spent allowance from a short throttle. Recognised wording co
 `quota_exceeded`.
 
 The state clears when a call to that provider succeeds again, when the reset instant the provider named
-passes, or at the next month boundary in that provider's `reset` zone, since a spend limit is a monthly
-allowance. It is held in memory, so a restart forgets it and the next failed call detects it again.
+passes, or at the next month boundary in that provider's `reset` zone, since a spend limit is usually a
+monthly allowance. A wallet figure saying `blocked` is the exception: it is re-read from the provider
+every refresh, so it clears as soon as the account has money again rather than waiting for a month.
+It is held in memory, so a restart forgets it and the next failed call detects it again.
 `/budget clear <provider>` drops it by hand, for a limit you just raised.
 
 ## The `/budget` command
@@ -203,6 +211,55 @@ fresh figure the minutes between GitHub's snapshot and now are counted twice, at
 at the default interval. The alternative would drop non-Pi usage in that window, so the overlap is
 kept.
 
+## Wallet figures
+
+A prepaid gateway has no monthly allowance: you buy credit and the next call that runs out is refused.
+For those providers the meter runs on the money in the account rather than on a calendar month. Add a
+`balance` block, currently honoured for the provider name `opper` only:
+
+```json
+"balance": { "refreshMinutes": 15 }
+```
+
+It fetches `https://api.opper.ai/v3/me` with the API key Pi already uses for that provider
+(`modelRegistry.getApiKeyForProvider`), and reads:
+
+| Field | Used for |
+|---|---|
+| `balance.balance_cents` | Money left. Part of the cap and the number in the footer |
+| `spend.spent_cents` | What the provider billed in its own period: the baseline the meter starts from |
+| `spend.limit_cents` | A Spend limit rule, which becomes a ceiling of its own |
+| `spend.period_start` / `period_end` | The window the figure is valid for; outside it the figure is ignored |
+| `blocked` + `block_reason` | The provider refusing spend, which forces the divert tier |
+
+**The cap.** `monthlyCapUsd` stays the ceiling you set for yourself. The wallet adds two of its own:
+`spend + max(0, balance)`, the money that actually exists, and `limit_cents` if the account has a
+Spend limit rule. The lowest of the three is the cap, so with $1.22 spent and $8.77 left an entry with
+`monthlyCapUsd: 8` tiers against $8.00, and one with no cap tiers against $9.99. A top-up raises the
+cap and pulls the percentage back down by itself. A wallet with nothing in it caps at 0, which is
+divert rather than a division by zero.
+
+The percentage therefore counts the whole organization's spend, including other keys, other machines
+and the dashboard. That is the point, but it also means the number can move without Pi causing it.
+
+**Staleness.** A figure is used only while it is inside its own billing period and no older than four
+`refreshMinutes`. After that the wallet stops setting a cap, `monthlyCapUsd` is all that is left, the
+footer reads `opper ? balance unknown`, and the meter falls back to Pi's logs. A failed fetch is
+recorded as an attempt, so a dead endpoint or a key without the `billing:read` permission is retried on
+the same interval rather than after every agent run. `/budget-balance` forces a fetch now and reports
+the numbers. Without any figure the provider is fail-open: tracked and priced, but nothing refuses a
+launch unless you configured `monthlyCapUsd`.
+
+**Blocked accounts.** `blocked: true` marks the provider out of budget from the provider's own word, no
+error-message matching involved: the footer reads `opper out of budget`, launches that would spend it
+are refused, and the session is offered the local model. A spend-cap block clears at `period_end`; an
+empty balance has no period to wait out, so it clears when a later fetch says the account is fine, or
+with `/budget clear opper`.
+
+The key is sent to `api.opper.ai` and nowhere else, is never logged, and is never written to a config
+file. Like the seat fetch, the provider name is matched literally: a provider you have renamed locally
+gets no wallet figure.
+
 ## Tests
 
 ```sh
@@ -219,13 +276,15 @@ machine happens to have logged.
 ## Limitations
 
 - Spend is Pi's estimate at API list prices, not the invoice. Without a current provider figure (from
-  `seat`, or from a hand-written `observed`) the meter sees only this machine's logs, so usage on other
-  machines or in the IDE is missed and the estimate can read low.
-- Only Copilot has a figure the extension can fetch. Anthropic's cost report needs an admin API key
+  `seat`, from `balance`, or from a hand-written `observed`) the meter sees only this machine's logs, so
+  usage on other machines or in the IDE is missed and the estimate can read low. A gateway that bills at
+  provider rates with no markup, like Opper, is metered exactly once its models carry prices.
+- Copilot and Opper have figures the extension can fetch. Anthropic's cost report needs an admin API key
   (`sk-ant-admin-...`), which is a separate credential from the one Pi uses, and Mistral's billing API
   is Enterprise-only. For those two, hand-writing `observed` is the only way to count non-Pi usage.
 - A provider entry without `monthlyCapUsd` is priced and reported but never tiered, so it never nudges,
-  compacts, or refuses anything.
+  compacts, or refuses anything. For a wallet provider that also means: while its balance fetch is
+  failing there is no ceiling at all.
 - Subagent child sessions are counted from their own session files. Transcripts under
   `subagent-artifacts/` are skipped because they duplicate those files.
 - `enforce` sees top-level `subagent` launches and `tasks` arrays only. Launches inside workflow scripts

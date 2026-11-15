@@ -23,14 +23,18 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
 	applyDivert,
 	advisorySection,
+	balanceLiveFigure,
 	billingFor,
 	buildRoutes,
 	costTable,
+	DEFAULT_BALANCE,
 	DEFAULT_SEAT,
+	figureUsable,
 	loadConfig,
 	menuModelRefs,
 	monthSpendAll,
 	monthStartMs,
+	seatLiveFigure,
 	parseAgentOverrideModels,
 	preSwitchCompactionStep,
 	classifyExhaustion,
@@ -42,8 +46,10 @@ import {
 	usageSince,
 	windowLabel,
 	type BudgetConfig,
+	type BalanceFigure,
 	type CredentialSource,
 	type Exhaustion,
+	type LiveFigure,
 	type MonthSpend,
 	type ProviderStatus,
 	type RegistryModelLike,
@@ -51,6 +57,7 @@ import {
 	type Tier,
 } from "./budget.ts";
 import { fetchCopilotSeat, isCopilotProvider } from "./seat.ts";
+import { fetchOpperBalance, isOpperProvider } from "./balance.ts";
 import { resolveGitHubToken } from "./credential.ts";
 
 const AGENT_DIR = process.env.PI_BUDGET_ROUTING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
@@ -66,9 +73,9 @@ interface Snapshot {
 	statuses: ProviderStatus[];
 }
 
-interface SeatResult {
+interface FigureResult {
 	ok: boolean;
-	figure?: SeatFigure;
+	figure?: LiveFigure;
 	source?: Exclude<CredentialSource, "auto">;
 	note: string;
 }
@@ -76,9 +83,10 @@ interface SeatResult {
 /** One slot for the whole provider set: the tree is walked once, so partial caching would cost more walks. */
 let cache: { at: number; key: string; spend: Map<string, MonthSpend> } | undefined;
 
-/** Figures fetched from providers this session. In memory only: the config file is never written. */
-const seatFigures = new Map<string, SeatFigure>();
+/** Figures fetched from providers this session, normalized. In memory only: the config file is never written. */
+const liveFigures = new Map<string, LiveFigure>();
 const seatFetchMs = new Map<string, number>();
+const balanceFetchMs = new Map<string, number>();
 
 /**
  * Providers that refused a call for spend or credit reasons. In memory only: a restart forgets it and
@@ -88,13 +96,14 @@ const exhausted = new Map<string, Exhaustion>();
 
 function configKey(cfg: BudgetConfig): string {
 	const entries = cfg.providers.map((pb) => [pb.provider, pb.monthlyCapUsd ?? null, pb.reset, pb.observed?.asOfMs ?? null, pb.observed?.creditsUsed ?? null]);
-	return JSON.stringify([entries, [...seatFigures.entries()].map(([p, f]) => [p, f.creditsUsed, f.asOfMs])]);
+	const figures = [...liveFigures.entries()].map(([p, f]) => [p, f.spendUsd, f.balanceUsd ?? null, f.hardCapUsd ?? null, f.asOfMs]);
+	return JSON.stringify([entries, figures]);
 }
 
 async function spendAll(cfg: BudgetConfig): Promise<Map<string, MonthSpend>> {
 	const key = configKey(cfg);
 	if (cache && cache.key === key && Date.now() - cache.at < CACHE_MS) return cache.spend;
-	const spend = await monthSpendAll(cfg, SESSIONS_DIR, new Date(), seatFigures);
+	const spend = await monthSpendAll(cfg, SESSIONS_DIR, new Date(), liveFigures);
 	cache = { at: Date.now(), key, spend };
 	return spend;
 }
@@ -106,7 +115,14 @@ async function currentSnapshot(models: readonly RegistryModelLike[]): Promise<Sn
 	const spend = await spendAll(cfg);
 	const now = new Date();
 	const statuses = cfg.providers.map((pb) =>
-		providerStatus(pb, spend.get(pb.provider) ?? { spend: 0, source: "meter", observationIgnored: false }, billingFor(pb, models), exhausted.get(pb.provider), now),
+		providerStatus(
+			pb,
+			spend.get(pb.provider) ?? { spend: 0, source: "meter", observationIgnored: false },
+			billingFor(pb, models),
+			exhausted.get(pb.provider),
+			now,
+			liveFigures.get(pb.provider),
+		),
 	);
 	return { cfg, statuses };
 }
@@ -114,7 +130,8 @@ async function currentSnapshot(models: readonly RegistryModelLike[]): Promise<Sn
 export default function (pi: ExtensionAPI) {
 	const announced = new Set<string>();
 	const compacted = new Map<string, boolean>();
-	let seatInFlight: Promise<SeatResult[]> | undefined;
+	let seatInFlight: Promise<FigureResult[]> | undefined;
+	let balanceInFlight: Promise<FigureResult[]> | undefined;
 	const activeStatusKeys = new Set<string>();
 
 	function notifyOnce(ctx: ExtensionContext, key: string, message: string, severity: "info" | "warning" | "error" = "warning") {
@@ -142,7 +159,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/** Fetch at most once at a time; a second caller joins the run already in flight. */
-	function refreshSeats(ctx: ExtensionContext, force = false): Promise<SeatResult[]> {
+	function refreshSeats(ctx: ExtensionContext, force = false): Promise<FigureResult[]> {
 		if (seatInFlight) return seatInFlight;
 		seatInFlight = doRefreshSeats(ctx, force).finally(() => {
 			seatInFlight = undefined;
@@ -154,7 +171,7 @@ export default function (pi: ExtensionAPI) {
 	 * Refreshes every provider whose entry has a `seat` block. Never throws: it runs off the agent
 	 * path, so each failure resolves with ok:false and a note. GitHub is contacted only for Copilot.
 	 */
-	async function doRefreshSeats(ctx: ExtensionContext, force: boolean): Promise<SeatResult[]> {
+	async function doRefreshSeats(ctx: ExtensionContext, force: boolean): Promise<FigureResult[]> {
 		if (!existsSync(CONFIG_PATH)) return [{ ok: false, note: "no config file" }];
 		let cfg: BudgetConfig;
 		try {
@@ -162,7 +179,7 @@ export default function (pi: ExtensionAPI) {
 		} catch (err) {
 			return [{ ok: false, note: (err as Error).message }];
 		}
-		const out: SeatResult[] = [];
+		const out: FigureResult[] = [];
 		for (const pb of cfg.providers) {
 			if (!isCopilotProvider(pb.provider)) {
 				if (pb.seat) out.push({ ok: false, note: `${pb.provider}: the GitHub seat fetch is not used for this provider` });
@@ -174,6 +191,9 @@ export default function (pi: ExtensionAPI) {
 				continue;
 			}
 			const seat = pb.seat ?? DEFAULT_SEAT;
+			// Recorded before the work rather than after it succeeds: a rejected credential or a dead
+			// endpoint would otherwise be retried on every settle.
+			seatFetchMs.set(pb.provider, Date.now());
 			let token: string;
 			let source: Exclude<CredentialSource, "auto">;
 			try {
@@ -191,12 +211,12 @@ export default function (pi: ExtensionAPI) {
 				out.push({ ok: false, note: (err as Error).message });
 				continue;
 			}
-			seatFetchMs.set(pb.provider, Date.now());
-			seatFigures.set(pb.provider, fig);
+			const usdPerCredit = pb.observed?.usdPerCredit ?? 0.01;
+			const live = seatLiveFigure(fig, usdPerCredit, pb.reset, seat.refreshMinutes);
+			liveFigures.set(pb.provider, live);
 			cache = undefined;
 
-			const usdPerCredit = pb.observed?.usdPerCredit ?? 0.01;
-			const capFromSeat = fig.entitlement * usdPerCredit;
+			const capFromSeat = live.hardCapUsd ?? 0;
 			if (pb.monthlyCapUsd !== undefined && Math.abs(capFromSeat - pb.monthlyCapUsd) > 0.005) {
 				notifyOnce(
 					ctx,
@@ -204,13 +224,70 @@ export default function (pi: ExtensionAPI) {
 					`seat entitlement is ${fig.entitlement} credits ($${capFromSeat.toFixed(2)}) but ${pb.provider}.monthlyCapUsd is $${pb.monthlyCapUsd}. Align the cap with the seat if you want it to track it.`,
 				);
 			}
-			const pct = Math.round((fig.creditsUsed / fig.entitlement) * 100);
 			out.push({
 				ok: true,
-				figure: fig,
+				figure: live,
 				source,
-				note: `${fig.login}: ${fig.creditsUsed}/${fig.entitlement} credits (${pct}%), ${fig.remaining} left, as of ${new Date(fig.asOfMs).toISOString()}, credential from ${source}`,
+				note: `${live.detail}, as of ${new Date(live.asOfMs).toISOString()}, credential from ${source}`,
 			});
+		}
+		return out;
+	}
+
+	/** Wallet figures fetch at most once at a time, separately from seat fetches. */
+	function refreshBalances(ctx: ExtensionContext, force = false): Promise<FigureResult[]> {
+		if (balanceInFlight) return balanceInFlight;
+		balanceInFlight = doRefreshBalances(ctx, force).finally(() => {
+			balanceInFlight = undefined;
+		});
+		return balanceInFlight;
+	}
+
+	/** Refreshes every provider whose entry has a `balance` block. */
+	async function doRefreshBalances(ctx: ExtensionContext, force: boolean): Promise<FigureResult[]> {
+		if (!existsSync(CONFIG_PATH)) return [{ ok: false, note: "no config file" }];
+		let cfg: BudgetConfig;
+		try {
+			cfg = await loadConfig(CONFIG_PATH);
+		} catch (err) {
+			return [{ ok: false, note: (err as Error).message }];
+		}
+		const out: FigureResult[] = [];
+		for (const pb of cfg.providers) {
+			if (!isOpperProvider(pb.provider)) {
+				if (pb.balance) out.push({ ok: false, note: `${pb.provider}: the wallet fetch is not used for this provider` });
+				continue;
+			}
+			if (!pb.balance && !force) continue;
+			const balance = pb.balance ?? DEFAULT_BALANCE;
+			if (!force && Date.now() - (balanceFetchMs.get(pb.provider) ?? 0) < balance.refreshMinutes * 60_000) {
+				out.push({ ok: true, note: "figure is fresh" });
+				continue;
+			}
+			// Recorded before the work, so a dead endpoint is not retried on every settle.
+			balanceFetchMs.set(pb.provider, Date.now());
+			const key = await ctx.modelRegistry.getApiKeyForProvider(pb.provider);
+			if (!key) {
+				notifyOnce(ctx, `balance-key:${pb.provider}`, `no API key for ${pb.provider}, so its balance is not tracked`);
+				out.push({ ok: false, note: `no API key for ${pb.provider}` });
+				continue;
+			}
+			let fig: BalanceFigure;
+			try {
+				fig = await fetchOpperBalance(key);
+			} catch (err) {
+				notifyOnce(ctx, `balance-fetch:${pb.provider}`, `balance refresh failed: ${(err as Error).message}`);
+				out.push({ ok: false, note: (err as Error).message });
+				continue;
+			}
+			const live = balanceLiveFigure(fig, balance.refreshMinutes);
+			liveFigures.set(pb.provider, live);
+			cache = undefined;
+			// A refusal remembered from a failed call should not outlive the provider saying it is fine.
+			const previous = exhausted.get(pb.provider);
+			if (!fig.blocked && fig.balanceUsd > 0 && previous && previous.atMs <= live.asOfMs) exhausted.delete(pb.provider);
+			const blockedNote = fig.blocked ? `, blocked: ${fig.blockReason ?? "unknown reason"}` : "";
+			out.push({ ok: true, figure: live, note: `${live.detail}${blockedNote}` });
 		}
 		return out;
 	}
@@ -257,7 +334,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		announced.clear();
 		compacted.clear();
-		void refreshSeats(ctx)
+		void Promise.all([refreshSeats(ctx), refreshBalances(ctx)])
 			.then(() => refreshStatus(ctx))
 			.catch(() => undefined);
 	});
@@ -324,6 +401,16 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("budget-balance", {
+		description: "Fetch the provider wallet figures now and report them",
+		handler: async (_args, ctx) => {
+			const results = await refreshBalances(ctx, true);
+			const usable = results.filter((r) => r.note !== undefined);
+			ctx.ui.notify(usable.map((r) => `${r.ok ? "ok" : "failed"}: ${r.note}`).join(" | ") || "no balance block configured", usable.some((r) => r.ok) ? "info" : "warning");
+			await refreshStatus(ctx);
+		},
+	});
+
 	pi.registerTool({
 		name: TOOL_NAME,
 		label: "Budget",
@@ -355,11 +442,15 @@ export default function (pi: ExtensionAPI) {
 
 		for (const s of snap.statuses) {
 			if (s.observationIgnored) {
-				notifyOnce(ctx, `stale-observation:${s.provider}:${month}`, `the figure for ${s.provider} is from another month and was ignored. Fix the seat fetch, or update observed.asOf.`);
+				const why = s.figureStale
+					? `the wallet figure for ${s.provider} is too old or outside its billing period, so it is metered from Pi's logs alone. Check the balance fetch.`
+					: `the figure for ${s.provider} is from another month and was ignored. Fix the seat fetch, or update observed.asOf.`;
+				notifyOnce(ctx, `stale-observation:${s.provider}:${month}`, why);
 			}
 			if (s.tier !== "ok") {
 				const severity = s.tier === "nudge" ? "info" : "warning";
-				notifyOnce(ctx, `${s.tier}:${s.provider}:${month}`, `${s.provider} budget at ${s.pct}% (${s.tier})`, severity);
+				// Keyed on the cap too: a top-up raises it, and draining twice in one month is two news items.
+				notifyOnce(ctx, `${s.tier}:${s.provider}:${s.capUsd ?? month}`, `${s.provider} budget at ${s.pct}% (${s.tier})`, severity);
 			}
 		}
 
@@ -371,10 +462,17 @@ export default function (pi: ExtensionAPI) {
 		const mine = snap.statuses.find((s) => s.provider === ctx.model?.provider);
 		if (mine?.tier === "divert") {
 			const t = snap.cfg.localModel;
-			const ok = await ctx.ui.confirm(
-				"Monthly cap reached",
-				`${mine.provider} is at ${mine.pct}% of its cap. Switch the main session to ${t.provider}/${t.modelId}? Pre-switch compaction ${compacted.get(mine.provider) ? "is done" : "was NOT done"}.`,
-			);
+			// One offer per state rather than one per prompt: while a provider stays over its cap the
+			// confirm would otherwise interrupt every message. A top-up or a reset changes the key.
+			const offerKey = `switch-offer:${mine.provider}:${mine.capUsd ?? month}:${mine.exhausted ? "blocked" : "cap"}`;
+			const state = mine.exhausted ? `${mine.provider} is out of budget (${mine.exhausted.reason})` : `${mine.provider} is at ${mine.pct}% of its cap`;
+			const ok =
+				!announced.has(offerKey) &&
+				(await ctx.ui.confirm(
+					"Budget limit reached",
+					`${state}. Switch the main session to ${t.provider}/${t.modelId}? Pre-switch compaction ${compacted.get(mine.provider) ? "is done" : "was NOT done"}.`,
+				));
+			announced.add(offerKey);
 			if (ok) {
 				const target = ctx.modelRegistry.find(t.provider, t.modelId);
 				if (!target) {
@@ -434,7 +532,7 @@ export default function (pi: ExtensionAPI) {
 	// Keep the fetched figures current between runs. Off the critical path: the next turn sees it
 	// because currentSnapshot() re-reads the config file.
 	pi.on("agent_settled", async (_event, ctx) => {
-		void refreshSeats(ctx)
+		void Promise.all([refreshSeats(ctx), refreshBalances(ctx)])
 			.then(() => refreshStatus(ctx))
 			.catch(() => undefined);
 	});

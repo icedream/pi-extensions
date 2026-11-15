@@ -34,6 +34,13 @@
     {
       "provider": "mistral",
       "reset": "utc"
+    },
+    {
+      "provider": "opper",
+      "monthlyCapUsd": 8,
+      "reset": "utc",
+      "billing": "metered",
+      "balance": { "refreshMinutes": 15 }
     }
   ]
 }

@@ -8,22 +8,27 @@ import { utimes } from "node:fs/promises";
 import {
 	advisorySection,
 	applyDivert,
+	balanceLiveFigure,
 	billingFor,
 	buildRoutes,
 	costTable,
 	DEFAULT_SEAT,
 	DEFAULT_THRESHOLDS,
+	effectiveCapUsd,
+	figureUsable,
 	formatCost,
 	menuModelRefs,
 	monthSpend,
 	monthSpendAll,
 	monthStartMs,
 	parseAgentOverrideModels,
+	parseBalanceFigure,
 	parseConfig,
 	parseSeatFigure,
 	preSwitchCompactionStep,
 	providerForModelRef,
 	providerStatus,
+	seatLiveFigure,
 	rejectReason,
 	classifyExhaustion,
 	exhaustionActive,
@@ -544,7 +549,7 @@ test("monthSpend: a live seat figure wins over the hand-written observed", async
 	await fs.writeFile(path.join(dir, "s.jsonl"), [line("github-copilot", "assistant", Date.now(), 2.5)].join("\n") + "\n");
 	const now = new Date();
 	const cfg = parseConfig({ ...validRaw, observed: { creditsUsed: 999_999, asOf: new Date(now).toISOString() } });
-	const live = { ...parseSeatFigure(seatPayload), asOfMs: now.getTime() - 60_000 };
+	const live = seatLiveFigure({ ...parseSeatFigure(seatPayload), asOfMs: now.getTime() - 60_000 }, 0.01, "local");
 
 	const r = await monthSpend(cfg.providers[0], dir, now, live);
 	assert.equal(r.source, "live");
@@ -561,7 +566,7 @@ test("monthSpend: live figure adds Pi spend since the snapshot, and usdPerCredit
 		line("github-copilot", "assistant", now.getTime() - 60_000, 1.5), // after it: counted
 	].join("\n") + "\n");
 	const cfg = parseConfig({ ...validRaw, observed: { creditsUsed: 1, asOf: new Date(now).toISOString(), usdPerCredit: 0.02 } });
-	const live = { ...parseSeatFigure(seatPayload), asOfMs: now.getTime() - 5 * 60_000 };
+	const live = seatLiveFigure({ ...parseSeatFigure(seatPayload), asOfMs: now.getTime() - 5 * 60_000 }, 0.02, "local");
 
 	const r = await monthSpend(cfg.providers[0], dir, now, live);
 	assert.equal(r.source, "live");
@@ -572,7 +577,7 @@ test("monthSpend: a live figure from another month falls back to the meter", asy
 	const dir = await tmpSessions();
 	await fs.writeFile(path.join(dir, "s.jsonl"), [line("github-copilot", "assistant", Date.now(), 4)].join("\n") + "\n");
 	const cfg = parseConfig(validRaw);
-	const stale = { ...parseSeatFigure(seatPayload), asOfMs: new Date(2000, 0, 1).getTime() };
+	const stale = seatLiveFigure({ ...parseSeatFigure(seatPayload), asOfMs: new Date(2000, 0, 1).getTime() }, 0.01, "local");
 	const r = await monthSpend(cfg.providers[0], dir, new Date(), stale);
 	assert.equal(r.source, "meter");
 	assert.equal(r.observationIgnored, true);
@@ -702,7 +707,7 @@ test("monthSpendAll mixes a fetched baseline with plain meters in one walk", asy
 		].join("\n") + "\n",
 	);
 	const cfg = parseConfig(v2Raw);
-	const live = new Map([[COPILOT, { ...parseSeatFigure(seatPayload), asOfMs: now.getTime() - 5 * 60_000 }]]);
+	const live = new Map([[COPILOT, seatLiveFigure({ ...parseSeatFigure(seatPayload), asOfMs: now.getTime() - 5 * 60_000 }, 0.01, "local")]]);
 	const m = await monthSpendAll(cfg, dir, now, live);
 	assert.equal(m.get(COPILOT)?.source, "live");
 	assert.ok(Math.abs((m.get(COPILOT)?.spend ?? 0) - (156.4 + 1.5)) < 1e-9, `got ${m.get(COPILOT)?.spend}`);
@@ -918,5 +923,173 @@ test("usageReport states the refusal above the table", () => {
 	const ex = classifyExhaustion(ANTHROPIC_USAGE_LIMIT, now);
 	const rows = [{ model: "claude-haiku-5-5", messages: 1, input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0.1 }];
 	const out = usageReport("anthropic", rows, "since 2026-11-01 00:00 UTC", undefined, ex);
-	assert.match(out, /OUT OF BUDGET: spend limit reached since 2026-11-14T12:00:00\.000Z, back 2026-12-01T00:00:00\.000Z/);
+	assert.match(out, /OUT OF BUDGET: spend limit reached since 2026-11-14T12:00:00\.000Z\. Calls to this provider fail until 2026-12-01T00:00:00\.000Z\./);
+});
+
+/** A /v3/me answer for an account with $8.77 left and $1.22 billed in the period. */
+const mePayload = {
+	object: "me",
+	organization: { name: "acme", plan: "gateway" },
+	project: { name: "default" },
+	visibility: { organization_finance: true },
+	balance: { balance_cents: 877, balance_dollars: 8.77, currency: "usd" },
+	spend: {
+		currency: "usd",
+		spent_cents: 122,
+		spent_dollars: 1.22,
+		limit_cents: null,
+		limit_scope: null,
+		budget_period: "month",
+		period_start: "2026-11-01T00:00:00Z",
+		period_end: "2026-12-01T00:00:00Z",
+	},
+	project_spend: { spent_cents: 122 },
+	blocked: false,
+};
+
+const opperCfg = (monthlyCapUsd?: number) =>
+	parseConfig({
+		localModel: { provider: "strata", modelId: "q", subagentRef: "strata/q" },
+		localSubagents: ["scout"],
+		thresholds: { nudge: 0.7, warn: 0.8, prepare: 0.95, divert: 1.0 },
+		providers: [{ provider: "opper", reset: "utc", balance: { refreshMinutes: 15 }, ...(monthlyCapUsd === undefined ? {} : { monthlyCapUsd }) }],
+	});
+
+test("parseBalanceFigure reads the wallet in dollars and keeps the period", () => {
+	const f = parseBalanceFigure(mePayload);
+	assert.equal(f.spendUsd, 1.22);
+	assert.equal(f.balanceUsd, 8.77);
+	assert.equal(f.limitUsd, undefined);
+	assert.equal(f.blocked, false);
+	assert.equal(new Date(f.periodEndMs).toISOString(), "2026-12-01T00:00:00.000Z");
+	// A spend-limit rule becomes a ceiling of its own.
+	const capped = parseBalanceFigure({ ...mePayload, spend: { ...mePayload.spend, limit_cents: 5000 } });
+	assert.equal(capped.limitUsd, 50);
+	// A `total` budget has no period end, which is not the same as a broken date.
+	const total = parseBalanceFigure({ ...mePayload, spend: { ...mePayload.spend, budget_period: "total", period_end: null } });
+	assert.equal(total.periodEndMs, Number.POSITIVE_INFINITY);
+});
+
+test("parseBalanceFigure refuses a payload it cannot read as the organization's wallet", () => {
+	assert.throws(() => parseBalanceFigure({ ...mePayload, visibility: { organization_finance: false } }), /billing:read/);
+	assert.throws(() => parseBalanceFigure({ ...mePayload, spend: undefined }), /no organization spend block/);
+	assert.throws(() => parseBalanceFigure({ ...mePayload, balance: undefined }), /no organization balance block/);
+	assert.throws(() => parseBalanceFigure({ ...mePayload, spend: { ...mePayload.spend, period_start: "soon" } }), /period_start is not a date/);
+	assert.throws(() => parseBalanceFigure(null), /must be a JSON object/);
+});
+
+test("the wallet sets the cap when the entry sets none, and the lower ceiling wins", () => {
+	const now = new Date("2026-11-15T12:00:00Z");
+	const live = balanceLiveFigure(parseBalanceFigure(mePayload), 15, now);
+	assert.equal(effectiveCapUsd(opperCfg().providers[0], live, now), 9.99);
+	assert.equal(effectiveCapUsd(opperCfg(8).providers[0], live, now), 8);
+	const limited = balanceLiveFigure(parseBalanceFigure({ ...mePayload, spend: { ...mePayload.spend, limit_cents: 500 } }), 15, now);
+	assert.equal(effectiveCapUsd(opperCfg(8).providers[0], limited, now), 5);
+	// A figure that is not usable caps nothing: the entry's own number is all that is left.
+	assert.equal(effectiveCapUsd(opperCfg(8).providers[0], live, new Date("2027-01-01T00:00:00Z")), 8);
+	assert.equal(effectiveCapUsd(opperCfg().providers[0], live, new Date("2027-01-01T00:00:00Z")), undefined);
+});
+
+test("a wallet is tiered by the money in the account, and Pi's own calls come off the balance", () => {
+	const now = new Date("2026-11-15T12:00:00Z");
+	const pb = opperCfg().providers[0];
+	const live = balanceLiveFigure(parseBalanceFigure(mePayload), 15, now);
+	const at = providerStatus(pb, { spend: 1.22, source: "live", observationIgnored: false }, "metered", undefined, now, live);
+	assert.equal(at.capUsd, 9.99);
+	assert.equal(at.pct, 12);
+	assert.equal(at.tier, "ok");
+	// 3.00 billed after the snapshot: the denominator stays where the fetch left it.
+	const after = providerStatus(pb, { spend: 4.22, source: "live", observationIgnored: false }, "metered", undefined, now, live);
+	assert.equal(after.pct, 42);
+	assert.ok(Math.abs((after.headroomUsd ?? 0) - (9.99 - 4.22)) < 1e-9, `got ${after.headroomUsd}`);
+	assert.equal(statusLabel(after).text, "opper 42% $8.77 left");
+});
+
+test("an empty account is divert rather than a NaN percentage", () => {
+	const now = new Date("2026-11-15T12:00:00Z");
+	const pb = opperCfg().providers[0];
+	const empty = balanceLiveFigure(
+		parseBalanceFigure({ ...mePayload, balance: { balance_cents: 0 }, spend: { ...mePayload.spend, spent_cents: 0 } }),
+		15,
+		now,
+	);
+	const s = providerStatus(pb, { spend: 0, source: "live", observationIgnored: false }, "metered", undefined, now, empty);
+	assert.equal(s.tier, "divert");
+	assert.equal(s.pct, 100);
+	assert.equal(Number.isFinite(s.frac ?? Number.NaN), false);
+	assert.equal(s.headroomUsd, 0);
+	// A negative balance is an account already over, so the cap clamps at what it has billed.
+	const over = balanceLiveFigure(parseBalanceFigure({ ...mePayload, balance: { balance_cents: -50 } }), 15, now);
+	const t = providerStatus(pb, { spend: 1.22, source: "live", observationIgnored: false }, "metered", undefined, now, over);
+	assert.equal(t.capUsd, 1.22);
+	assert.equal(t.tier, "divert");
+});
+
+test("a top-up raises the cap, so the same spend reads lower", () => {
+	const now = new Date("2026-11-15T12:00:00Z");
+	const pb = opperCfg().providers[0];
+	const low = balanceLiveFigure(parseBalanceFigure({ ...mePayload, spend: { ...mePayload.spend, spent_cents: 955 }, balance: { balance_cents: 50 } }), 15, now);
+	const topped = balanceLiveFigure(parseBalanceFigure({ ...mePayload, spend: { ...mePayload.spend, spent_cents: 955 }, balance: { balance_cents: 1050 } }), 15, now);
+	assert.equal(providerStatus(pb, { spend: 9.55, source: "live", observationIgnored: false }, "metered", undefined, now, low).tier, "prepare");
+	assert.equal(providerStatus(pb, { spend: 9.55, source: "live", observationIgnored: false }, "metered", undefined, now, topped).tier, "ok");
+});
+
+test("a figure outside its period or too old stops capping and says so", () => {
+	const pb = opperCfg(8).providers[0];
+	const live = balanceLiveFigure(parseBalanceFigure(mePayload), 15, new Date("2026-11-30T23:00:00Z"));
+	const stale = providerStatus(pb, { spend: 7, source: "meter", observationIgnored: true }, "metered", undefined, new Date("2026-12-02T00:30:00Z"), live);
+	assert.equal(stale.figureStale, true);
+	assert.equal(stale.capUsd, 8);
+	assert.equal(statusLabel(stale).text, "opper ? balance unknown");
+	// Inside the period but fetched four refresh intervals ago is stale as well.
+	const old = balanceLiveFigure(parseBalanceFigure(mePayload), 15, new Date("2026-11-15T10:00:00Z"));
+	assert.equal(figureUsable(old, new Date("2026-11-15T11:30:00Z")), false);
+	assert.equal(figureUsable(old, new Date("2026-11-15T10:30:00Z")), true);
+});
+
+test("a blocked account is out of budget from the figure alone", () => {
+	const now = new Date("2026-11-15T12:00:00Z");
+	const pb = opperCfg().providers[0];
+	const blocked = balanceLiveFigure(parseBalanceFigure({ ...mePayload, blocked: true, block_reason: "org_spend_cap_hit" }), 15, now);
+	const s = providerStatus(pb, { spend: 1.22, source: "live", observationIgnored: false }, "metered", undefined, now, blocked);
+	assert.equal(s.tier, "divert");
+	assert.equal(s.exhausted?.reason, "org_spend_cap_hit");
+	assert.equal(new Date(s.exhausted?.untilMs ?? 0).toISOString(), "2026-12-01T00:00:00.000Z");
+	// An empty wallet has no period to wait out: it clears when a later fetch says it is fine again.
+	const dry = balanceLiveFigure(
+		parseBalanceFigure({ ...mePayload, blocked: true, block_reason: "balance_exhausted", balance: { balance_cents: 0 } }),
+		15,
+		now,
+	);
+	const d = providerStatus(pb, { spend: 1.22, source: "live", observationIgnored: false }, "metered", undefined, now, dry);
+	assert.equal(d.exhausted?.untilMs, undefined);
+	assert.match(usageReport("opper", [], "since 2026-11-01 00:00 UTC", d), /fail until the account has money again/);
+});
+
+test("Opper ids with colons and thinking suffixes resolve to the opper provider", () => {
+	const models = [{ provider: "opper", id: "anthropic:priority/claude-opus-5-5" }, { provider: "opper", id: "azure:eu/gpt-6.1-sol" }];
+	assert.equal(providerForModelRef("opper/anthropic:priority/claude-opus-5-5:high", models), "opper");
+	assert.equal(providerForModelRef("opper/azure:eu/gpt-6.1-sol", models), "opper");
+});
+
+test("a 402 from a prepaid gateway counts as out of budget, a 429 does not", () => {
+	assert.equal(classifyExhaustion('Error: 402 {"error":{"code":"balance_exhausted","message":"no credit left"}}')?.reason, "credit balance exhausted");
+	assert.equal(classifyExhaustion('402 project_spend_cap_hit')?.reason, "spend limit reached");
+	assert.equal(classifyExhaustion("429 rate_limit_error: Your requests have been rate limited"), undefined);
+});
+
+test("a session on a blocked provider is not asked to compact", () => {
+	const blocked: ProviderStatus = {
+		provider: "opper",
+		billing: "metered",
+		capUsd: 9.99,
+		spend: 9.99,
+		frac: 1,
+		pct: 100,
+		tier: "divert",
+		source: "live",
+		observationIgnored: false,
+		exhausted: { atMs: 1, reason: "balance_exhausted" },
+	};
+	assert.deepEqual(preSwitchCompactionStep(blocked, false), { compact: false, compacted: false });
 });

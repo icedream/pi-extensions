@@ -38,6 +38,11 @@ export interface SeatConfig {
 	credential: CredentialSource;
 }
 
+export interface BalanceConfig {
+	/** Minimum minutes between wallet fetches. */
+	refreshMinutes: number;
+}
+
 /** One provider under observation. Absent monthlyCapUsd means it is tracked but never capped. */
 export interface ProviderBudget {
 	/** Provider name as recorded in Pi session logs, e.g. "github-copilot". */
@@ -50,6 +55,11 @@ export interface ProviderBudget {
 	observed?: Observation;
 	/** Fetches the seat figure from GitHub. Only honoured for the Copilot provider. */
 	seat?: SeatConfig;
+	/**
+	 * Fetches the provider's own wallet figure. Only honoured for the `opper` provider, the same way
+	 * `seat` is only honoured for Copilot: a provider renamed locally gets no figure.
+	 */
+	balance?: BalanceConfig;
 }
 
 export interface AdvisoryConfig {
@@ -77,6 +87,7 @@ export interface BudgetConfig {
 export const DEFAULT_THRESHOLDS: Thresholds = { nudge: 0.7, warn: 0.8, prepare: 0.95, divert: 1 };
 
 export const DEFAULT_SEAT: SeatConfig = { refreshMinutes: 15, credential: "auto" };
+export const DEFAULT_BALANCE: BalanceConfig = { refreshMinutes: 15 };
 
 export const DEFAULT_ADVISORY: AdvisoryConfig = { models: [], maxModels: 8 };
 
@@ -144,6 +155,15 @@ function parseSeat(raw: unknown, name: string): SeatConfig | undefined {
 	return { refreshMinutes, credential: credentialSource(s.credential, `${name}.credential`) };
 }
 
+function parseBalance(raw: unknown, name: string): BalanceConfig | undefined {
+	if (raw === undefined) return undefined;
+	const b = raw as Record<string, unknown>;
+	if (typeof b !== "object" || b === null) throw new Error(`budget config: ${name} must be an object`);
+	const refreshMinutes = b.refreshMinutes === undefined ? DEFAULT_BALANCE.refreshMinutes : num(b.refreshMinutes, `${name}.refreshMinutes`);
+	if (refreshMinutes < 1) throw new Error(`budget config: ${name}.refreshMinutes must be >= 1`);
+	return { refreshMinutes };
+}
+
 function parseProvider(raw: unknown, shared: Thresholds): ProviderBudget {
 	const r = raw as Record<string, unknown>;
 	const name = str(r.provider, "provider");
@@ -158,6 +178,7 @@ function parseProvider(raw: unknown, shared: Thresholds): ProviderBudget {
 		billing,
 		observed: parseObserved(r.observed, `${name}.observed`),
 		seat: parseSeat(r.seat, `${name}.seat`),
+		balance: parseBalance(r.balance, `${name}.balance`),
 	};
 }
 
@@ -274,6 +295,133 @@ export function parseSeatFigure(raw: unknown): SeatFigure {
 	};
 }
 
+/** Opper's wallet snapshot, the shape `GET https://api.opper.ai/v3/me` answers with. */
+export interface BalanceFigure {
+	/** Money left in the account. Can be negative when usage overshoots the last top-up. */
+	balanceUsd: number;
+	/** Billed so far in the provider's own billing period. */
+	spendUsd: number;
+	/** A spend-limit rule the provider enforces itself. Absent when the account has none. */
+	limitUsd?: number;
+	periodStartMs: number;
+	/** Infinity for a `total` budget, which has no period end. */
+	periodEndMs: number;
+	blocked: boolean;
+	blockReason?: string;
+}
+
+/**
+ * Reads a /v3/me payload. The organization-wide fields are only there for a key with the
+ * `billing:read` permission, so a key without it is an error rather than a silently wrong budget.
+ * `project_spend` and `member_spend` are deliberately ignored: they cover a narrower scope than the
+ * balance, and mixing them would compare a project's spend against the whole organization's money.
+ */
+export function parseBalanceFigure(raw: unknown): BalanceFigure {
+	if (typeof raw !== "object" || raw === null) throw new Error("balance payload must be a JSON object");
+	const r = raw as Record<string, unknown>;
+	const visibility = r.visibility as Record<string, unknown> | undefined;
+	if (visibility?.organization_finance !== true) {
+		throw new Error("/v3/me reported no organization finance: this API key lacks the billing:read permission");
+	}
+	const spend = r.spend as Record<string, unknown> | undefined;
+	if (typeof spend !== "object" || spend === null) throw new Error("/v3/me has no organization spend block");
+	const balance = r.balance as Record<string, unknown> | undefined;
+	if (typeof balance !== "object" || balance === null) throw new Error("/v3/me has no organization balance block");
+
+	const spendUsd = num(spend.spent_cents, "spend.spent_cents") / 100;
+	// Negative is a real state: usage that overshot the last top-up. Clamping happens at the cap.
+	const balanceUsd = num(balance.balance_cents, "balance.balance_cents") / 100;
+	const limitUsd = spend.limit_cents === undefined || spend.limit_cents === null ? undefined : num(spend.limit_cents, "spend.limit_cents") / 100;
+	const periodStartMs = Date.parse(typeof spend.period_start === "string" ? spend.period_start : "");
+	if (Number.isNaN(periodStartMs)) throw new Error("spend.period_start is not a date");
+	const periodEndMs = Date.parse(typeof spend.period_end === "string" ? spend.period_end : "");
+
+	return {
+		spendUsd,
+		balanceUsd,
+		...(limitUsd === undefined ? {} : { limitUsd }),
+		periodStartMs,
+		periodEndMs: Number.isNaN(periodEndMs) ? Number.POSITIVE_INFINITY : periodEndMs,
+		blocked: r.blocked === true,
+		...(typeof r.block_reason === "string" ? { blockReason: r.block_reason } : {}),
+	};
+}
+
+/**
+ * A usage figure fetched from the provider itself. The Copilot seat and the Opper wallet both
+ * normalize into this, so the meter, the cap and the validity rule live in one place.
+ */
+export interface LiveFigure {
+	spendUsd: number;
+	/** Money left, for display. Only a wallet figure has one. */
+	balanceUsd?: number;
+	/** Seat: the credit allowance. Wallet: money spent plus money left. */
+	hardCapUsd?: number;
+	/** A ceiling the provider enforces itself, such as Opper's Spend limit rule. */
+	limitUsd?: number;
+	asOfMs: number;
+	/** The provider's own billing period. A figure outside it is ignored. */
+	validFromMs: number;
+	validUntilMs: number;
+	/** Inside its period, a figure older than this is ignored too: a fetch that keeps failing must not pin the budget to an old number. */
+	staleAfterMs: number;
+	/**
+	 * Whether the figure may set a cap. A wallet's remaining money is a hard ceiling. A seat's
+	 * entitlement is not: your own `monthlyCapUsd` stays the number, and a disagreement between the
+	 * two is reported as drift instead of silently overriding it.
+	 */
+	caps: boolean;
+	blocked?: boolean;
+	blockReason?: string;
+	label: "seat" | "balance";
+	/** One line for the refresh command, worded by whoever fetched the figure. */
+	detail: string;
+}
+
+/** A figure only counts while it is recent, inside the provider's own period, and not from the future. */
+export function figureUsable(f: LiveFigure, now: Date = new Date()): boolean {
+	const at = now.getTime();
+	return f.asOfMs <= at && f.asOfMs >= f.validFromMs && at < f.validUntilMs && at - f.asOfMs <= f.staleAfterMs;
+}
+
+export function seatLiveFigure(f: SeatFigure, usdPerCredit: number, reset: ResetZone, refreshMinutes = DEFAULT_SEAT.refreshMinutes): LiveFigure {
+	const asOf = new Date(f.asOfMs);
+	const pct = f.entitlement > 0 ? Math.round((f.creditsUsed / f.entitlement) * 100) : 0;
+	return {
+		spendUsd: f.creditsUsed * usdPerCredit,
+		hardCapUsd: f.entitlement * usdPerCredit,
+		asOfMs: f.asOfMs,
+		validFromMs: monthStartMs(asOf, reset),
+		validUntilMs: monthEndMs(asOf, reset),
+		staleAfterMs: refreshMinutes * 4 * 60_000,
+		caps: false,
+		label: "seat",
+		detail: `${f.login}: ${f.creditsUsed}/${f.entitlement} credits (${pct}%), ${f.remaining} left`,
+	};
+}
+
+/**
+ * The wallet as a live figure. The balance is clamped here: a negative balance means the account is
+ * already over, and a cap below the spend would make every percentage meaningless.
+ */
+export function balanceLiveFigure(f: BalanceFigure, refreshMinutes: number, asOfMs: Date = new Date()): LiveFigure {
+	return {
+		spendUsd: f.spendUsd,
+		balanceUsd: f.balanceUsd,
+		hardCapUsd: f.spendUsd + Math.max(0, f.balanceUsd),
+		...(f.limitUsd === undefined ? {} : { limitUsd: f.limitUsd }),
+		asOfMs: asOfMs.getTime(),
+		validFromMs: f.periodStartMs,
+		validUntilMs: f.periodEndMs,
+		staleAfterMs: refreshMinutes * 4 * 60_000,
+		caps: true,
+		blocked: f.blocked,
+		...(f.blockReason === undefined ? {} : { blockReason: f.blockReason }),
+		label: "balance",
+		detail: `${usd(f.spendUsd)} spent this period, ${usd(f.balanceUsd)} left in the account`,
+	};
+}
+
 /**
  * Start of the month containing `now`. A provider that resets on the 1st UTC needs the UTC
  * components; reading local ones and passing them to Date.UTC is off by the offset at the month edges.
@@ -281,6 +429,12 @@ export function parseSeatFigure(raw: unknown): SeatFigure {
 export function monthStartMs(now: Date = new Date(), zone: ResetZone = "local"): number {
 	if (zone === "utc") return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
 	return new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+}
+
+/** Start of the month after the one containing `now`, used as the end of a seat's period. */
+export function monthEndMs(now: Date = new Date(), zone: ResetZone = "local"): number {
+	if (zone === "utc") return Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
+	return new Date(now.getFullYear(), now.getMonth() + 1, 1).getTime();
 }
 
 async function* jsonlFiles(dir: string): AsyncGenerator<string> {
@@ -425,6 +579,10 @@ export function usageReport(
 	if (status) {
 		const cap = status.capUsd === undefined ? "no cap" : `cap ${usd(status.capUsd)}, ${status.pct}% used`;
 		head.push(`${provider}: ${status.billing}, ${cap}, spent ${usd(status.spend)} (${status.source}), ${windowText}`);
+		if (status.balanceUsd !== undefined) {
+		const fresh = status.figureStale ? ", but that figure is too old or outside its period to use" : "";
+			head.push(`account balance ${usd(status.balanceUsd)}${fresh}`);
+		}
 		if (status.source !== "meter") {
 			head.push(`logged by pi: ${usd(logged)}. The spent figure counts usage up to its own snapshot time, so the two differ.`);
 		}
@@ -433,8 +591,8 @@ export function usageReport(
 	}
 	const ex = status?.exhausted ?? remembered;
 	if (ex) {
-		const until = ex.untilMs === undefined ? "" : `, back ${new Date(ex.untilMs).toISOString()}`;
-		head.push(`OUT OF BUDGET: ${ex.reason} since ${new Date(ex.atMs).toISOString()}${until}. Calls to this provider fail until it resets.`);
+		const until = ex.untilMs === undefined ? "until the account has money again" : `until ${new Date(ex.untilMs).toISOString()}`;
+		head.push(`OUT OF BUDGET: ${ex.reason} since ${new Date(ex.atMs).toISOString()}. Calls to this provider fail ${until}.`);
 	}
 	if (rows.length === 0) return [...head, "no assistant messages logged for this window"].join("\n");
 	const total = rows.reduce((s, r) => s + r.messages, 0);
@@ -470,30 +628,32 @@ export interface MonthSpend {
 }
 
 /**
- * Month-to-date spend in USD. A live seat figure fetched from GitHub wins over the hand-written
- * `observed`. Either one, when it falls in the tracked month, is the baseline: it already counts Pi
- * and non-Pi usage up to its timestamp, and Pi-logged spend since then is added on top.
+ * Spend in the provider's billing window. A figure fetched from the provider wins over the
+ * hand-written `observed`. Either one, while it is usable, is the baseline: it already counts Pi and
+ * non-Pi usage up to its own time, and Pi-logged spend since then is added on top.
  */
 export async function monthSpend(
 	pb: ProviderBudget,
 	sessionsDir: string,
 	now: Date = new Date(),
-	live?: SeatFigure,
+	live?: LiveFigure,
 ): Promise<MonthSpend> {
+	if (live && figureUsable(live, now)) {
+		const local = await spendSince(sessionsDir, pb.provider, live.asOfMs);
+		return { spend: live.spendUsd + local, source: "live", observationIgnored: false };
+	}
 	const start = monthStartMs(now, pb.reset);
-	const o = live
-		? { creditsUsed: live.creditsUsed, usdPerCredit: pb.observed?.usdPerCredit ?? 0.01, asOfMs: live.asOfMs }
-		: pb.observed;
+	const o = pb.observed;
 	if (o && o.asOfMs >= start && o.asOfMs <= now.getTime()) {
 		const local = await spendSince(sessionsDir, pb.provider, o.asOfMs);
-		const source = live ? "live" : "calibrated";
-		return { spend: o.creditsUsed * o.usdPerCredit + local, source, observationIgnored: false };
+		return { spend: o.creditsUsed * o.usdPerCredit + local, source: "calibrated", observationIgnored: false };
 	}
-	return { spend: await spendSince(sessionsDir, pb.provider, start), source: "meter", observationIgnored: o !== undefined };
+	const ignored = o !== undefined || live !== undefined;
+	return { spend: await spendSince(sessionsDir, pb.provider, start), source: "meter", observationIgnored: ignored };
 }
 
 /**
- * Month-to-date spend for every configured provider in one walk. A provider with a live or in-month
+ * The window figure for every configured provider in one walk. A provider with a usable fetched or
  * hand-written baseline needs only the tail after that snapshot, which is a second window on the same
  * provider rather than a second walk.
  */
@@ -501,26 +661,34 @@ export async function monthSpendAll(
 	cfg: BudgetConfig,
 	sessionsDir: string,
 	now: Date = new Date(),
-	live?: Map<string, SeatFigure>,
+	live?: Map<string, LiveFigure>,
 ): Promise<Map<string, MonthSpend>> {
-	const baseline = new Map<string, Observation>();
+	const baselineUsd = new Map<string, number>();
+	const baselineSource = new Map<string, "live" | "calibrated">();
 	const windows: { key: string; provider: string; sinceMs: number }[] = [];
 	for (const pb of cfg.providers) {
-		const start = monthStartMs(now, pb.reset);
+		const monthStart = monthStartMs(now, pb.reset);
 		const fig = live?.get(pb.provider);
-		const o = fig ? { creditsUsed: fig.creditsUsed, usdPerCredit: pb.observed?.usdPerCredit ?? 0.01, asOfMs: fig.asOfMs } : pb.observed;
-		const usable = o !== undefined && o.asOfMs >= start && o.asOfMs <= now.getTime();
-		if (o && usable) baseline.set(pb.provider, o);
-		windows.push({ key: pb.provider, provider: pb.provider, sinceMs: usable ? o!.asOfMs : start });
+		const o = pb.observed;
+		if (fig && figureUsable(fig, now)) {
+			baselineUsd.set(pb.provider, fig.spendUsd);
+			baselineSource.set(pb.provider, "live");
+			windows.push({ key: pb.provider, provider: pb.provider, sinceMs: fig.asOfMs });
+		} else if (o !== undefined && o.asOfMs >= monthStart && o.asOfMs <= now.getTime()) {
+			baselineUsd.set(pb.provider, o.creditsUsed * o.usdPerCredit);
+			baselineSource.set(pb.provider, "calibrated");
+			windows.push({ key: pb.provider, provider: pb.provider, sinceMs: o.asOfMs });
+		} else {
+			windows.push({ key: pb.provider, provider: pb.provider, sinceMs: monthStart });
+		}
 	}
 	const walk = await spendByWindow(sessionsDir, windows);
 	const out = new Map<string, MonthSpend>();
 	for (const pb of cfg.providers) {
-		const o = baseline.get(pb.provider);
+		const base = baselineUsd.get(pb.provider);
 		const tail = walk.get(pb.provider) ?? 0;
-		if (o) {
-			const source: MonthSpend["source"] = live?.has(pb.provider) ? "live" : "calibrated";
-			out.set(pb.provider, { spend: o.creditsUsed * o.usdPerCredit + tail, source, observationIgnored: false });
+		if (base !== undefined) {
+			out.set(pb.provider, { spend: base + tail, source: baselineSource.get(pb.provider) as MonthSpend["source"], observationIgnored: false });
 		} else {
 			const stale = pb.observed !== undefined || live?.has(pb.provider) === true;
 			out.set(pb.provider, { spend: tail, source: "meter", observationIgnored: stale });
@@ -545,6 +713,10 @@ export interface ProviderStatus {
 	headroomUsd?: number;
 	source: MonthSpend["source"];
 	observationIgnored: boolean;
+	/** Money left in a prepaid account, from the provider's own figure. */
+	balanceUsd?: number;
+	/** A figure was fetched for this provider but is too old or outside its period to use. */
+	figureStale?: boolean;
 }
 
 /** Billing shape for a provider: the config wins, otherwise a Copilot seat is credits and a zero-priced model is free. */
@@ -556,25 +728,70 @@ export function billingFor(pb: ProviderBudget, models: readonly RegistryModelLik
 	return "metered";
 }
 
-export function providerStatus(pb: ProviderBudget, m: MonthSpend, billing: Billing, exhausted?: Exhaustion, now: Date = new Date()): ProviderStatus {
+/**
+ * The cap a provider is tiered against. `monthlyCapUsd` is the ceiling you set for yourself; a wallet
+ * adds two of its own, the money actually in the account and any spend-limit rule the provider
+ * enforces. A seat figure adds nothing: its entitlement is reported to you as drift rather than
+ * quietly overriding your number.
+ */
+export function effectiveCapUsd(pb: ProviderBudget, live?: LiveFigure, now: Date = new Date()): number | undefined {
+	const ceilings: number[] = [];
+	if (pb.monthlyCapUsd !== undefined) ceilings.push(pb.monthlyCapUsd);
+	if (live && live.caps && figureUsable(live, now)) {
+		if (live.limitUsd !== undefined) ceilings.push(live.limitUsd);
+		if (live.hardCapUsd !== undefined) ceilings.push(live.hardCapUsd);
+	}
+	return ceilings.length === 0 ? undefined : Math.min(...ceilings);
+}
+
+export function providerStatus(
+	pb: ProviderBudget,
+	m: MonthSpend,
+	billing: Billing,
+	exhausted?: Exhaustion,
+	now: Date = new Date(),
+	live?: LiveFigure,
+): ProviderStatus {
 	const s: ProviderStatus = {
 		provider: pb.provider,
 		billing,
-		capUsd: pb.monthlyCapUsd,
+		capUsd: effectiveCapUsd(pb, live, now),
 		spend: m.spend,
 		tier: "ok",
 		source: m.source,
 		observationIgnored: m.observationIgnored,
+		...(live?.balanceUsd === undefined ? {} : { balanceUsd: live.balanceUsd }),
+		...(live === undefined ? {} : { figureStale: !figureUsable(live, now) }),
 	};
-	if (pb.monthlyCapUsd !== undefined) {
-		s.frac = m.spend / pb.monthlyCapUsd;
-		s.pct = Math.round(s.frac * 100);
-		s.tier = tierFor(s.frac, pb.thresholds);
-		s.headroomUsd = Math.max(0, pb.monthlyCapUsd - m.spend);
+	if (s.capUsd !== undefined) {
+		if (s.capUsd <= 0) {
+			// A drained wallet leaves no denominator. tierFor would read NaN as "ok" and the footer
+			// would divide by zero, so an empty account is divert on its own terms.
+			s.frac = Number.POSITIVE_INFINITY;
+			s.pct = 100;
+			s.tier = "divert";
+			s.headroomUsd = 0;
+		} else {
+			s.frac = m.spend / s.capUsd;
+			s.pct = Math.round(s.frac * 100);
+			s.tier = tierFor(s.frac, pb.thresholds);
+			s.headroomUsd = Math.max(0, s.capUsd - m.spend);
+		}
 	}
 	// The provider's own refusal outranks the meter: a cap configured above the account's real limit
-	// reads low right up until every call fails, so an observed refusal is the stronger signal.
-	if (exhausted && exhaustionActive(exhausted, pb.reset, now)) {
+	// reads low right up until every call fails. A fresh "blocked" from the provider is the strongest
+	// signal there is, and it expires with the figure rather than outliving a top-up.
+	if (live && live.caps && live.blocked && figureUsable(live, now)) {
+		// Only a spend-cap rule resets with the period. An empty balance stays empty until it is topped
+		// up, so giving it a period end would promise a recovery that never comes.
+		const periodScoped = (live.blockReason ?? "").endsWith("_spend_cap_hit");
+		s.exhausted = {
+			atMs: live.asOfMs,
+			...(periodScoped && Number.isFinite(live.validUntilMs) ? { untilMs: live.validUntilMs } : {}),
+			reason: live.blockReason ?? "the provider reports spending blocked",
+		};
+		s.tier = "divert";
+	} else if (exhausted && exhaustionActive(exhausted, pb.reset, now)) {
 		s.exhausted = exhausted;
 		s.tier = "divert";
 	}
@@ -600,6 +817,10 @@ const EXHAUSTION_PATTERNS: { match: RegExp; reason: string }[] = [
 	{ match: /credit balance is too low/i, reason: "credit balance exhausted" },
 	{ match: /insufficient_quota|exceeded your current quota/i, reason: "quota exhausted" },
 	{ match: /quota_exceeded|quota exceeded/i, reason: "quota exhausted" },
+	// A prepaid gateway refuses the next call with 402 and names the cause. A plain 429 stays out of
+	// this list: that is a throttle, not an empty account.
+	{ match: /balance_exhausted/i, reason: "credit balance exhausted" },
+	{ match: /(?:project|member|org)_spend_cap_hit/i, reason: "spend limit reached" },
 ];
 
 /** "You will regain access on 2026-12-01 at 00:00 UTC" and plain ISO dates. */
@@ -670,6 +891,9 @@ export interface CompactionStep {
  */
 export function preSwitchCompactionStep(session: ProviderStatus | undefined, compacted: boolean): CompactionStep {
 	if (!session) return { compact: false, compacted };
+	// ctx.compact() summarizes with the model of the session, so a session on a provider that is
+	// already refusing calls would only fail, clear its flag, and try again on the next agent_end.
+	if (session.exhausted) return { compact: false, compacted };
 	if (session.tier !== "prepare" && session.tier !== "divert") return { compact: false, compacted: false };
 	if (compacted) return { compact: false, compacted: true };
 	return { compact: true, compacted: true };
@@ -697,10 +921,13 @@ export function shortName(provider: string): string {
 export function statusLabel(s: ProviderStatus): { text: string; color: "dim" | "accent" | "warning" | "error" } {
 	const name = shortName(s.provider);
 	if (s.exhausted) return { text: `${name} out of budget`, color: "error" };
+	// The meter can still print a number, but the one that matters is unknown.
+	if (s.figureStale && s.balanceUsd !== undefined) return { text: `${name} ? balance unknown`, color: "warning" };
 	if (s.capUsd === undefined) return { text: `${name} ${usd(s.spend)}`, color: "dim" };
 	const estimate = s.source === "meter" ? "~" : "";
+	const balance = s.balanceUsd === undefined ? "" : ` ${usd(s.balanceUsd)} left`;
 	const mark = s.tier === "prepare" ? " !" : s.tier === "divert" ? " over" : "";
-	return { text: `${name} ${estimate}${s.pct}%${mark}`, color: STATUS_COLORS[s.tier] };
+	return { text: `${name} ${estimate}${s.pct}%${balance}${mark}`, color: STATUS_COLORS[s.tier] };
 }
 
 function usd(v: number): string {
@@ -877,9 +1104,18 @@ function pad(v: string, w: number): string {
 function headroomLabel(s: ProviderStatus | undefined): string {
 	if (!s) return "not tracked";
 	if (s.exhausted) return "out of budget";
+	// For a prepaid account the money left is the headroom, and it is the number worth reading.
+	if (s.balanceUsd !== undefined) return s.figureStale ? "balance unknown" : `${usd(s.balanceUsd)} left`;
 	if (s.capUsd === undefined) return "no cap";
 	if (s.tier === "divert") return "over cap";
 	return `${Math.max(0, Math.round(((s.capUsd - s.spend) / s.capUsd) * 100))}% left`;
+}
+
+/** Where the spent figure came from, with the kind of figure named when there is a fetched one. */
+function figureLabel(s: ProviderStatus): string {
+	if (s.source === "live") return s.balanceUsd === undefined ? "live (seat)" : "live (balance)";
+	if (s.figureStale) return `${s.source} (figure stale)`;
+	return s.source;
 }
 
 /** Column widths come from the data, so a $1000000 cap does not shift the rest of the row. */
@@ -898,7 +1134,7 @@ export function costTable(statuses: readonly ProviderStatus[], routes: readonly 
 		usd(s.spend),
 		s.pct === undefined ? "-" : `${s.pct}%`,
 		headroomLabel(s),
-		s.source,
+		figureLabel(s),
 	]);
 	const out = [renderTable(["provider", "billing", "cap", "spent", "pct", "headroom", "figure"], providerRows)];
 	if (routes.length > 0) {

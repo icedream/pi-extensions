@@ -38,6 +38,7 @@ function fakePi(): FakePi {
 
 const MODELS = [
 	{ provider: "github-copilot", id: "claude-sonnet-5.5", cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 }, contextWindow: 1_000_000 },
+	{ provider: "opper", id: "aws/claude-sonnet-5-5", cost: { input: 2.2, output: 11, cacheRead: 0.25, cacheWrite: 2.75 }, contextWindow: 1_000_000 },
 	{ provider: "mistral", id: "magistral-medium-latest", cost: { input: 2, output: 5, cacheRead: 0, cacheWrite: 0.6 }, contextWindow: 128_000 },
 	{ provider: "strata", id: "local", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 393_216 },
 ];
@@ -140,7 +141,7 @@ test("registers the budget tool, both commands, and one footer key per provider"
 	await pi.handlers.get("before_agent_start")?.[0]({ systemPromptOptions: {} }, fakeCtx(trace));
 
 	assert.ok(pi.tools.get("budget"), "budget tool missing");
-	assert.ok(pi.commands.get("budget") && pi.commands.get("budget-seat"), "commands missing");
+	assert.ok(pi.commands.get("budget") && pi.commands.get("budget-seat") && pi.commands.get("budget-balance"), "commands missing");
 	assert.deepEqual([...trace.statuses.keys()].sort(), ["budget-routing/anthropic", "budget-routing/github-copilot", "budget-routing/mistral"]);
 	assert.equal(trace.statuses.get("budget-routing/github-copilot"), "copilot ~10%");
 });
@@ -402,4 +403,127 @@ test("/budget clear drops a remembered refusal", async () => {
 	assert.match(await runBudget(pi, "clear anthropic", trace), /cleared the out-of-budget state for anthropic/);
 	assert.doesNotMatch(await runBudget(pi, "anthropic", trace), /OUT OF BUDGET/);
 	assert.match(await runBudget(pi, "clear nope", trace), /nope was not marked out of budget/);
+});
+
+/** What /v3/me answers for a wallet with `balanceCents` left and `spentCents` billed this period. */
+function mePayload(spentCents: number, balanceCents: number, blocked = false, blockReason?: string) {
+	const now = new Date();
+	const periodStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
+	const periodEnd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)).toISOString();
+	return {
+		object: "me",
+		organization: { name: "acme", plan: "gateway" },
+		project: { name: "default" },
+		visibility: { organization_finance: true },
+		balance: { balance_cents: balanceCents },
+		spend: { spent_cents: spentCents, limit_cents: null, period_start: periodStart, period_end: periodEnd },
+		blocked,
+		...(blockReason === undefined ? {} : { block_reason: blockReason }),
+	};
+}
+
+/**
+ * The same throwaway agent directory, but with a prepaid gateway under observation and a stubbed
+ * /v3/me, so the wallet path runs end to end without a network.
+ */
+async function loadOpper(opts: {
+	monthlyCapUsd?: number;
+	me?: unknown;
+	noKey?: boolean;
+	fetchShouldFail?: boolean;
+	onFetch?: () => void;
+} = {}) {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "budget-opper-"));
+	const now = Date.now();
+	await fs.mkdir(path.join(dir, "sessions", "proj"), { recursive: true });
+	await fs.writeFile(
+		path.join(dir, "sessions", "proj", "current.jsonl"),
+		[line("opper", now - 5 * 60_000, 0.35, "aws/claude-sonnet-5-5", 400, 90_000)].join("\n") + "\n",
+	);
+	const config = {
+		localModel: { provider: "strata", modelId: "local", subagentRef: "strata/local" },
+		localSubagents: ["scout"],
+		thresholds: { nudge: 0.7, warn: 0.8, prepare: 0.95, divert: 1 },
+		enforce: "reject",
+		providers: [{ provider: "opper", reset: "utc", billing: "metered", balance: { refreshMinutes: 15 }, ...(opts.monthlyCapUsd === undefined ? {} : { monthlyCapUsd: opts.monthlyCapUsd }) }],
+	};
+	await fs.writeFile(path.join(dir, "budget-routing.json"), JSON.stringify(config));
+	await fs.writeFile(path.join(dir, "settings.json"), JSON.stringify(SETTINGS));
+	process.env.PI_BUDGET_ROUTING_AGENT_DIR = dir;
+	process.env.PI_BUDGET_ROUTING_CONFIG = path.join(dir, "budget-routing.json");
+	const mod = await import(`./index.ts?opperdir=${encodeURIComponent(dir)}`);
+	const pi = fakePi();
+	mod.default(pi as never);
+
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = (async () => {
+		opts.onFetch?.();
+		if (opts.fetchShouldFail) return new Response("nope", { status: 401 });
+		return new Response(JSON.stringify(opts.me ?? mePayload(122, 877)), { status: 200 });
+	}) as typeof fetch;
+
+	const trace = newTrace();
+	const ctx = fakeCtx(trace, "opper");
+	(ctx.modelRegistry as Record<string, unknown>).getApiKeyForProvider = async () => (opts.noKey ? undefined : "opp-key");
+	await pi.handlers.get("session_start")?.[0]({}, ctx);
+	return { pi, ctx, trace, restore: () => (globalThis.fetch = realFetch) };
+}
+
+test("a wallet figure sets the cap, the footer and the report", async () => {
+	const { pi, trace, restore } = await loadOpper();
+	try {
+		assert.equal(await statusEventually(trace, "budget-routing/opper", "opper 12% $8.77 left"), "opper 12% $8.77 left");
+		const out = await runBudget(pi, "opper", trace);
+		assert.match(out, /opper: metered, cap \$9\.99, 12% used/);
+		assert.match(out, /account balance \$8\.77/);
+		// The single-provider report names the source; only the all-provider table labels the kind.
+		assert.match(await runBudget(pi, "", trace), /live \(balance\)/);
+	} finally {
+		restore();
+	}
+});
+
+test("an empty wallet refuses launches aimed at it and leaves the session alone", async () => {
+	const { pi, ctx, trace, restore } = await loadOpper({ me: mePayload(122, 0, true, "balance_exhausted") });
+	try {
+		assert.equal(await statusEventually(trace, "budget-routing/opper", "opper out of budget"), "opper out of budget");
+		const toolCall = pi.handlers.get("tool_call")?.[0];
+		const blocked = await toolCall?.({ toolName: "subagent", input: { agent: "worker", task: "x", model: "opper/aws/claude-sonnet-5-5" } }, ctx);
+		assert.equal(blocked?.block, true);
+		assert.match(blocked?.reason, /out of budget on opper \(balance_exhausted\)/);
+		// A launch that spends another provider is untouched by a drained wallet.
+		const passed = await toolCall?.({ toolName: "subagent", input: { agent: "scout", task: "x", model: "mistral/magistral-medium-latest" } }, ctx);
+		assert.equal(passed, undefined);
+		// Compacting would summarize with the provider that is refusing calls, so it is skipped.
+		await pi.handlers.get("agent_end")?.[0]({}, ctx);
+		assert.equal(trace.compacts, 0);
+	} finally {
+		restore();
+	}
+});
+
+test("no API key means no wallet, and the provider is metered from logs with one notice", async () => {
+	const { pi, trace, restore } = await loadOpper({ noKey: true });
+	try {
+		// Only the logged 0.35 is known, and with no cap the spend is what the footer shows.
+		assert.equal(await statusEventually(trace, "budget-routing/opper", "opper $0.35"), "opper $0.35");
+		assert.equal(trace.notices.filter((n) => /no API key for opper/.test(n)).length, 1);
+	} finally {
+		restore();
+	}
+});
+
+test("a failing balance fetch is attempted once, not on every settle", async () => {
+	let calls = 0;
+	const { pi, ctx, trace, restore } = await loadOpper({ fetchShouldFail: true, onFetch: () => calls++ });
+	try {
+		await pi.handlers.get("agent_settled")?.[0]({}, ctx);
+		await pi.handlers.get("agent_settled")?.[0]({}, ctx);
+		await new Promise((r) => setTimeout(r, 50));
+		// One attempt from session_start; the settles are inside the refresh window.
+		assert.equal(calls, 1);
+		assert.equal(trace.notices.filter((n) => /balance refresh failed/.test(n)).length, 1);
+	} finally {
+		restore();
+	}
 });
