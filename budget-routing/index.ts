@@ -30,11 +30,15 @@ import {
 	loadConfig,
 	menuModelRefs,
 	monthSpendAll,
+	monthStartMs,
 	parseAgentOverrideModels,
 	preSwitchCompactionStep,
 	providerStatus,
 	rejectReason,
 	statusLabel,
+	usageReport,
+	usageSince,
+	windowLabel,
 	type BudgetConfig,
 	type CredentialSource,
 	type MonthSpend,
@@ -225,6 +229,16 @@ export default function (pi: ExtensionAPI) {
 		return buildRoutes(refs, ctx.modelRegistry.getAll(), snap.statuses, snap.cfg.localModel.subagentRef);
 	}
 
+	/** Provider names from the config, for argument completion. Empty when there is no usable config. */
+	async function configuredProviders(): Promise<string[]> {
+		if (!existsSync(CONFIG_PATH)) return [];
+		try {
+			return (await loadConfig(CONFIG_PATH)).providers.map((p) => p.provider);
+		} catch {
+			return [];
+		}
+	}
+
 	function monthKey(): string {
 		const d = new Date();
 		return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
@@ -238,15 +252,40 @@ export default function (pi: ExtensionAPI) {
 			.catch(() => undefined);
 	});
 
+	// /budget shows every tracked provider and its priced routes. /budget <provider> shows that provider's
+	// state and per-model usage for the current window, for any provider the session logs have seen.
 	pi.registerCommand("budget", {
-		description: "Spend, caps and priced routes for every tracked provider",
-		handler: async (_args, ctx) => {
+		description: "Spend and caps for all tracked providers, or per-model usage for one: /budget [provider]",
+		getArgumentCompletions: async (prefix) => {
+			const names = await configuredProviders();
+			const items = names.filter((n) => n.startsWith(prefix.trim())).map((n) => ({ value: n, label: n }));
+			return items.length > 0 ? items : null;
+		},
+		handler: async (args, ctx) => {
+			const want = args.trim();
 			const snap = await safeSnapshot(ctx);
 			if (!snap) {
 				ctx.ui.notify(`budget-routing: no config at ${CONFIG_PATH}`, "warning");
 				return;
 			}
-			ctx.ui.notify(costTable(snap.statuses, await routesFor(ctx, snap)), "info");
+			if (want === "") {
+				ctx.ui.notify(costTable(snap.statuses, await routesFor(ctx, snap)), "info");
+				return;
+			}
+
+			const status = snap.statuses.find((s) => s.provider === want);
+			const zone = snap.cfg.providers.find((p) => p.provider === want)?.reset ?? "local";
+			const start = monthStartMs(new Date(), zone);
+			const rows = await usageSince(SESSIONS_DIR, want, start);
+			if (!status && rows.length === 0) {
+				const known = [...new Set([...snap.statuses.map((s) => s.provider)])].join(", ");
+				ctx.ui.notify(
+					`budget-routing: no usage logged for "${want}" this month. Tracked: ${known}. Usage comes from session logs, so a provider shows up once a session has used it.`,
+					"warning",
+				);
+				return;
+			}
+			ctx.ui.notify(usageReport(want, rows, windowLabel(start, zone), status), "info");
 		},
 	});
 

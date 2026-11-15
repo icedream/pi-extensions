@@ -302,8 +302,15 @@ async function* jsonlFiles(dir: string): AsyncGenerator<string> {
 interface AssistantMessage {
 	role?: string;
 	provider?: string;
+	model?: string;
 	timestamp?: number;
-	usage?: { cost?: { total?: number } };
+	usage?: {
+		input?: number;
+		output?: number;
+		cacheRead?: number;
+		cacheWrite?: number;
+		cost?: { total?: number };
+	};
 }
 
 /**
@@ -342,6 +349,105 @@ export async function spendByWindow(sessionsDir: string, windows: { key: string;
 /** Sum of Pi-estimated cost for assistant messages from `provider` at or after `sinceMs`. */
 export async function spendSince(sessionsDir: string, provider: string, sinceMs: number): Promise<number> {
 	return (await spendByWindow(sessionsDir, [{ key: provider, provider, sinceMs }])).get(provider) ?? 0;
+}
+
+export interface ModelUsage {
+	model: string;
+	messages: number;
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	/** Pi's estimate at registry prices, USD. */
+	cost: number;
+}
+
+/** Per-model usage of one provider since `sinceMs`, one walk of the session tree. Largest cost first. */
+export async function usageSince(sessionsDir: string, provider: string, sinceMs: number): Promise<ModelUsage[]> {
+	const byModel = new Map<string, ModelUsage>();
+	for await (const fp of jsonlFiles(sessionsDir)) {
+		if ((await stat(fp)).mtimeMs < sinceMs) continue;
+		const text = await readFile(fp, "utf8");
+		for (const line of text.split("\n")) {
+			if (!line.includes('"role":"assistant"')) continue;
+			let m: AssistantMessage | undefined;
+			try {
+				m = JSON.parse(line).message as AssistantMessage | undefined;
+			} catch {
+				continue;
+			}
+			if (!m || m.role !== "assistant" || m.provider !== provider || (m.timestamp ?? 0) < sinceMs) continue;
+			const model = m.model ?? "(unknown model)";
+			const u = m.usage ?? {};
+			const row = byModel.get(model) ?? { model, messages: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+			row.messages++;
+			row.input += u.input ?? 0;
+			row.output += u.output ?? 0;
+			row.cacheRead += u.cacheRead ?? 0;
+			row.cacheWrite += u.cacheWrite ?? 0;
+			row.cost += u.cost?.total ?? 0;
+			byModel.set(model, row);
+		}
+	}
+	return [...byModel.values()].sort((a, b) => b.cost - a.cost || a.model.localeCompare(b.model));
+}
+
+/** Token counts in the compact form the report uses: 812, 14k, 2.4M, 3.5B. */
+export function formatTokens(n: number): string {
+	if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+	if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+	if (n >= 1e3) return `${Math.round(n / 1e3)}k`;
+	return String(n);
+}
+
+/** The window a report covers, named in the zone the provider resets in. */
+export function windowLabel(startMs: number, zone: ResetZone): string {
+	const d = new Date(startMs);
+	const pad = (n: number) => String(n).padStart(2, "0");
+	if (zone === "utc") return `since ${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} 00:00 UTC`;
+	return `since ${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} 00:00 local`;
+}
+
+/**
+ * The `/budget <provider>` report: the cap state when the provider is tracked, then what the session
+ * logs show per model. When the spent figure comes from the provider's own usage page, the logged total
+ * is shown beside it, since the two cover different spans.
+ */
+export function usageReport(provider: string, rows: readonly ModelUsage[], windowText: string, status?: ProviderStatus): string {
+	const logged = rows.reduce((s, r) => s + r.cost, 0);
+	const head: string[] = [];
+	if (status) {
+		const cap = status.capUsd === undefined ? "no cap" : `cap ${usd(status.capUsd)}, ${status.pct}% used`;
+		head.push(`${provider}: ${status.billing}, ${cap}, spent ${usd(status.spend)} (${status.source}), ${windowText}`);
+		if (status.source !== "meter") {
+			head.push(`logged by pi: ${usd(logged)}. The spent figure counts usage up to its own snapshot time, so the two differ.`);
+		}
+	} else {
+		head.push(`${provider}: not in budget-routing.json, usage only, logged ${usd(logged)}, ${windowText}`);
+	}
+	if (rows.length === 0) return [...head, "no assistant messages logged for this window"].join("\n");
+	const total = rows.reduce((s, r) => s + r.messages, 0);
+	const sum = (f: (r: ModelUsage) => number) => rows.reduce((s, r) => s + f(r), 0);
+	const body = rows.map((r) => [
+		r.model,
+		String(r.messages),
+		formatTokens(r.input),
+		formatTokens(r.output),
+		formatTokens(r.cacheRead),
+		formatTokens(r.cacheWrite),
+		usd(r.cost),
+	]);
+	const totals = [
+		"total",
+		String(total),
+		formatTokens(sum((r) => r.input)),
+		formatTokens(sum((r) => r.output)),
+		formatTokens(sum((r) => r.cacheRead)),
+		formatTokens(sum((r) => r.cacheWrite)),
+		usd(logged),
+	];
+	const table = renderTable(["model", "msgs", "input", "output", "cache r", "cache w", "cost"], [...body, totals]);
+	return [...head, "", table].join("\n");
 }
 
 export interface MonthSpend {

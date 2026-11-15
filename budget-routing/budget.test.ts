@@ -25,10 +25,14 @@ import {
 	providerForModelRef,
 	providerStatus,
 	rejectReason,
+	formatTokens,
 	spendByWindow,
 	spendSince,
 	statusLabel,
 	tierFor,
+	usageReport,
+	usageSince,
+	windowLabel,
 	type ProviderStatus,
 	type Tier,
 } from "./budget.ts";
@@ -36,6 +40,13 @@ import { pickGitHubToken } from "./credential.ts";
 
 const line = (provider: string, role: string, timestamp: number, cost: number) =>
 	JSON.stringify({ type: "message", message: { role, provider, timestamp, usage: { cost: { total: cost } } } });
+
+// A full usage record, the shape Pi writes for every assistant message.
+const usageLine = (provider: string, model: string, timestamp: number, u: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: number }) =>
+	JSON.stringify({
+		type: "message",
+		message: { role: "assistant", provider, model, timestamp, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, ...u, cost: { total: u.cost ?? 0 } } },
+	});
 
 async function tmpSessions(): Promise<string> {
 	return fs.mkdtemp(path.join(os.tmpdir(), "budget-routing-test-"));
@@ -86,6 +97,97 @@ test("spendSince skips subagent transcripts that duplicate child sessions", asyn
 
 test("spendSince returns 0 for a missing sessions directory", async () => {
 	assert.equal(await spendSince(path.join(os.tmpdir(), "does-not-exist-budget"), "github-copilot", 0), 0);
+});
+
+test("usageSince breaks one provider down by model, largest cost first", async () => {
+	const dir = await tmpSessions();
+	const now = Date.now();
+	const since = now - 3_600_000;
+	await fs.mkdir(path.join(dir, "proj"));
+	await fs.writeFile(
+		path.join(dir, "proj", "s.jsonl"),
+		[
+			usageLine("anthropic", "claude-haiku-5-5", now, { input: 10, output: 20, cacheRead: 30, cacheWrite: 40, cost: 0.5 }),
+			usageLine("anthropic", "claude-sonnet-5-5", now, { input: 100, output: 200, cacheRead: 300, cacheWrite: 400, cost: 2.5 }),
+			usageLine("anthropic", "claude-haiku-5-5", now, { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.25 }),
+			usageLine("mistral", "magistral-medium-latest", now, { input: 5, output: 6, cost: 9 }), // other provider: ignored
+			usageLine("anthropic", "claude-haiku-5-5", since - 1000, { input: 999, cost: 99 }), // before the window: ignored
+		].join("\n") + "\n",
+	);
+	const rows = await usageSince(dir, "anthropic", since);
+	assert.deepEqual(rows.map((r) => r.model), ["claude-sonnet-5-5", "claude-haiku-5-5"]);
+	assert.deepEqual(rows[0], { model: "claude-sonnet-5-5", messages: 1, input: 100, output: 200, cacheRead: 300, cacheWrite: 400, cost: 2.5 });
+	assert.deepEqual(rows[1], { model: "claude-haiku-5-5", messages: 2, input: 11, output: 22, cacheRead: 33, cacheWrite: 44, cost: 0.75 });
+});
+
+test("usageSince returns nothing for a provider with no logged messages", async () => {
+	const dir = await tmpSessions();
+	assert.deepEqual(await usageSince(dir, "anthropic", 0), []);
+	assert.deepEqual(await usageSince(path.join(os.tmpdir(), "does-not-exist-usage"), "anthropic", 0), []);
+});
+
+test("formatTokens keeps the report columns narrow", () => {
+	assert.equal(formatTokens(0), "0");
+	assert.equal(formatTokens(812), "812");
+	assert.equal(formatTokens(14_400), "14k");
+	assert.equal(formatTokens(2_440_000), "2.4M");
+	assert.equal(formatTokens(3_500_000_000), "3.5B");
+});
+
+test("windowLabel names the zone the window starts in", () => {
+	assert.equal(windowLabel(Date.UTC(2026, 10, 1), "utc"), "since 2026-11-01 00:00 UTC");
+	assert.equal(windowLabel(new Date(2026, 10, 1).getTime(), "local"), "since 2026-11-01 00:00 local");
+});
+
+test("usageReport shows the cap state, the per-model table, and a total row", () => {
+	const rows = [
+		{ model: "claude-sonnet-5-5", messages: 2, input: 100, output: 200, cacheRead: 300, cacheWrite: 400, cost: 2.5 },
+		{ model: "claude-haiku-5-5", messages: 1, input: 10, output: 20, cacheRead: 30, cacheWrite: 40, cost: 0.5 },
+	];
+	const status: ProviderStatus = {
+		provider: "anthropic",
+		billing: "metered",
+		capUsd: 60,
+		spend: 3,
+		pct: 5,
+		tier: "ok",
+		source: "meter",
+		observationIgnored: false,
+	};
+	const out = usageReport("anthropic", rows, "since 2026-11-01 00:00 UTC", status);
+	assert.match(out, /^anthropic: metered, cap \$60\.00, 5% used, spent \$3\.00 \(meter\), since 2026-11-01 00:00 UTC/);
+	assert.match(out, /model +msgs +input +output +cache r +cache w +cost/);
+	assert.match(out, /claude-sonnet-5-5 +2 +100 +200 +300 +400 +\$2\.50/);
+	assert.match(out, /total +3 +110 +220 +330 +440 +\$3\.00/);
+	// A meter figure already is the logged total, so there is nothing to reconcile.
+	assert.ok(!/logged by pi/.test(out));
+});
+
+test("usageReport explains why a fetched figure and the logged total differ", () => {
+	const rows = [{ model: "claude-sonnet-5.5", messages: 1, input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 1.5 }];
+	const status: ProviderStatus = {
+		provider: "github-copilot",
+		billing: "credits",
+		capUsd: 150,
+		spend: 136.5,
+		pct: 91,
+		tier: "warn",
+		source: "live",
+		observationIgnored: false,
+	};
+	const out = usageReport("github-copilot", rows, "since 2026-11-01 00:00 local", status);
+	assert.match(out, /spent \$136\.50 \(live\)/);
+	assert.match(out, /logged by pi: \$1\.50/);
+});
+
+test("usageReport handles an untracked provider and an empty window", () => {
+	const rows = [{ model: "qwen3.8-flash-next-iq3_s", messages: 4, input: 1000, output: 500, cacheRead: 0, cacheWrite: 0, cost: 0 }];
+	const untracked = usageReport("strata", rows, "since 2026-11-01 00:00 local");
+	assert.match(untracked, /^strata: not in budget-routing\.json, usage only, logged \$0\.00/);
+	assert.match(untracked, /qwen3\.8-flash-next-iq3_s +4 +1k +500 +0 +0 +\$0\.00/);
+
+	const empty = usageReport("freellmapi", [], "since 2026-11-01 00:00 local");
+	assert.match(empty, /no assistant messages logged for this window/);
 });
 
 test("tierFor maps fractions to tiers at the threshold boundaries", () => {

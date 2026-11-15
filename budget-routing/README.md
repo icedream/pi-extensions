@@ -105,7 +105,32 @@ registry price is what the same model would cost on a metered API, while what yo
 seat credit per request. A reference that is not in the registry stays in the table marked `price
 unknown` rather than disappearing, so a typo in `advisory.models` is visible.
 
-`/budget` prints the same table for you.
+## The `/budget` command
+
+`/budget` prints the table above for you, in the TUI only, so it costs no model tokens.
+
+`/budget <provider>` prints one provider's state and its per-model usage for the current window:
+
+```
+anthropic: metered, no cap, spent $5.89 (meter), since 2026-11-01 00:00 UTC
+
+model              msgs  input  output  cache r  cache w  cost
+claude-haiku-5-5   168   368    297k    60.0M    1.8M     $4.89
+claude-sonnet-5-5  33    70     58k     1.4M     113k     $1.00
+total              201   438    355k    61.4M    1.9M     $5.89
+```
+
+The argument completes from the providers in your config, but it is not limited to them: any provider
+name that appears in the session logs works, including ones you never configured, and those are marked
+`not in budget-routing.json, usage only`. A local provider shows its token counts at `$0.00`, which is
+still useful for spotting which model a session actually ran on.
+
+When the spent figure comes from the provider's own usage page (`source` is `live` or `calibrated`)
+the report also prints what Pi logged, because the two cover different spans: the provider figure
+counts everything up to its snapshot, the log only what this machine recorded after it.
+
+Usage is read from the session logs, so it covers this machine only and starts at the provider's own
+month boundary (`reset`).
 
 ## Seat figure
 

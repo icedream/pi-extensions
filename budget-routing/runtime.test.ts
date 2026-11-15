@@ -75,8 +75,11 @@ function fakeCtx(trace: Trace, provider = "github-copilot") {
 	};
 }
 
-const line = (provider: string, timestamp: number, cost: number) =>
-	JSON.stringify({ type: "message", message: { role: "assistant", provider, timestamp, usage: { cost: { total: cost } } } });
+const line = (provider: string, timestamp: number, cost: number, model = "m", input = 0, output = 0) =>
+	JSON.stringify({
+		type: "message",
+		message: { role: "assistant", provider, model, timestamp, usage: { input, output, cacheRead: 0, cacheWrite: 0, cost: { total: cost } } },
+	});
 
 const SETTINGS = { subagents: { agentOverrides: { worker: { model: "github-copilot/claude-sonnet-5.5" }, scout: { model: "mistral/magistral-medium-latest" } } } };
 
@@ -90,7 +93,12 @@ async function loadWith(capCopilot: number | undefined, capMistral = 20) {
 	await fs.mkdir(path.join(dir, "sessions", "proj"), { recursive: true });
 	await fs.writeFile(
 		path.join(dir, "sessions", "proj", "current.jsonl"),
-		[line("github-copilot", now, 5), line("mistral", now, 0.2), line("strata", now, 0)].join("\n") + "\n",
+		[
+			line("github-copilot", now, 4.5, "claude-sonnet-5.5", 600, 300_000),
+			line("github-copilot", now, 0.5, "claude-haiku-5.5", 40, 60_000),
+			line("mistral", now, 0.2, "magistral-medium-latest", 100, 20_000),
+			line("strata", now, 0, "qwen3.8-flash-next-iq3_s", 900, 400),
+		].join("\n") + "\n",
 	);
 	const config = {
 		localModel: { provider: "strata", modelId: "local", subagentRef: "strata/local" },
@@ -246,4 +254,63 @@ test("footer keys for providers removed from the config are cleared", async () =
 	const trace = newTrace();
 	await pi.handlers.get("before_agent_start")?.[0]({ systemPromptOptions: {} }, fakeCtx(trace));
 	assert.equal(trace.statuses.get("budget-routing/mistral"), undefined);
+});
+
+// --- /budget -----------------------------------------------------------------------------------
+
+async function runBudget(pi: FakePi, args: string, trace: Trace): Promise<string> {
+	const cmd = pi.commands.get("budget") as { handler: (args: string, ctx: unknown) => Promise<void> };
+	const before = trace.notices.length;
+	await cmd.handler(args, fakeCtx(trace));
+	return trace.notices.slice(before).join("\n");
+}
+
+test("/budget with no argument keeps the all-provider table", async () => {
+	const { pi } = await loadWith(50);
+	const out = await runBudget(pi, "", newTrace());
+	assert.match(out, /provider +billing +cap +spent +pct +headroom +figure/);
+	assert.match(out, /copilot +credits +\$50\.00 +\$5\.00 +10%/);
+	assert.match(out, /route +billing/);
+});
+
+test("/budget <provider> shows that provider's per-model usage", async () => {
+	const { pi } = await loadWith(50);
+	const out = await runBudget(pi, "github-copilot", newTrace());
+	assert.match(out, /^github-copilot: credits, cap \$50\.00, 10% used, spent \$5\.00 \(meter\)/);
+	assert.match(out, /model +msgs +input +output +cache r +cache w +cost/);
+	// largest cost first, with the totals row last
+	assert.match(out, /claude-sonnet-5\.5 +1 +600 +300k +0 +0 +\$4\.50/);
+	assert.match(out, /claude-haiku-5\.5 +1 +40 +60k +0 +0 +\$0\.50/);
+	assert.match(out, /total +2 +640 +360k +0 +0 +\$5\.00/);
+	assert.ok(out.indexOf("claude-sonnet-5.5") < out.indexOf("claude-haiku-5.5"));
+});
+
+test("/budget <provider> works for a provider that is only in the session logs", async () => {
+	const { pi } = await loadWith(50);
+	const out = await runBudget(pi, "strata", newTrace());
+	assert.match(out, /^strata: not in budget-routing\.json, usage only, logged \$0\.00/);
+	assert.match(out, /qwen3\.8-flash-next-iq3_s +1 +900 +400 +0 +0 +\$0\.00/);
+});
+
+test("/budget <unknown> says so and names what is tracked", async () => {
+	const { pi } = await loadWith(50);
+	const out = await runBudget(pi, "nope", newTrace());
+	assert.match(out, /no usage logged for "nope" this month/);
+	assert.match(out, /Tracked: github-copilot, mistral/);
+});
+
+test("/budget completions offer the configured providers", async () => {
+	const { pi } = await loadWith(50);
+	const cmd = pi.commands.get("budget") as { getArgumentCompletions: (p: string) => Promise<{ value: string }[] | null> };
+	assert.deepEqual(await cmd.getArgumentCompletions(""), [{ value: "github-copilot", label: "github-copilot" }, { value: "mistral", label: "mistral" }]);
+	assert.deepEqual(await cmd.getArgumentCompletions("mis"), [{ value: "mistral", label: "mistral" }]);
+	assert.equal(await cmd.getArgumentCompletions("zzz"), null);
+});
+
+test("/budget reports a missing config instead of an empty table", async () => {
+	const { pi, dir } = await loadWith(50);
+	await fs.rm(path.join(dir, "budget-routing.json"));
+	const trace = newTrace();
+	const out = await runBudget(pi, "", trace);
+	assert.match(out, /no config at/);
 });
