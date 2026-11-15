@@ -413,7 +413,13 @@ export function windowLabel(startMs: number, zone: ResetZone): string {
  * logs show per model. When the spent figure comes from the provider's own usage page, the logged total
  * is shown beside it, since the two cover different spans.
  */
-export function usageReport(provider: string, rows: readonly ModelUsage[], windowText: string, status?: ProviderStatus): string {
+export function usageReport(
+	provider: string,
+	rows: readonly ModelUsage[],
+	windowText: string,
+	status?: ProviderStatus,
+	remembered?: Exhaustion,
+): string {
 	const logged = rows.reduce((s, r) => s + r.cost, 0);
 	const head: string[] = [];
 	if (status) {
@@ -424,6 +430,11 @@ export function usageReport(provider: string, rows: readonly ModelUsage[], windo
 		}
 	} else {
 		head.push(`${provider}: not in budget-routing.json, usage only, logged ${usd(logged)}, ${windowText}`);
+	}
+	const ex = status?.exhausted ?? remembered;
+	if (ex) {
+		const until = ex.untilMs === undefined ? "" : `, back ${new Date(ex.untilMs).toISOString()}`;
+		head.push(`OUT OF BUDGET: ${ex.reason} since ${new Date(ex.atMs).toISOString()}${until}. Calls to this provider fail until it resets.`);
 	}
 	if (rows.length === 0) return [...head, "no assistant messages logged for this window"].join("\n");
 	const total = rows.reduce((s, r) => s + r.messages, 0);
@@ -521,6 +532,8 @@ export async function monthSpendAll(
 export interface ProviderStatus {
 	provider: string;
 	billing: Billing;
+	/** Set while the provider itself refuses calls for spend or credit reasons. */
+	exhausted?: Exhaustion;
 	/** undefined when the entry sets no cap: tracked, never limited. */
 	capUsd?: number;
 	spend: number;
@@ -543,7 +556,7 @@ export function billingFor(pb: ProviderBudget, models: readonly RegistryModelLik
 	return "metered";
 }
 
-export function providerStatus(pb: ProviderBudget, m: MonthSpend, billing: Billing): ProviderStatus {
+export function providerStatus(pb: ProviderBudget, m: MonthSpend, billing: Billing, exhausted?: Exhaustion, now: Date = new Date()): ProviderStatus {
 	const s: ProviderStatus = {
 		provider: pb.provider,
 		billing,
@@ -559,7 +572,70 @@ export function providerStatus(pb: ProviderBudget, m: MonthSpend, billing: Billi
 		s.tier = tierFor(s.frac, pb.thresholds);
 		s.headroomUsd = Math.max(0, pb.monthlyCapUsd - m.spend);
 	}
+	// The provider's own refusal outranks the meter: a cap configured above the account's real limit
+	// reads low right up until every call fails, so an observed refusal is the stronger signal.
+	if (exhausted && exhaustionActive(exhausted, pb.reset, now)) {
+		s.exhausted = exhausted;
+		s.tier = "divert";
+	}
 	return s;
+}
+
+export interface Exhaustion {
+	/** When the refusal was observed. */
+	atMs: number;
+	/** When the provider said access returns, if it said so. */
+	untilMs?: number;
+	reason: string;
+}
+
+/**
+ * Spend and credit refusals, which persist until the provider's own reset, as opposed to a rate limit
+ * that clears in seconds. Anthropic reports its spend limit as a 429 rate_limit_error whose message
+ * names the usage limits, so the text is what separates the two.
+ */
+const EXHAUSTION_PATTERNS: { match: RegExp; reason: string }[] = [
+	{ match: /enforced_spend_limit_reached/i, reason: "spend limit reached" },
+	{ match: /reached your (specified )?api usage limits?/i, reason: "spend limit reached" },
+	{ match: /credit balance is too low/i, reason: "credit balance exhausted" },
+	{ match: /insufficient_quota|exceeded your current quota/i, reason: "quota exhausted" },
+	{ match: /quota_exceeded|quota exceeded/i, reason: "quota exhausted" },
+];
+
+/** "You will regain access on 2026-12-01 at 00:00 UTC" and plain ISO dates. */
+function parseResetInstant(message: string): number | undefined {
+	const named = /regain access on (\d{4}-\d{2}-\d{2})(?: at (\d{2}:\d{2}))?\s*(UTC)?/i.exec(message);
+	if (named) {
+		const ms = Date.parse(`${named[1]}T${named[2] ?? "00:00"}:00Z`);
+		if (!Number.isNaN(ms)) return ms;
+	}
+	const iso = /\b(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2}))/.exec(message);
+	if (iso) {
+		const ms = Date.parse(iso[1]);
+		if (!Number.isNaN(ms)) return ms;
+	}
+	return undefined;
+}
+
+/**
+ * Whether a provider's error message says the account is out of spend or credit rather than merely
+ * rate limited. Returns the state to remember, or undefined when the error is something else.
+ */
+export function classifyExhaustion(message: string, now: Date = new Date()): Exhaustion | undefined {
+	const hit = EXHAUSTION_PATTERNS.find((p) => p.match.test(message));
+	if (!hit) return undefined;
+	return { atMs: now.getTime(), untilMs: parseResetInstant(message), reason: hit.reason };
+}
+
+/**
+ * A refusal stops counting once the provider said it would, or at the next month boundary in the
+ * provider's own reset zone, since a spend limit is a monthly allowance.
+ */
+export function exhaustionActive(ex: Exhaustion, zone: ResetZone, now: Date = new Date()): boolean {
+	if (ex.untilMs !== undefined) return now.getTime() < ex.untilMs;
+	const d = new Date(ex.atMs);
+	const next = zone === "utc" ? Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1) : new Date(d.getFullYear(), d.getMonth() + 1, 1).getTime();
+	return now.getTime() < next;
 }
 
 export function tierFor(frac: number, t: Thresholds): Tier {
@@ -620,6 +696,7 @@ export function shortName(provider: string): string {
  */
 export function statusLabel(s: ProviderStatus): { text: string; color: "dim" | "accent" | "warning" | "error" } {
 	const name = shortName(s.provider);
+	if (s.exhausted) return { text: `${name} out of budget`, color: "error" };
 	if (s.capUsd === undefined) return { text: `${name} ${usd(s.spend)}`, color: "dim" };
 	const estimate = s.source === "meter" ? "~" : "";
 	const mark = s.tier === "prepare" ? " !" : s.tier === "divert" ? " over" : "";
@@ -799,6 +876,7 @@ function pad(v: string, w: number): string {
 
 function headroomLabel(s: ProviderStatus | undefined): string {
 	if (!s) return "not tracked";
+	if (s.exhausted) return "out of budget";
 	if (s.capUsd === undefined) return "no cap";
 	if (s.tier === "divert") return "over cap";
 	return `${Math.max(0, Math.round(((s.capUsd - s.spend) / s.capUsd) * 100))}% left`;
@@ -846,6 +924,7 @@ export const TIER_LABELS: Record<Tier, string> = {
 export function advisorySection(statuses: readonly ProviderStatus[], localRef: string, toolName: string): string {
 	if (statuses.length === 0) return "";
 	const parts = statuses.map((s) => {
+		if (s.exhausted) return `${shortName(s.provider)} ${s.billing}, out of budget (${s.exhausted.reason})`;
 		if (s.capUsd === undefined) return `${shortName(s.provider)} ${s.billing}, no cap`;
 		return `${shortName(s.provider)} ${s.billing}, ${TIER_LABELS[s.tier]}`;
 	});
@@ -942,14 +1021,16 @@ export function applyDivert(input: unknown, opts: DivertOptions): DivertResult {
  * their price, so the model can re-queue the same task instead of guessing.
  */
 export function rejectReason(result: DivertResult, statuses: readonly ProviderStatus[], routes: readonly Route[], localRef: string): string {
-	const over = statuses.filter((s) => s.tier === "divert").map((s) => `${shortName(s.provider)} ${s.pct}%`);
+	const diverting = statuses.filter((s) => s.tier === "divert");
+	const over = diverting.map((s) => (s.exhausted ? `${shortName(s.provider)} (${s.exhausted.reason})` : `${shortName(s.provider)} ${s.pct}%`));
+	const why = diverting.some((s) => s.exhausted) ? "out of budget on" : "over the monthly cap on";
 	const open = routes
 		.filter((r) => r.ref !== localRef && r.status && r.status.tier !== "divert")
 		.slice(0, 4)
 		.map((r) => `${r.ref} (${r.price}, ${headroomLabel(r.status)})`);
 	const blocked = result.rejected.map((r) => (r.provider ? `${r.label} -> ${r.provider}` : `${r.label} -> unattributable model`));
 	return (
-		`budget-routing: over the monthly cap on ${over.join(", ")}. Blocked launches: ${blocked.join(", ")}. ` +
+		`budget-routing: ${why} ${over.join(", ")}. Blocked launches: ${blocked.join(", ")}. ` +
 		`Re-queue each task on an open route: ${open.length > 0 ? open.join("; ") : "none with headroom"}. ` +
 		`Local fallback: ${localRef}.`
 	);

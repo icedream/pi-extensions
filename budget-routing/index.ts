@@ -33,6 +33,8 @@ import {
 	monthStartMs,
 	parseAgentOverrideModels,
 	preSwitchCompactionStep,
+	classifyExhaustion,
+	exhaustionActive,
 	providerStatus,
 	rejectReason,
 	statusLabel,
@@ -41,6 +43,7 @@ import {
 	windowLabel,
 	type BudgetConfig,
 	type CredentialSource,
+	type Exhaustion,
 	type MonthSpend,
 	type ProviderStatus,
 	type RegistryModelLike,
@@ -77,6 +80,12 @@ let cache: { at: number; key: string; spend: Map<string, MonthSpend> } | undefin
 const seatFigures = new Map<string, SeatFigure>();
 const seatFetchMs = new Map<string, number>();
 
+/**
+ * Providers that refused a call for spend or credit reasons. In memory only: a restart forgets it and
+ * the next failed call detects it again, which costs one request rather than a state file to keep sane.
+ */
+const exhausted = new Map<string, Exhaustion>();
+
 function configKey(cfg: BudgetConfig): string {
 	const entries = cfg.providers.map((pb) => [pb.provider, pb.monthlyCapUsd ?? null, pb.reset, pb.observed?.asOfMs ?? null, pb.observed?.creditsUsed ?? null]);
 	return JSON.stringify([entries, [...seatFigures.entries()].map(([p, f]) => [p, f.creditsUsed, f.asOfMs])]);
@@ -95,8 +104,9 @@ async function currentSnapshot(models: readonly RegistryModelLike[]): Promise<Sn
 	if (!existsSync(CONFIG_PATH)) return undefined;
 	const cfg = await loadConfig(CONFIG_PATH);
 	const spend = await spendAll(cfg);
+	const now = new Date();
 	const statuses = cfg.providers.map((pb) =>
-		providerStatus(pb, spend.get(pb.provider) ?? { spend: 0, source: "meter", observationIgnored: false }, billingFor(pb, models)),
+		providerStatus(pb, spend.get(pb.provider) ?? { spend: 0, source: "meter", observationIgnored: false }, billingFor(pb, models), exhausted.get(pb.provider), now),
 	);
 	return { cfg, statuses };
 }
@@ -262,17 +272,31 @@ export default function (pi: ExtensionAPI) {
 			return items.length > 0 ? items : null;
 		},
 		handler: async (args, ctx) => {
-			const want = args.trim();
+			const argv = args.trim().split(/\s+/).filter(Boolean);
 			const snap = await safeSnapshot(ctx);
 			if (!snap) {
 				ctx.ui.notify(`budget-routing: no config at ${CONFIG_PATH}`, "warning");
 				return;
 			}
-			if (want === "") {
+			if (argv.length === 0) {
 				ctx.ui.notify(costTable(snap.statuses, await routesFor(ctx, snap)), "info");
 				return;
 			}
 
+			// `/budget clear <provider>` drops a remembered refusal, for a limit that was raised or lifted.
+			if (argv[0] === "clear") {
+				const name = argv[1];
+				if (!name) {
+					ctx.ui.notify("budget-routing: /budget clear <provider>", "warning");
+					return;
+				}
+				const had = exhausted.delete(name);
+				ctx.ui.notify(had ? `budget-routing: cleared the out-of-budget state for ${name}` : `budget-routing: ${name} was not marked out of budget`, "info");
+				await refreshStatus(ctx);
+				return;
+			}
+
+			const want = argv[0];
 			const status = snap.statuses.find((s) => s.provider === want);
 			const zone = snap.cfg.providers.find((p) => p.provider === want)?.reset ?? "local";
 			const start = monthStartMs(new Date(), zone);
@@ -285,7 +309,9 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
-			ctx.ui.notify(usageReport(want, rows, windowLabel(start, zone), status), "info");
+			const remembered = exhausted.get(want);
+			const note = remembered && exhaustionActive(remembered, zone) ? remembered : undefined;
+			ctx.ui.notify(usageReport(want, rows, windowLabel(start, zone), status, note), "info");
 		},
 	});
 
@@ -382,6 +408,29 @@ export default function (pi: ExtensionAPI) {
 		});
 	});
 
+	// The provider's own refusal is the only ground truth about a real spend limit: a cap configured
+	// above it reads low right up until every call fails. A failed assistant message names its provider
+	// and carries the error text, so it is read here and remembered until the provider resets.
+	pi.on("message_end", async (event, ctx) => {
+		const m = event.message as { role?: string; provider?: string; stopReason?: string; errorMessage?: string };
+		if (m.role !== "assistant" || !m.provider) return;
+
+		if (m.stopReason !== "error") {
+			// A call that worked proves the provider is usable again.
+			if (exhausted.delete(m.provider)) void refreshStatus(ctx);
+			return;
+		}
+		const hit = classifyExhaustion(m.errorMessage ?? "");
+		if (!hit) return;
+		const previous = exhausted.get(m.provider);
+		exhausted.set(m.provider, hit);
+		if (!previous) {
+			const until = hit.untilMs === undefined ? "until it resets" : `until ${new Date(hit.untilMs).toISOString()}`;
+			ctx.ui.notify(`budget-routing: ${m.provider} is out of budget (${hit.reason}) ${until}. Launches that would spend it are refused.`, "error");
+		}
+		void refreshStatus(ctx);
+	});
+
 	// Keep the fetched figures current between runs. Off the critical path: the next turn sees it
 	// because currentSnapshot() re-reads the config file.
 	pi.on("agent_settled", async (_event, ctx) => {
@@ -397,8 +446,9 @@ export default function (pi: ExtensionAPI) {
 		const snap = await safeSnapshot(ctx);
 		if (!snap || snap.cfg.enforce === "off") return undefined;
 
+		// A provider with no cap still counts once it refuses: its own limit is the cap.
 		const tiers: Record<string, Tier> = {};
-		for (const s of snap.statuses) if (s.capUsd !== undefined) tiers[s.provider] = s.tier;
+		for (const s of snap.statuses) if (s.capUsd !== undefined || s.exhausted) tiers[s.provider] = s.tier;
 
 		const plan = applyDivert((event as unknown as { input?: unknown }).input, {
 			mode: snap.cfg.enforce,

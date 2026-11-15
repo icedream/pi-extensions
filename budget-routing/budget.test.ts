@@ -25,6 +25,8 @@ import {
 	providerForModelRef,
 	providerStatus,
 	rejectReason,
+	classifyExhaustion,
+	exhaustionActive,
 	formatTokens,
 	spendByWindow,
 	spendSince,
@@ -828,4 +830,93 @@ test("menuModelRefs prefers the configured list, else the agent settings, and de
 	assert.deepEqual(menuModelRefs(pinned, overrides, undefined), ["mistral/magistral-medium-latest", "anthropic/claude-sonnet-5-5", "mistral/other"]);
 	const tight = parseConfig({ ...v2Raw, advisory: { models: ["a/x", "b/y", "c/z"], maxModels: 2 } });
 	assert.deepEqual(menuModelRefs(tight, [], undefined), ["a/x", "b/y"]);
+});
+
+// --- out-of-budget detection -------------------------------------------------------------------
+
+const ANTHROPIC_SPEND_LIMIT =
+	'400 {"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}';
+const ANTHROPIC_USAGE_LIMIT =
+	'429 {"type":"error","error":{"type":"rate_limit_error","message":"You have reached your specified API usage limits. You will regain access on 2026-12-01 at 00:00 UTC."}}';
+
+test("classifyExhaustion recognises spend and credit refusals, not rate limits", () => {
+	const now = new Date("2026-11-14T12:00:00Z");
+	const spend = classifyExhaustion(ANTHROPIC_USAGE_LIMIT, now);
+	assert.equal(spend?.reason, "spend limit reached");
+	assert.equal(spend?.atMs, now.getTime());
+	assert.equal(spend?.untilMs, Date.parse("2026-12-01T00:00:00Z"));
+
+	assert.equal(classifyExhaustion(ANTHROPIC_SPEND_LIMIT, now)?.reason, "credit balance exhausted");
+	assert.equal(classifyExhaustion('{"error":{"code":"insufficient_quota"}}', now)?.reason, "quota exhausted");
+	assert.equal(classifyExhaustion("429 rate_limit_error: too many requests, retry in 12s", now), undefined);
+	assert.equal(classifyExhaustion("Connection error.", now), undefined);
+	assert.equal(classifyExhaustion("", now), undefined);
+});
+
+test("classifyExhaustion reads an ISO reset instant when the message carries one", () => {
+	const ex = classifyExhaustion('{"message":"quota exceeded, resets 2026-12-01T00:00:00Z"}', new Date("2026-11-14T12:00:00Z"));
+	assert.equal(ex?.untilMs, Date.parse("2026-12-01T00:00:00Z"));
+});
+
+test("exhaustionActive expires at the stated reset, else at the next month boundary", () => {
+	const now = new Date("2026-11-14T12:00:00Z");
+	const stated = { atMs: now.getTime(), untilMs: Date.parse("2026-12-01T00:00:00Z"), reason: "spend limit reached" };
+	assert.equal(exhaustionActive(stated, "utc", new Date("2026-11-30T23:59:00Z")), true);
+	assert.equal(exhaustionActive(stated, "utc", new Date("2026-12-01T00:00:01Z")), false);
+
+	// No stated reset: a monthly allowance, so it holds until the next month in that zone.
+	const unstated = { atMs: Date.parse("2026-11-14T12:00:00Z"), reason: "quota exhausted" };
+	assert.equal(exhaustionActive(unstated, "utc", new Date("2026-11-30T23:00:00Z")), true);
+	assert.equal(exhaustionActive(unstated, "utc", new Date("2026-12-01T00:30:00Z")), false);
+});
+
+test("an out-of-budget provider is forced to divert even with no cap configured", () => {
+	const pb = { provider: "anthropic", thresholds: DEFAULT_THRESHOLDS, reset: "utc" as const };
+	const m = { spend: 5.89, source: "meter" as const, observationIgnored: false };
+	const now = new Date("2026-11-14T12:00:00Z");
+	const ex = classifyExhaustion(ANTHROPIC_USAGE_LIMIT, now);
+
+	const plain = providerStatus(pb, m, "metered", undefined, now);
+	assert.equal(plain.tier, "ok");
+	assert.equal(plain.exhausted, undefined);
+
+	const hit = providerStatus(pb, m, "metered", ex, now);
+	assert.equal(hit.tier, "divert", "a refusal outranks the meter, which still reads 5.89 spent");
+	assert.equal(hit.exhausted?.reason, "spend limit reached");
+	assert.deepEqual(statusLabel(hit), { text: "anthropic out of budget", color: "error" });
+	assert.match(costTable([hit], []), /anthropic +metered +none +\$5\.89 +- +out of budget +meter/);
+	assert.match(advisorySection([hit], "strata/local", "budget"), /anthropic metered, out of budget \(spend limit reached\)/);
+});
+
+test("a refusal that has expired stops forcing divert", () => {
+	const pb = { provider: "anthropic", thresholds: DEFAULT_THRESHOLDS, reset: "utc" as const };
+	const m = { spend: 1, source: "meter" as const, observationIgnored: false };
+	const ex = { atMs: Date.parse("2026-11-14T12:00:00Z"), untilMs: Date.parse("2026-12-01T00:00:00Z"), reason: "spend limit reached" };
+	const after = new Date("2026-12-02T00:00:00Z");
+	assert.equal(providerStatus(pb, m, "metered", ex, after).tier, "ok");
+});
+
+test("rejectReason says out of budget when the provider refused, and names the reset", () => {
+	const now = new Date("2026-11-14T12:00:00Z");
+	const pb = { provider: "anthropic", thresholds: DEFAULT_THRESHOLDS, reset: "utc" as const };
+	const status = providerStatus(pb, { spend: 5.89, source: "meter", observationIgnored: false }, "metered", classifyExhaustion(ANTHROPIC_USAGE_LIMIT, now), now);
+	const plan = applyDivert({ agent: "worker", model: "anthropic/claude-sonnet-5-5", task: "a" }, {
+		mode: "reject",
+		localSubagents: ["scout"],
+		subagentRef: "strata/local",
+		tiers: { anthropic: "divert" },
+		models: [{ provider: "anthropic", id: "claude-sonnet-5-5" }],
+	});
+	const reason = rejectReason(plan, [status], [], "strata/local");
+	assert.match(reason, /out of budget on anthropic \(spend limit reached\)/);
+	assert.match(reason, /worker -> anthropic/);
+	assert.match(reason, /Local fallback: strata\/local/);
+});
+
+test("usageReport states the refusal above the table", () => {
+	const now = new Date("2026-11-14T12:00:00Z");
+	const ex = classifyExhaustion(ANTHROPIC_USAGE_LIMIT, now);
+	const rows = [{ model: "claude-haiku-5-5", messages: 1, input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0.1 }];
+	const out = usageReport("anthropic", rows, "since 2026-11-01 00:00 UTC", undefined, ex);
+	assert.match(out, /OUT OF BUDGET: spend limit reached since 2026-11-14T12:00:00\.000Z, back 2026-12-01T00:00:00\.000Z/);
 });

@@ -49,6 +49,17 @@ interface Trace {
 	confirms: string[];
 }
 
+/** The footer refresh runs off the message_end path, so a test has to wait for it to land. */
+async function statusEventually(trace: Trace, key: string, want: string | undefined, ms = 3000): Promise<string | undefined> {
+	const deadline = Date.now() + ms;
+	let seen = trace.statuses.get(key);
+	while (seen !== want && Date.now() < deadline) {
+		await new Promise((r) => setTimeout(r, 10));
+		seen = trace.statuses.get(key);
+	}
+	return seen;
+}
+
 function newTrace(): Trace {
 	return { notices: [], statuses: new Map(), compacts: 0, confirms: [] };
 }
@@ -97,6 +108,7 @@ async function loadWith(capCopilot: number | undefined, capMistral = 20) {
 			line("github-copilot", now, 4.5, "claude-sonnet-5.5", 600, 300_000),
 			line("github-copilot", now, 0.5, "claude-haiku-5.5", 40, 60_000),
 			line("mistral", now, 0.2, "magistral-medium-latest", 100, 20_000),
+			line("anthropic", now, 0.3, "claude-haiku-5-5", 50, 10_000),
 			line("strata", now, 0, "qwen3.8-flash-next-iq3_s", 900, 400),
 		].join("\n") + "\n",
 	);
@@ -108,6 +120,7 @@ async function loadWith(capCopilot: number | undefined, capMistral = 20) {
 		providers: [
 			{ provider: "github-copilot", ...(capCopilot === undefined ? {} : { monthlyCapUsd: capCopilot }) },
 			{ provider: "mistral", monthlyCapUsd: capMistral },
+			{ provider: "anthropic", reset: "utc" },
 		],
 	};
 	await fs.writeFile(path.join(dir, "budget-routing.json"), JSON.stringify(config));
@@ -128,7 +141,7 @@ test("registers the budget tool, both commands, and one footer key per provider"
 
 	assert.ok(pi.tools.get("budget"), "budget tool missing");
 	assert.ok(pi.commands.get("budget") && pi.commands.get("budget-seat"), "commands missing");
-	assert.deepEqual([...trace.statuses.keys()].sort(), ["budget-routing/github-copilot", "budget-routing/mistral"]);
+	assert.deepEqual([...trace.statuses.keys()].sort(), ["budget-routing/anthropic", "budget-routing/github-copilot", "budget-routing/mistral"]);
 	assert.equal(trace.statuses.get("budget-routing/github-copilot"), "copilot ~10%");
 });
 
@@ -296,13 +309,17 @@ test("/budget <unknown> says so and names what is tracked", async () => {
 	const { pi } = await loadWith(50);
 	const out = await runBudget(pi, "nope", newTrace());
 	assert.match(out, /no usage logged for "nope" this month/);
-	assert.match(out, /Tracked: github-copilot, mistral/);
+	assert.match(out, /Tracked: github-copilot, mistral, anthropic/);
 });
 
 test("/budget completions offer the configured providers", async () => {
 	const { pi } = await loadWith(50);
 	const cmd = pi.commands.get("budget") as { getArgumentCompletions: (p: string) => Promise<{ value: string }[] | null> };
-	assert.deepEqual(await cmd.getArgumentCompletions(""), [{ value: "github-copilot", label: "github-copilot" }, { value: "mistral", label: "mistral" }]);
+	assert.deepEqual(await cmd.getArgumentCompletions(""), [
+		{ value: "github-copilot", label: "github-copilot" },
+		{ value: "mistral", label: "mistral" },
+		{ value: "anthropic", label: "anthropic" },
+	]);
 	assert.deepEqual(await cmd.getArgumentCompletions("mis"), [{ value: "mistral", label: "mistral" }]);
 	assert.equal(await cmd.getArgumentCompletions("zzz"), null);
 });
@@ -313,4 +330,76 @@ test("/budget reports a missing config instead of an empty table", async () => {
 	const trace = newTrace();
 	const out = await runBudget(pi, "", trace);
 	assert.match(out, /no config at/);
+});
+
+// --- out-of-budget detection -------------------------------------------------------------------
+
+const spendLimitError = (provider: string) => ({
+	role: "assistant",
+	provider,
+	stopReason: "error",
+	errorMessage:
+		'429 {"type":"error","error":{"type":"rate_limit_error","message":"You have reached your specified API usage limits. You will regain access on 2026-12-01 at 00:00 UTC."}}',
+});
+
+test("a spend-limit error marks the provider out of budget and refuses its launches", async () => {
+	const { pi } = await loadWith(1000);
+	const trace = newTrace();
+	const ctx = fakeCtx(trace, "anthropic");
+	await pi.handlers.get("message_end")?.[0]({ message: spendLimitError("anthropic") }, ctx);
+
+	assert.ok(trace.notices.some((n) => /anthropic is out of budget \(spend limit reached\)/.test(n)), trace.notices.join(" | "));
+	assert.equal(await statusEventually(trace, "budget-routing/anthropic", "anthropic out of budget"), "anthropic out of budget");
+
+	const blocked = await pi.handlers.get("tool_call")?.[0](
+		{ toolName: "subagent", input: { agent: "worker", model: "mistral/magistral-medium-latest", task: "x" } },
+		ctx,
+	);
+	assert.equal(blocked, undefined, "mistral still has room, so that launch is untouched");
+
+	const toAnthropic = await pi.handlers.get("tool_call")?.[0](
+		{ toolName: "subagent", input: { agent: "worker", model: "anthropic/claude-sonnet-5-5", task: "x" } },
+		ctx,
+	);
+	assert.ok(toAnthropic?.block, "a launch to the exhausted provider is refused");
+	assert.match(toAnthropic.reason, /out of budget on anthropic \(spend limit reached\)/);
+});
+
+test("a transient rate limit does not mark the provider out of budget", async () => {
+	const { pi } = await loadWith(1000);
+	const trace = newTrace();
+	const ctx = fakeCtx(trace, "anthropic");
+	await pi.handlers.get("before_agent_start")?.[0]({ systemPromptOptions: {} }, ctx);
+	assert.equal(await statusEventually(trace, "budget-routing/anthropic", "anthropic $0.30"), "anthropic $0.30");
+
+	await pi.handlers.get("message_end")?.[0](
+		{ message: { role: "assistant", provider: "anthropic", stopReason: "error", errorMessage: "429 rate_limit_error: too many requests" } },
+		ctx,
+	);
+	// Nothing refreshed, because a plain rate limit changes no state.
+	assert.equal(trace.statuses.get("budget-routing/anthropic"), "anthropic $0.30");
+	assert.ok(!trace.notices.some((n) => /out of budget/.test(n)));
+});
+
+test("a successful call clears the out-of-budget state", async () => {
+	const { pi } = await loadWith(1000);
+	const trace = newTrace();
+	const ctx = fakeCtx(trace, "anthropic");
+	await pi.handlers.get("message_end")?.[0]({ message: spendLimitError("anthropic") }, ctx);
+	assert.equal(await statusEventually(trace, "budget-routing/anthropic", "anthropic out of budget"), "anthropic out of budget");
+
+	await pi.handlers.get("message_end")?.[0]({ message: { role: "assistant", provider: "anthropic", stopReason: "stop" } }, ctx);
+	assert.equal(await statusEventually(trace, "budget-routing/anthropic", "anthropic $0.30"), "anthropic $0.30");
+});
+
+test("/budget clear drops a remembered refusal", async () => {
+	const { pi } = await loadWith(1000);
+	const trace = newTrace();
+	const ctx = fakeCtx(trace, "anthropic");
+	await pi.handlers.get("message_end")?.[0]({ message: spendLimitError("anthropic") }, ctx);
+
+	assert.match(await runBudget(pi, "anthropic", trace), /OUT OF BUDGET: spend limit reached/);
+	assert.match(await runBudget(pi, "clear anthropic", trace), /cleared the out-of-budget state for anthropic/);
+	assert.doesNotMatch(await runBudget(pi, "anthropic", trace), /OUT OF BUDGET/);
+	assert.match(await runBudget(pi, "clear nope", trace), /nope was not marked out of budget/);
 });

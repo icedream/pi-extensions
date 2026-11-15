@@ -105,6 +105,32 @@ registry price is what the same model would cost on a metered API, while what yo
 seat credit per request. A reference that is not in the registry stays in the table marked `price
 unknown` rather than disappearing, so a typo in `advisory.models` is visible.
 
+## Out of budget
+
+A configured cap is your own number, and it can sit above the account's real limit. Anthropic's spend
+limit, a depleted credit balance or a Copilot quota are enforced by the provider, so the meter can read
+11% while every call already fails. The extension therefore also listens to the provider itself.
+
+When an assistant message ends with `stopReason: "error"` and the message says the account is out of
+spend or credit, that provider is marked out of budget:
+
+- its footer shows `anthropic out of budget`
+- its tier becomes `divert` regardless of measured spend or of whether it has a cap at all, so launches
+  that would spend it are refused with the open routes listed, and a session running on it is offered
+  the switch to the local model
+- `/budget` shows `out of budget` in the headroom column, and `/budget <provider>` names the reason and
+  the reset time
+
+A plain rate limit does not trigger this: Anthropic reports both as `429 rate_limit_error`, so the text
+is what separates a spent allowance from a short throttle. Recognised wording covers `enforced_spend_limit_reached`,
+"reached your specified API usage limits", "credit balance is too low", `insufficient_quota` and
+`quota_exceeded`.
+
+The state clears when a call to that provider succeeds again, when the reset instant the provider named
+passes, or at the next month boundary in that provider's `reset` zone, since a spend limit is a monthly
+allowance. It is held in memory, so a restart forgets it and the next failed call detects it again.
+`/budget clear <provider>` drops it by hand, for a limit you just raised.
+
 ## The `/budget` command
 
 `/budget` prints the table above for you, in the TUI only, so it costs no model tokens.
