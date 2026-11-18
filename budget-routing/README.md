@@ -14,8 +14,8 @@ menu so it can move work to a cheaper route before it has to fall back to a loca
 | prepare | 95% | Compacts the main session while that provider still works, between agent runs. Only a session spending that provider compacts |
 | divert | 100% | Depends on `enforce`: `reject` (default) refuses launches that would spend it, with the open routes listed so the task gets re-queued elsewhere; `rewrite` points `localSubagents` at the local model and refuses the rest; `off` does nothing. Offers to switch the main session to the local model (confirmation required) |
 
-Each provider also carries a compact footer indicator next to the session cost, one per configured
-provider: `copilot 92%  anthropic $5.46  opper 12% $8.77 left`, coloured by tier. A leading `~` means
+Each provider also carries a compact footer indicator next to the session cost, one per provider
+this machine tracks: `copilot 92%  anthropic $5.46  opper 12% $8.77 left`, coloured by tier. A leading `~` means
 the figure is estimated from Pi's own logs rather than the provider's own figure; `!` and `over` mark
 the prepare and divert tiers. A provider with no cap shows its spend instead of a percentage, and a
 prepaid account shows what is left in it. `? balance unknown` means the wallet fetch is failing or its
@@ -51,7 +51,7 @@ Per provider entry:
 
 | Key | Meaning |
 |-----|---------|
-| `provider` | Provider name as recorded in session logs, e.g. `github-copilot` |
+| `provider` | Provider name as recorded in session logs, e.g. `github-copilot`. It must be a provider this machine has models for, see [Registered providers](#registered-providers) |
 | `monthlyCapUsd` | The cap. Omit it to track and price the provider without ever limiting it |
 | `reset` | `local` (default) or `utc`: which calendar the provider's monthly reset follows. Anthropic and Mistral reset on the 1st UTC |
 | `billing` | Optional override: `credits` (flat seat), `metered` (per token), `free`. Derived when absent: Copilot is `credits`, a provider whose models carry zero registry prices is `free`, everything else `metered` |
@@ -108,8 +108,34 @@ strata/qwen3.8-flash-next-iq3_s    free     -              -           393k    n
 
 Prices come from Pi's model registry. They are list prices, not invoices: on a `credits` provider the
 registry price is what the same model would cost on a metered API, while what you actually pay is one
-seat credit per request. A reference that is not in the registry stays in the table marked `price
-unknown` rather than disappearing, so a typo in `advisory.models` is visible.
+seat credit per request. A wrong model id under a provider this machine has stays in the table marked
+`price unknown` rather than disappearing, so a typo in `advisory.models` is visible. A reference for a
+provider with no models here is dropped, see [Registered providers](#registered-providers).
+
+## Registered providers
+
+A provider counts as registered here when Pi's model registry has at least one model under its name,
+or when Pi can authenticate to it here (`models.json`, a built-in, or an extension). The second half of
+that rule covers a `discoverModels` provider whose catalog has not loaded yet: its endpoint is down or
+still starting, and its spend is still this machine's to count. An entry with neither is a provider from
+another machine's config: it goes inert, and one notification per session says which entry that is.
+
+The config file is usually shared between machines, and the provider set is not. Without the gate the
+model gets told about a cap it can never spend against and about routes its subagent tool cannot
+launch on, and the number it reads for that provider is whatever other machines spent. Route references
+are the one place the rule stays strict: a reference only counts when the registry has that model,
+because that is what the subagent tool resolves against.
+
+What an inert entry stops doing on that machine:
+
+- no footer indicator, and it is absent from the `<budget>` prompt section, from `/budget`, from the
+  `budget` tool and from the price table appended to `subagent({action: "models"})`
+- route references in `advisory.models` under that provider are dropped from the menu
+- no seat or wallet fetch, which have no credential to read here anyway
+- no cap, so a launch aimed at that provider is never refused for spend
+
+`localModel` is gated by the same rule: while its `provider` is not this machine's, the routing advice
+and the rejection reason leave out the local fallback, because there is none to fall back to.
 
 ## Out of budget
 

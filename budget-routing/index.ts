@@ -40,6 +40,8 @@ import {
 	classifyExhaustion,
 	exhaustionActive,
 	providerStatus,
+	registeredProviders,
+	registeredRefs,
 	rejectReason,
 	statusLabel,
 	usageReport,
@@ -71,6 +73,8 @@ const TOOL_NAME = "budget";
 interface Snapshot {
 	cfg: BudgetConfig;
 	statuses: ProviderStatus[];
+	/** Configured providers this machine has no models or credentials for, so they are not tracked here. */
+	skipped: string[];
 }
 
 interface FigureResult {
@@ -109,12 +113,18 @@ async function spendAll(cfg: BudgetConfig): Promise<Map<string, MonthSpend>> {
 }
 
 /** undefined when no config file exists. Throws when the config is invalid or logs cannot be read. */
-async function currentSnapshot(models: readonly RegistryModelLike[]): Promise<Snapshot | undefined> {
+async function currentSnapshot(
+	models: readonly RegistryModelLike[],
+	authConfigured: (names: readonly string[]) => readonly string[],
+): Promise<Snapshot | undefined> {
 	if (!existsSync(CONFIG_PATH)) return undefined;
 	const cfg = await loadConfig(CONFIG_PATH);
+	const names = cfg.providers.map((pb) => pb.provider);
+	const known = registeredProviders(models, authConfigured(names));
+	const tracked = cfg.providers.filter((pb) => known.has(pb.provider));
 	const spend = await spendAll(cfg);
 	const now = new Date();
-	const statuses = cfg.providers.map((pb) =>
+	const statuses = tracked.map((pb) =>
 		providerStatus(
 			pb,
 			spend.get(pb.provider) ?? { spend: 0, source: "meter", observationIgnored: false },
@@ -124,7 +134,25 @@ async function currentSnapshot(models: readonly RegistryModelLike[]): Promise<Sn
 			liveFigures.get(pb.provider),
 		),
 	);
-	return { cfg, statuses };
+	// The budget config is shared between machines, so it can name providers that only exist on some of
+	// them. Such a provider can never be spent from here, so it stays out of every surface: the footer,
+	// the prompt section, the tables and the divert decision.
+	const skipped = cfg.providers.filter((pb) => !known.has(pb.provider)).map((pb) => pb.provider);
+	return { cfg, statuses, skipped };
+}
+
+/**
+ * True while Pi can authenticate to that provider here. Covers a `discoverModels` provider whose
+ * catalog has not loaded yet, which still bills against its cap once the endpoint answers.
+ */
+function hasConfiguredAuth(ctx: ExtensionContext, provider: string): boolean {
+	return ctx.modelRegistry.getProviderAuthStatus?.(provider)?.configured === true;
+}
+
+/** Provider set this machine can be billed on, for the configured names plus the local model. */
+function knownProviders(ctx: ExtensionContext, cfg: BudgetConfig): Set<string> {
+	const names = [...cfg.providers.map((pb) => pb.provider), cfg.localModel.provider];
+	return registeredProviders(ctx.modelRegistry.getAll(), names.filter((n) => hasConfiguredAuth(ctx, n)));
 }
 
 export default function (pi: ExtensionAPI) {
@@ -142,6 +170,10 @@ export default function (pi: ExtensionAPI) {
 
 	/** One footer indicator per provider, coloured by tier. Cleared for providers no longer configured. */
 	function updateStatus(ctx: ExtensionContext, snap: Snapshot | undefined): void {
+		// An entry that belongs to another machine is worth one line, or it looks like the config was ignored.
+		for (const p of snap?.skipped ?? []) {
+			notifyOnce(ctx, `unregistered:${p}`, `${p} is configured but this machine has no models or credentials for it, so it is not tracked here`, "info");
+		}
 		const seen = new Set<string>();
 		for (const s of snap?.statuses ?? []) {
 			const key = `${STATUS_PREFIX}/${s.provider}`;
@@ -180,7 +212,10 @@ export default function (pi: ExtensionAPI) {
 			return [{ ok: false, note: (err as Error).message }];
 		}
 		const out: FigureResult[] = [];
+		const known = knownProviders(ctx, cfg);
 		for (const pb of cfg.providers) {
+			// A provider this machine cannot launch on has no seat to read for it either.
+			if (!known.has(pb.provider)) continue;
 			if (!isCopilotProvider(pb.provider)) {
 				if (pb.seat) out.push({ ok: false, note: `${pb.provider}: the GitHub seat fetch is not used for this provider` });
 				continue;
@@ -253,7 +288,10 @@ export default function (pi: ExtensionAPI) {
 			return [{ ok: false, note: (err as Error).message }];
 		}
 		const out: FigureResult[] = [];
+		const known = knownProviders(ctx, cfg);
 		for (const pb of cfg.providers) {
+			// No models and no credential here means no wallet to read, so asking would only warn.
+			if (!known.has(pb.provider)) continue;
 			if (!isOpperProvider(pb.provider)) {
 				if (pb.balance) out.push({ ok: false, note: `${pb.provider}: the wallet fetch is not used for this provider` });
 				continue;
@@ -294,7 +332,7 @@ export default function (pi: ExtensionAPI) {
 
 	async function safeSnapshot(ctx: ExtensionContext): Promise<Snapshot | undefined> {
 		try {
-			return await currentSnapshot(ctx.modelRegistry.getAll());
+			return await currentSnapshot(ctx.modelRegistry.getAll(), (names) => names.filter((n) => hasConfiguredAuth(ctx, n)));
 		} catch (err) {
 			if (!announced.has("error")) {
 				announced.add("error");
@@ -313,7 +351,13 @@ export default function (pi: ExtensionAPI) {
 			overrides = undefined;
 		}
 		const refs = menuModelRefs(snap.cfg, parseAgentOverrideModels(overrides), ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
-		return buildRoutes(refs, ctx.modelRegistry.getAll(), snap.statuses, snap.cfg.localModel.subagentRef);
+		const models = ctx.modelRegistry.getAll();
+		return buildRoutes(registeredRefs(refs, registeredProviders(models)), models, snap.statuses, snap.cfg.localModel.subagentRef);
+	}
+
+	/** The local model only counts as a fallback while this machine can launch on it. */
+	function localRefFor(ctx: ExtensionContext, snap: Snapshot): string | undefined {
+		return knownProviders(ctx, snap.cfg).has(snap.cfg.localModel.provider) ? snap.cfg.localModel.subagentRef : undefined;
 	}
 
 	/** Provider names from the config, for argument completion. Empty when there is no usable config. */
@@ -381,14 +425,16 @@ export default function (pi: ExtensionAPI) {
 			if (!status && rows.length === 0) {
 				const known = [...new Set([...snap.statuses.map((s) => s.provider)])].join(", ");
 				ctx.ui.notify(
-					`budget-routing: no usage logged for "${want}" this month. Tracked: ${known}. Usage comes from session logs, so a provider shows up once a session has used it.`,
+					snap.skipped.includes(want)
+						? `budget-routing: ${want} is configured but this machine has no models or credentials for it, so nothing is tracked for it here. Tracked: ${known}.`
+						: `budget-routing: no usage logged for "${want}" this month. Tracked: ${known}. Usage comes from session logs, so a provider shows up once a session has used it.`,
 					"warning",
 				);
 				return;
 			}
 			const remembered = exhausted.get(want);
 			const note = remembered && exhaustionActive(remembered, zone) ? remembered : undefined;
-			ctx.ui.notify(usageReport(want, rows, windowLabel(start, zone), status, note), "info");
+			ctx.ui.notify(usageReport(want, rows, windowLabel(start, zone), status, note, snap.skipped.includes(want)), "info");
 		},
 	});
 
@@ -454,9 +500,10 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
+		const localRef = localRefFor(ctx, snap);
 		event.systemPromptOptions.sections = {
 			...(event.systemPromptOptions.sections ?? {}),
-			[SECTION_TAG]: advisorySection(snap.statuses, snap.cfg.localModel.subagentRef, TOOL_NAME),
+			[SECTION_TAG]: advisorySection(snap.statuses, localRef, TOOL_NAME),
 		};
 
 		const mine = snap.statuses.find((s) => s.provider === ctx.model?.provider);
@@ -557,7 +604,7 @@ export default function (pi: ExtensionAPI) {
 			models: ctx.modelRegistry.getAll(),
 		});
 		if (plan.rejected.length === 0) return undefined;
-		return { block: true, reason: rejectReason(plan, snap.statuses, await routesFor(ctx, snap), snap.cfg.localModel.subagentRef) };
+		return { block: true, reason: rejectReason(plan, snap.statuses, await routesFor(ctx, snap), localRefFor(ctx, snap)) };
 	});
 
 	// The model asks for models exactly when it is about to route work. Prices belong in that answer,

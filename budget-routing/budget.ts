@@ -573,6 +573,7 @@ export function usageReport(
 	windowText: string,
 	status?: ProviderStatus,
 	remembered?: Exhaustion,
+	unregistered = false,
 ): string {
 	const logged = rows.reduce((s, r) => s + r.cost, 0);
 	const head: string[] = [];
@@ -587,7 +588,8 @@ export function usageReport(
 			head.push(`logged by pi: ${usd(logged)}. The spent figure counts usage up to its own snapshot time, so the two differ.`);
 		}
 	} else {
-		head.push(`${provider}: not in budget-routing.json, usage only, logged ${usd(logged)}, ${windowText}`);
+		const why = unregistered ? "configured, but this machine has no models or credentials for it" : "not in budget-routing.json";
+		head.push(`${provider}: ${why}, usage only, logged ${usd(logged)}, ${windowText}`);
 	}
 	const ex = status?.exhausted ?? remembered;
 	if (ex) {
@@ -1001,6 +1003,31 @@ export function providerForModelRef(ref: string, models: readonly RegistryModelL
 	return byId.length === 1 ? byId[0].provider : undefined;
 }
 
+/**
+ * Providers this machine can launch on: those the registry has a model for, plus those with
+ * configured credentials and a catalog that has not loaded yet (`discoverModels` on a provider whose
+ * endpoint is slow or briefly down). A provider with neither belongs to another machine's config.
+ */
+export function registeredProviders(models: readonly RegistryModelLike[], authConfigured?: Iterable<string>): Set<string> {
+	const known = new Set(models.map((m) => m.provider));
+	for (const p of authConfigured ?? []) known.add(p);
+	return known;
+}
+
+/**
+ * Route refs whose provider exists on this machine. A ref is `provider/id` and provider names may
+ * themselves contain slashes, so the longest registered provider name that prefixes the ref decides.
+ * A wrong model id under a known provider stays in the menu, where buildRoutes marks it.
+ */
+export function registeredRefs(refs: readonly string[], registered: ReadonlySet<string>): string[] {
+	return refs.filter((r) => {
+		const base = stripThinkingSuffix(r.trim());
+		let best = "";
+		for (const p of registered) if ((base === p || base.startsWith(`${p}/`)) && p.length > best.length) best = p;
+		return best !== "";
+	});
+}
+
 interface Cost {
 	input: number;
 	output: number;
@@ -1157,18 +1184,19 @@ export const TIER_LABELS: Record<Tier, string> = {
  * changes, so Pi sends a prompt patch instead of rewriting the leading system message every turn,
  * which would cost a full cache miss on providers that bill cached prefixes cheaper.
  */
-export function advisorySection(statuses: readonly ProviderStatus[], localRef: string, toolName: string): string {
+export function advisorySection(statuses: readonly ProviderStatus[], localRef: string | undefined, toolName: string): string {
 	if (statuses.length === 0) return "";
 	const parts = statuses.map((s) => {
 		if (s.exhausted) return `${shortName(s.provider)} ${s.billing}, out of budget (${s.exhausted.reason})`;
 		if (s.capUsd === undefined) return `${shortName(s.provider)} ${s.billing}, no cap`;
 		return `${shortName(s.provider)} ${s.billing}, ${TIER_LABELS[s.tier]}`;
 	});
+	const fallback = localRef === undefined ? "" : ` ${localRef} is the last resort, not the default.`;
 	return (
 		`Budget: ${parts.join("; ")}. ` +
 		`Call ${toolName} with action "models" for the price and headroom table before routing work to another model. ` +
-		`A launch that would spend a provider over its cap is rejected with the open routes listed, so re-queue the same task on one of them. ` +
-		`${localRef} is the last resort, not the default.`
+		`A launch that would spend a provider over its cap is rejected with the open routes listed, so re-queue the same task on one of them.` +
+		fallback
 	);
 }
 
@@ -1256,7 +1284,7 @@ export function applyDivert(input: unknown, opts: DivertOptions): DivertResult {
  * The error a rejected launch gets back. It names the cap, and lists the routes that are open with
  * their price, so the model can re-queue the same task instead of guessing.
  */
-export function rejectReason(result: DivertResult, statuses: readonly ProviderStatus[], routes: readonly Route[], localRef: string): string {
+export function rejectReason(result: DivertResult, statuses: readonly ProviderStatus[], routes: readonly Route[], localRef: string | undefined): string {
 	const diverting = statuses.filter((s) => s.tier === "divert");
 	const over = diverting.map((s) => (s.exhausted ? `${shortName(s.provider)} (${s.exhausted.reason})` : `${shortName(s.provider)} ${s.pct}%`));
 	const why = diverting.some((s) => s.exhausted) ? "out of budget on" : "over the monthly cap on";
@@ -1268,6 +1296,6 @@ export function rejectReason(result: DivertResult, statuses: readonly ProviderSt
 	return (
 		`budget-routing: ${why} ${over.join(", ")}. Blocked launches: ${blocked.join(", ")}. ` +
 		`Re-queue each task on an open route: ${open.length > 0 ? open.join("; ") : "none with headroom"}. ` +
-		`Local fallback: ${localRef}.`
+		(localRef === undefined ? "No local fallback is registered on this machine." : `Local fallback: ${localRef}.`)
 	);
 }

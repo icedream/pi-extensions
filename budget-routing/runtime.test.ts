@@ -40,8 +40,15 @@ const MODELS = [
 	{ provider: "github-copilot", id: "claude-sonnet-5.5", cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 }, contextWindow: 1_000_000 },
 	{ provider: "opper", id: "aws/claude-sonnet-5-5", cost: { input: 2.2, output: 11, cacheRead: 0.25, cacheWrite: 2.75 }, contextWindow: 1_000_000 },
 	{ provider: "mistral", id: "magistral-medium-latest", cost: { input: 2, output: 5, cacheRead: 0, cacheWrite: 0.6 }, contextWindow: 128_000 },
+	{ provider: "anthropic", id: "claude-sonnet-5-5", cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 }, contextWindow: 1_000_000 },
 	{ provider: "strata", id: "local", cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 393_216 },
 ];
+
+/**
+ * Providers Pi can authenticate to here. A `discoverModels` provider whose catalog has not loaded yet
+ * is in this list and in no model list, which is still its machine.
+ */
+const AUTH_CONFIGURED = ["github-copilot", "anthropic", "mistral", "opper", "strata", "litellm"];
 
 interface Trace {
 	notices: string[];
@@ -71,6 +78,7 @@ function fakeCtx(trace: Trace, provider = "github-copilot") {
 		modelRegistry: {
 			getAll: () => MODELS,
 			find: (p: string, id: string) => MODELS.find((m) => m.provider === p && m.id === id),
+			getProviderAuthStatus: (p: string) => ({ configured: AUTH_CONFIGURED.includes(p) }),
 		},
 		ui: {
 			theme: { fg: (_c: string, t: string) => t },
@@ -99,7 +107,7 @@ const SETTINGS = { subagents: { agentOverrides: { worker: { model: "github-copil
  * A throwaway agent directory: config, settings.json with agent overrides, and session logs with known
  * costs, so tiers and table numbers are exact instead of whatever this machine happens to have logged.
  */
-async function loadWith(capCopilot: number | undefined, capMistral = 20) {
+async function loadWith(capCopilot: number | undefined, capMistral = 20, advisoryModels?: string[]) {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "budget-routing-runtime-"));
 	const now = Date.now();
 	await fs.mkdir(path.join(dir, "sessions", "proj"), { recursive: true });
@@ -111,6 +119,7 @@ async function loadWith(capCopilot: number | undefined, capMistral = 20) {
 			line("mistral", now, 0.2, "magistral-medium-latest", 100, 20_000),
 			line("anthropic", now, 0.3, "claude-haiku-5-5", 50, 10_000),
 			line("strata", now, 0, "qwen3.8-flash-next-iq3_s", 900, 400),
+			line("deepseek", now, 1.25, "deepseek-chat", 80, 30_000),
 		].join("\n") + "\n",
 	);
 	const config = {
@@ -118,10 +127,16 @@ async function loadWith(capCopilot: number | undefined, capMistral = 20) {
 		localSubagents: ["scout"],
 		thresholds: { nudge: 0.7, warn: 0.8, prepare: 0.95, divert: 1 },
 		enforce: "reject",
+		...(advisoryModels === undefined ? {} : { advisory: { models: advisoryModels, maxModels: 10 } }),
 		providers: [
 			{ provider: "github-copilot", ...(capCopilot === undefined ? {} : { monthlyCapUsd: capCopilot }) },
 			{ provider: "mistral", monthlyCapUsd: capMistral },
 			{ provider: "anthropic", reset: "utc" },
+			// A shared config lists providers that are only registered on some machines.
+			{ provider: "deepseek", monthlyCapUsd: 10 },
+			{ provider: "gemini" },
+			// Credentials configured, model catalog not loaded yet: this machine, so it stays tracked.
+			{ provider: "litellm", monthlyCapUsd: 5 },
 		],
 	};
 	await fs.writeFile(path.join(dir, "budget-routing.json"), JSON.stringify(config));
@@ -142,7 +157,12 @@ test("registers the budget tool, both commands, and one footer key per provider"
 
 	assert.ok(pi.tools.get("budget"), "budget tool missing");
 	assert.ok(pi.commands.get("budget") && pi.commands.get("budget-seat") && pi.commands.get("budget-balance"), "commands missing");
-	assert.deepEqual([...trace.statuses.keys()].sort(), ["budget-routing/anthropic", "budget-routing/github-copilot", "budget-routing/mistral"]);
+	assert.deepEqual([...trace.statuses.keys()].sort(), [
+		"budget-routing/anthropic",
+		"budget-routing/github-copilot",
+		"budget-routing/litellm",
+		"budget-routing/mistral",
+	]);
 	assert.equal(trace.statuses.get("budget-routing/github-copilot"), "copilot ~10%");
 });
 
@@ -165,6 +185,41 @@ test("an uncapped provider is reported, priced, and never tiered", async () => {
 
 	await pi.handlers.get("before_agent_start")?.[0]({ systemPromptOptions: {} }, fakeCtx(trace));
 	assert.match(trace.statuses.get("budget-routing/github-copilot") ?? "", /copilot \$5\.00/);
+});
+
+test("a provider with no models in this machine's registry is tracked nowhere", async () => {
+	const { pi } = await loadWith(50);
+	const trace = newTrace();
+	const event: { systemPromptOptions: { sections?: Record<string, string> } } = { systemPromptOptions: {} };
+	await pi.handlers.get("before_agent_start")?.[0](event, fakeCtx(trace));
+
+	const section = event.systemPromptOptions.sections?.budget ?? "";
+	assert.match(section, /copilot credits, under cap/);
+	assert.ok(!section.includes("deepseek"), `the section must not name it: ${section}`);
+	assert.equal(trace.statuses.get("budget-routing/deepseek"), undefined, "no footer indicator for it");
+	assert.ok(trace.notices.some((n) => /deepseek is configured but this machine has no models or credentials for it/.test(n)), trace.notices.join(" | "));
+
+	const tool = await pi.tools.get("budget").execute("c1", { action: "models" }, undefined, undefined, fakeCtx(newTrace()));
+	assert.ok(!tool.content[0].text.includes("deepseek"), tool.content[0].text);
+	// What this machine logged for it is still readable, it just carries no cap state.
+	assert.match(await runBudget(pi, "deepseek", newTrace()), /deepseek: configured, but this machine has no models or credentials for it, usage only, logged \$1\.25/);
+	// With nothing logged either there is no report to give, and the reason is stated instead.
+	assert.match(
+		await runBudget(pi, "gemini", newTrace()),
+		/gemini is configured but this machine has no models or credentials for it, so nothing is tracked for it here\. Tracked: github-copilot, mistral, anthropic, litellm\./,
+	);
+	// Credentials here but no loaded catalog is still this machine, so its cap is tracked.
+	const litellm = await pi.tools.get("budget").execute("c2", { action: "status" }, undefined, undefined, fakeCtx(newTrace()));
+	assert.match(litellm.content[0].text, /litellm +metered +\$5\.00 +\$0\.00 +0% +100% left +meter/);
+});
+
+test("route refs are dropped for an unregistered provider and kept for a mistyped model id", async () => {
+	const { pi } = await loadWith(50, 20, ["strata/local", "deepseek/deepseek-chat", "github-copilot/claude-sonnet-5", "mistral/magistral-medium-latest"]);
+	const out = await pi.tools.get("budget").execute("c1", { action: "models" }, undefined, undefined, fakeCtx(newTrace()));
+	const table = out.content[0].text;
+	assert.match(table, /mistral\/magistral-medium-latest/);
+	assert.ok(!table.includes("deepseek/deepseek-chat"), table);
+	assert.match(table, /github-copilot\/claude-sonnet-5 +metered +- +- +- +not tracked +\(not in the model registry\)/);
 });
 
 test("the budget tool tables differ by action and price the routes", async () => {
@@ -310,7 +365,7 @@ test("/budget <unknown> says so and names what is tracked", async () => {
 	const { pi } = await loadWith(50);
 	const out = await runBudget(pi, "nope", newTrace());
 	assert.match(out, /no usage logged for "nope" this month/);
-	assert.match(out, /Tracked: github-copilot, mistral, anthropic/);
+	assert.match(out, /Tracked: github-copilot, mistral, anthropic, litellm/);
 });
 
 test("/budget completions offer the configured providers", async () => {
@@ -320,6 +375,9 @@ test("/budget completions offer the configured providers", async () => {
 		{ value: "github-copilot", label: "github-copilot" },
 		{ value: "mistral", label: "mistral" },
 		{ value: "anthropic", label: "anthropic" },
+		{ value: "deepseek", label: "deepseek" },
+		{ value: "gemini", label: "gemini" },
+		{ value: "litellm", label: "litellm" },
 	]);
 	assert.deepEqual(await cmd.getArgumentCompletions("mis"), [{ value: "mistral", label: "mistral" }]);
 	assert.equal(await cmd.getArgumentCompletions("zzz"), null);

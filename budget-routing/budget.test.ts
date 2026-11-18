@@ -28,6 +28,8 @@ import {
 	preSwitchCompactionStep,
 	providerForModelRef,
 	providerStatus,
+	registeredProviders,
+	registeredRefs,
 	seatLiveFigure,
 	rejectReason,
 	classifyExhaustion,
@@ -793,6 +795,48 @@ test("buildRoutes keeps a reference the registry does not know, priced as unknow
 	const typo = routes.find((r) => r.ref === "anthropic/claud-sonnet-5-5");
 	assert.equal(typo?.price, "price unknown");
 	assert.match(costTable([], routes), /not in the model registry/);
+});
+
+test("registeredProviders lists what this machine can launch on", () => {
+	const models = [{ provider: "github-copilot", id: "claude-sonnet-5.5" }, { provider: "icedream-homepc/strata", id: "qwen" }, { provider: "github-copilot", id: "gpt-5.6-terra" }];
+	assert.deepEqual([...registeredProviders(models)].sort(), ["github-copilot", "icedream-homepc/strata"]);
+	// A `discoverModels` provider whose catalog has not loaded yet has no models and is still this machine's.
+	assert.deepEqual([...registeredProviders(models, ["litellm", "github-copilot"])].sort(), ["github-copilot", "icedream-homepc/strata", "litellm"]);
+});
+
+test("registeredRefs drops refs for providers this machine does not have", () => {
+	const registered = registeredProviders([
+		{ provider: "github-copilot", id: "claude-sonnet-5.5" },
+		{ provider: "icedream-homepc/strata", id: "qwen3.8-flash-next" },
+		{ provider: "strata", id: "qwen3.8-27b" },
+	]);
+	// The longest matching provider name wins, so a nested provider name is not mistaken for its prefix.
+	assert.deepEqual(
+		registeredRefs(
+			["icedream-homepc/strata/qwen3.8-flash-next", "strata/qwen3.8-27b:high", "github-copilot/claude-sonnet-5.5", "opper/aws/claude-haiku-5-5-eu", "deepseek/deepseek-chat"],
+			registered,
+		),
+		["icedream-homepc/strata/qwen3.8-flash-next", "strata/qwen3.8-27b:high", "github-copilot/claude-sonnet-5.5"],
+	);
+});
+
+test("a local model this machine cannot launch on is left out of the routing advice", () => {
+	const statuses = [providerStatus({ provider: COPILOT, monthlyCapUsd: 150, thresholds: DEFAULT_THRESHOLDS, reset: "local" }, { spend: 151, source: "live", observationIgnored: false }, "credits")];
+	const section = advisorySection(statuses, undefined, "budget");
+	assert.match(section, /copilot credits, over cap/);
+	assert.match(section, /re-queue the same task on one of them\.$/);
+
+	const models = [{ provider: "github-copilot", id: "claude-sonnet-5.5", cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } }];
+	const plan = applyDivert({ agent: "worker", model: "github-copilot/claude-sonnet-5.5", task: "a" }, {
+		mode: "reject",
+		localSubagents: ["scout"],
+		subagentRef: "strata/qwen3.8-flash-next",
+		tiers: { [COPILOT]: "divert" },
+		models,
+	});
+	const reason = rejectReason(plan, statuses, buildRoutes(["github-copilot/claude-sonnet-5.5"], models, statuses, "strata/qwen3.8-flash-next"), undefined);
+	assert.match(reason, /No local fallback is registered on this machine\./);
+	assert.ok(!reason.includes("strata/"), reason);
 });
 
 test("rejectReason names the cap and lists open routes so the task can be re-queued", () => {
