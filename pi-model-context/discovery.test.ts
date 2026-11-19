@@ -216,13 +216,26 @@ test("maxTokens comes from the endpoint when reported", () => {
 	assert.equal(models[0].maxTokensReported, true);
 });
 
-test("an unreported maxTokens falls back and is flagged, clamped to the context window", () => {
+test("an unreported maxTokens falls back to half the window and is flagged", () => {
+	// Large window: DEFAULT_MAX_TOKENS is the smaller half, unchanged.
 	const { models } = parseModelsPayload({ data: [{ id: "big", meta: { n_ctx: 393216 } }] });
 	assert.equal(models[0].maxTokens, DEFAULT_MAX_TOKENS);
 	assert.equal(models[0].maxTokensReported, false);
 
+	// Small window: the whole window is not a budget, because the prompt has to fit in it too.
 	const small = parseModelsPayload({ data: [{ id: "small", meta: { n_ctx: 4096 } }] });
-	assert.equal(small.models[0].maxTokens, 4096);
+	assert.equal(small.models[0].maxTokens, 2048);
+
+	// llama.cpp reporting -1 (--n-predict default, "no limit") is not a reported cap.
+	const unbounded = parseModelsPayload({ data: [{ id: "olala", meta: { n_ctx: 32768, n_predict: -1 } }] });
+	assert.equal(unbounded.models[0].maxTokens, 16384);
+	assert.equal(unbounded.models[0].maxTokensReported, false);
+});
+
+test("a reported cap still wins over the fallback", () => {
+	const { models } = parseModelsPayload({ data: [{ id: "capped", meta: { n_ctx: 32768, n_predict: 8192 } }] });
+	assert.equal(models[0].maxTokens, 8192);
+	assert.equal(models[0].maxTokensReported, true);
 });
 
 test("a mixed list keeps usable models and reports the skipped ones", () => {

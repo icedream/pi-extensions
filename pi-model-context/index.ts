@@ -44,6 +44,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import {
 	canDiscover,
+	DEFAULT_MAX_TOKENS,
 	DEFAULT_REFRESH_MINUTES,
 	describeRejections,
 	discoveryFlag,
@@ -133,7 +134,8 @@ async function registerProvider(
 		if (unreported.length > 0) {
 			notify(
 				`${LOG_PREFIX} ${entry.id}: ${unreported.length} model(s) report no output limit; ` +
-					`using ${unreported[0].maxTokens} (pin "maxTokens" in models.json to change it)`,
+					`budgeting half the context window, at most ${DEFAULT_MAX_TOKENS} ` +
+					`(${unreported[0].id}: ${unreported[0].maxTokens}); pin "maxTokens" in models.json to change it`,
 				"info",
 			);
 		}

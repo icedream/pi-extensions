@@ -39,7 +39,7 @@ hand survives every refresh.
 | `id` | Model id | entry skipped if missing |
 | `name` | Display name | `id` |
 | `meta.n_ctx`, `n_ctx`, `context_window`, `contextWindow`, `max_model_len`, `context_length` | `contextWindow` | **none** - the model is skipped |
-| `meta.n_predict`, `max_tokens`, `maxTokens`, then `max_output_tokens` inside any object-valued field | `maxTokens` | 65,536, clamped to the context window, with a notice |
+| `meta.n_predict`, `max_tokens`, `maxTokens`, then `max_output_tokens` inside any object-valued field | `maxTokens` | 65,536 or half the context window, whichever is smaller, with a notice |
 | `architecture.input_modalities` | `input` | `["text"]` |
 | `architecture.output_modalities` containing `decisions` | classifier marker | entry skipped with a notice |
 | `architecture.output_modalities` declared but without `text` (embeddings, image-only) | not a chat model | entry skipped with a notice |
@@ -101,7 +101,7 @@ the provider id skips the first pick. The list is whatever the last successful f
   ```
   pi-model-context: aggregator: 446 model(s) from https://aggregator.example/v1/models
   pi-model-context: aggregator: 56 model(s) skipped: no context window reported
-  pi-model-context: aggregator: 446 model(s) report no output limit; using 65536 (pin "maxTokens" in models.json to change it)
+  pi-model-context: aggregator: 446 model(s) report no output limit; budgeting half the context window, at most 65536 (llama-3-8b: 4096); pin "maxTokens" in models.json to change it
   ```
 
   `/model-context-list` is the way in to the individual models.

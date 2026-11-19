@@ -147,6 +147,20 @@ export function reportedContextWindow(model: EndpointModel): number | undefined 
  * `max_output_tokens` inside any object-valued field counts: providers that nest their own
  * metadata report the real cap per model there, and some caps are well below DEFAULT_MAX_TOKENS.
  */
+/**
+ * The output budget to assume when the endpoint reports none.
+ *
+ * A server that reports no cap is not saying "zero", and it is not saying "the whole window"
+ * either: llama.cpp's `-n/--n-predict` defaults to -1, meaning no limit, and every generated token
+ * has to fit in the same `n_ctx` as the prompt. Budgeting the whole window therefore assumes the
+ * prompt is free, which turns any request with a real prompt into a truncated turn at the server's
+ * own wall. Half the window leaves room for the prompt and still gives small windows a usable
+ * budget; DEFAULT_MAX_TOKENS remains the cap for windows large enough not to need one.
+ */
+export function fallbackMaxTokens(contextWindow: number): number {
+	return Math.min(DEFAULT_MAX_TOKENS, Math.max(1, Math.floor(contextWindow / 2)));
+}
+
 export function reportedMaxTokens(model: EndpointModel): number | undefined {
 	const candidates = [model.meta?.n_predict, model.max_tokens, model.maxTokens];
 	for (const candidate of candidates) {
@@ -334,7 +348,7 @@ export function parseModelsPayload(payload: unknown, discover?: DiscoverOptions)
 			reasoning: thinking.supported,
 			input: reportedInput(entry),
 			contextWindow,
-			maxTokens: Math.min(reported ?? DEFAULT_MAX_TOKENS, contextWindow),
+			maxTokens: reported !== undefined ? Math.min(reported, contextWindow) : fallbackMaxTokens(contextWindow),
 			maxTokensReported: reported !== undefined,
 			...(cost ? { cost } : {}),
 			...(thinking.levels ? { thinkingLevels: thinking.levels } : {}),
