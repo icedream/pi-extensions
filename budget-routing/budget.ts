@@ -1,4 +1,5 @@
 // Pure budget logic for the budget-routing extension. No pi imports, so it can be tested without the runtime.
+import { existsSync } from "node:fs";
 import { readFile, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -298,13 +299,65 @@ function parseAdvisory(raw: unknown): AdvisoryConfig {
 }
 
 export async function loadConfig(path: string): Promise<BudgetConfig> {
-	let text: string;
+	const base = await readJsonFile(path);
+	const localPath = localConfigPath(path);
+	if (!existsSync(localPath)) return parseConfig(base);
+	return parseConfig(mergeConfigRaw(base, await readJsonFile(localPath)));
+}
+
+async function readJsonFile(path: string): Promise<unknown> {
 	try {
-		text = await readFile(path, "utf8");
+		return JSON.parse(await readFile(path, "utf8"));
 	} catch {
 		throw new Error(`budget config not found: ${path}`);
 	}
-	return parseConfig(JSON.parse(text));
+}
+
+/** The machine-local sidecar of a config path: `budget-routing.json` becomes `budget-routing.local.json`. */
+export function localConfigPath(path: string): string {
+	return path.replace(/\.json$/i, "") + ".local.json";
+}
+
+/**
+ * A machine-local file over the shared one. Provider entries merge by name with the local entry winning,
+ * `advisory.models` union with the shared order first, and any other key the local file states replaces
+ * the shared value. Neither file has to name only providers that exist everywhere: the credential gate
+ * makes an entry inert where there is no credential for it.
+ */
+export function mergeConfigRaw(base: unknown, local: unknown): Record<string, unknown> {
+	if (typeof base !== "object" || base === null) throw new Error("budget config must be a JSON object");
+	if (typeof local !== "object" || local === null) throw new Error("budget local config must be a JSON object");
+	const b = { ...(base as Record<string, unknown>) };
+	const l = local as Record<string, unknown>;
+	const sharedProviders = Array.isArray(b.providers) ? (b.providers as unknown[]) : undefined;
+	const localProviders = Array.isArray(l.providers) ? (l.providers as unknown[]) : undefined;
+	if (localProviders && !sharedProviders) {
+		if (typeof b.provider === "string") throw new Error("budget config: give the shared file a providers array before a local file merges into it");
+		b.providers = localProviders;
+	} else if (sharedProviders && localProviders) {
+		const nameOf = (v: unknown) => (v && typeof v === "object" ? (v as Record<string, unknown>).provider : undefined);
+		const merged = [...sharedProviders];
+		for (const entry of localProviders) {
+			const name = nameOf(entry);
+			const at = name === undefined ? -1 : merged.findIndex((e) => nameOf(e) === name);
+			if (at === -1) merged.push(entry);
+			else merged[at] = { ...(merged[at] as Record<string, unknown>), ...(entry as Record<string, unknown>) };
+		}
+		b.providers = merged;
+	}
+	for (const [key, value] of Object.entries(l)) {
+		if (key === "providers" && b.providers !== undefined) continue;
+		if (key === "thresholds" && b.thresholds && typeof b.thresholds === "object") {
+			b.thresholds = { ...(b.thresholds as Record<string, unknown>), ...((value ?? {}) as Record<string, unknown>) };
+		} else if (key === "advisory" && b.advisory && typeof b.advisory === "object" && Array.isArray((value as Record<string, unknown>).models)) {
+			const models = Array.isArray((b.advisory as Record<string, unknown>).models) ? [...((b.advisory as Record<string, unknown>).models as unknown[])] : [];
+			for (const m of (value as { models: unknown[] }).models) if (!models.includes(m)) models.push(m);
+			b.advisory = { ...(b.advisory as Record<string, unknown>), ...(value as Record<string, unknown>), models };
+		} else {
+			b[key] = value;
+		}
+	}
+	return b;
 }
 
 /** The seat figure behind github.com/settings/copilot/features. */

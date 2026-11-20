@@ -79,6 +79,30 @@ one-entry `providers` list. A file that carries both forms is rejected rather th
 }
 ```
 
+### Machine-local values
+
+The same file is usually synced between machines that are billed differently, so a value that belongs to
+one box does not go in it. Put those in `budget-routing.local.json` beside the config (or
+`<name>.local.json` for a `PI_BUDGET_ROUTING_CONFIG` path), which is not synced and merges over the
+shared file before validation:
+
+- `providers` merges by `provider` name. A local entry adds its keys to the shared entry of the same name,
+  keeps shared keys it does not name, and an entry no shared file has is appended in local order.
+- `advisory.models` unions, shared refs first, so a machine can name routes the others cannot use.
+- `thresholds` merges per key; every other top-level key the local file states replaces the shared value.
+
+A provider named only in one of the two files is fine either way: the credential gate makes it inert on a
+machine that cannot authenticate to it.
+
+```json
+// budget-routing.local.json, on the machine whose Gemini key lives in one project
+{
+  "providers": [
+    { "provider": "google", "usage": { "source": "gcp-quota", "project": "<gcp-project-id>", "refreshMinutes": 15 } }
+  ]
+}
+```
+
 ## Cost table and the `budget` tool
 
 Pi records every provider's tokens at list price, but it never tells the model what a route costs, and
@@ -305,10 +329,10 @@ USD, so a counter cannot refuse a launch.
 }
 ```
 
-`project` names the project outright; `projectEnv` names a variable holding it, which is what a config
-file shared between work and private machines wants, so the project that carries the key stays on the
-machine that has it. Without either, the counter is skipped and one notification says which entry is
-missing the value. `quotaMetric` defaults to
+`project` names the project outright, and a shared file usually leaves it to the machine-local sidecar
+(see [Machine-local values](#machine-local-values)). `projectEnv` names a variable holding it instead,
+for a setup where environment is the per-machine switch. Without either, the counter is skipped and one
+notification says which entry is missing the value. `quotaMetric` defaults to
 `generativelanguage.googleapis.com/api_requests` and may be set to any quota metric the project reports. The fetch reads
 `serviceruntime.googleapis.com/quota/rate/net_usage` for the tracked month from
 `monitoring.googleapis.com`, authenticating with `gcloud auth print-access-token` (no project argument:

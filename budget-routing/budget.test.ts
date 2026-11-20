@@ -17,6 +17,9 @@ import {
 	effectiveCapUsd,
 	figureUsable,
 	formatCost,
+	localConfigPath,
+	loadConfig,
+	mergeConfigRaw,
 	menuModelRefs,
 	monthSpend,
 	monthSpendAll,
@@ -1139,6 +1142,56 @@ test("a session on a blocked provider is not asked to compact", () => {
 		exhausted: { atMs: 1, reason: "balance_exhausted" },
 	};
 	assert.deepEqual(preSwitchCompactionStep(blocked, false), { compact: false, compacted: false });
+});
+
+test("a machine-local file merges over the shared one", () => {
+	const shared = {
+		localModel: { provider: "strata", modelId: "qwen", subagentRef: "strata/qwen" },
+		localSubagents: ["scout"],
+		thresholds: { nudge: 0.7, warn: 0.8 },
+		advisory: { models: ["strata/qwen", "github-copilot/haiku"] },
+		providers: [
+			{ provider: "github-copilot", monthlyCapUsd: 150 },
+			{ provider: "google", reset: "utc" },
+		],
+	};
+	const local = {
+		thresholds: { warn: 0.9 },
+		advisory: { models: ["github-copilot/haiku", "litellm/qwen"], maxModels: 12 },
+		providers: [{ provider: "google", usage: { source: "gcp-quota", project: "my-playground" } }, { provider: "litellm", monthlyCapUsd: 4 }],
+	};
+	const merged = mergeConfigRaw(shared, local);
+	// Shared order is kept, a named entry merges rather than replaces, an unnamed one appends.
+	assert.deepEqual((merged.providers as Array<Record<string, unknown>>).map((p) => p.provider), ["github-copilot", "google", "litellm"]);
+	const google = (merged.providers as Array<Record<string, unknown>>)[1];
+	assert.equal(google.reset, "utc", "keys the local file does not name stay");
+	assert.equal((google.usage as Record<string, unknown>).project, "my-playground");
+	assert.deepEqual((merged.advisory as Record<string, unknown>).models, ["strata/qwen", "github-copilot/haiku", "litellm/qwen"]);
+	assert.deepEqual(merged.thresholds, { nudge: 0.7, warn: 0.9 });
+	assert.equal(localConfigPath("/x/budget-routing.json"), "/x/budget-routing.local.json");
+	assert.throws(
+		() => mergeConfigRaw({ provider: "github-copilot", monthlyCapUsd: 150, localModel: shared.localModel, localSubagents: ["scout"] }, { providers: [{ provider: "google" }] }),
+		/give the shared file a providers array/,
+	);
+});
+
+test("a machine-local sidecar is read by loadConfig when it exists", async () => {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "budget-local-"));
+	const sharedPath = path.join(dir, "budget-routing.json");
+	await fs.writeFile(
+		sharedPath,
+		JSON.stringify({
+			localModel: { provider: "strata", modelId: "qwen", subagentRef: "strata/qwen" },
+			localSubagents: ["scout"],
+			providers: [{ provider: "google", reset: "utc" }],
+		}),
+	);
+	assert.equal((await loadConfig(sharedPath)).providers[0].usage, undefined);
+	await fs.writeFile(path.join(dir, "budget-routing.local.json"), JSON.stringify({ providers: [{ provider: "google", usage: { source: "gcp-quota", project: "my-playground" } }] }));
+	const cfg = await loadConfig(sharedPath);
+	assert.equal(cfg.providers.length, 1, "the local entry merges into the shared one instead of appending");
+	assert.equal(cfg.providers[0].usage?.project, "my-playground");
+	await fs.rm(dir, { recursive: true, force: true });
 });
 
 test("trackedProviders keeps only providers this machine can authenticate to", () => {
