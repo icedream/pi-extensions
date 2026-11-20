@@ -3,7 +3,8 @@
 Pi extension for spend caps on the paid providers a session is billed on, several at once (GitHub
 Copilot, Anthropic, Mistral, a prepaid gateway such as Opper). Spend comes from Pi's session logs,
 from the provider's own usage API where one exists ([`seat`](#seat-figure) for Copilot,
-[`balance`](#wallet-figures) for a prepaid wallet), or from a hand-written `observed` figure.
+[`balance`](#wallet-figures) for a prepaid wallet, [`usage`](#request-counters) for a request counter),
+or from a hand-written `observed` figure.
 Behaviour then changes per provider by tier as its budget fills, and the model gets a priced route
 menu so it can move work to a cheaper route before it has to fall back to a local model.
 
@@ -58,6 +59,7 @@ Per provider entry:
 | `observed` | The provider's own usage figure, copied by hand: `creditsUsed`, `asOf` (ISO time you read it), `usdPerCredit` (default `0.01`). In-month replaces the meter as the baseline, and Pi spend since `asOf` is added on top |
 | `seat` | Copilot only. Fetches the figure instead of copying it. See [Seat figure](#seat-figure) |
 | `balance` | Prepaid wallets, currently `opper` only. Fetches the account balance and period spend. See [Wallet figures](#wallet-figures) |
+| `usage` | A request counter for a provider with no readable bill, e.g. a GCP project whose billing account is not visible here. Displayed only, never capped. See [Request counters](#request-counters) |
 
 A v1 file with a top-level `provider`, `monthlyCapUsd`, `observed` and `seat` still works: it reads as a
 one-entry `providers` list. A file that carries both forms is rejected rather than picking one.
@@ -114,11 +116,13 @@ provider with no models here is dropped, see [Registered providers](#registered-
 
 ## Registered providers
 
-A provider counts as registered here when Pi's model registry has at least one model under its name,
-or when Pi can authenticate to it here (`models.json`, a built-in, or an extension). The second half of
-that rule covers a `discoverModels` provider whose catalog has not loaded yet: its endpoint is down or
-still starting, and its spend is still this machine's to count. An entry with neither is a provider from
-another machine's config: it goes inert, and one notification per session says which entry that is.
+A provider counts as this machine's when Pi can authenticate to it here: an `auth.json` entry, an
+`apiKey` in `models.json`, an environment key, or an extension that supplies one. That covers a
+`discoverModels` provider whose catalog has not loaded yet, whose endpoint is down or still starting
+while its spend is still this machine's to count. Catalog presence is deliberately not a test: Pi ships
+the model catalog of providers such as Anthropic and Mistral on every install, and a machine without a
+key for them never bills on them. An entry with no credential here is inert, and one notification per
+session says which entry that is.
 
 The config file is usually shared between machines, and the provider set is not. Without the gate the
 model gets told about a cap it can never spend against and about routes its subagent tool cannot
@@ -285,6 +289,41 @@ with `/budget clear opper`.
 The key is sent to `api.opper.ai` and nowhere else, is never logged, and is never written to a config
 file. Like the seat fetch, the provider name is matched literally: a provider you have renamed locally
 gets no wallet figure.
+
+## Request counters
+
+A provider can bill you in a way you cannot read from this machine: the project that carries the key may
+have no accessible Cloud Billing account, so there is no dollar figure to fetch and no usage endpoint of
+its own. For those, a `usage` block counts requests instead. It is displayed and never tiered: caps stay
+USD, so a counter cannot refuse a launch.
+
+```json
+{
+  "provider": "google",
+  "reset": "utc",
+  "usage": { "source": "gcp-quota", "projectEnv": "BUDGET_GOOGLE_PROJECT", "refreshMinutes": 15 }
+}
+```
+
+`project` names the project outright; `projectEnv` names a variable holding it, which is what a config
+file shared between work and private machines wants, so the project that carries the key stays on the
+machine that has it. Without either, the counter is skipped and one notification says which entry is
+missing the value. `quotaMetric` defaults to
+`generativelanguage.googleapis.com/api_requests` and may be set to any quota metric the project reports. The fetch reads
+`serviceruntime.googleapis.com/quota/rate/net_usage` for the tracked month from
+`monitoring.googleapis.com`, authenticating with `gcloud auth print-access-token` (no project argument:
+gcloud validates that argument against the account context and fails when the configured project is
+elsewhere, while the bare token reads every project the account can see). It needs no key in this
+process and never sees a service-account credential. `/budget-usage` forces a fetch and reports it. The `budget` tool then appends a counter table:
+
+```text
+provider  requests this month  period start (UTC)  largest method
+google    2,314                2026-11-01          google.ai.generativelanguage.v1beta.GenerativeService.GenerateContent
+```
+
+A counter starts at zero with the month, so the first refresh after a reset reports what the month has
+cost in calls rather than in money. Points before the period start are dropped, not clamped, because the
+fetch window reaches back past the boundary on every refresh.
 
 ## Tests
 

@@ -43,6 +43,29 @@ export interface BalanceConfig {
 	refreshMinutes: number;
 }
 
+export const USAGE_SOURCES = ["gcp-quota"] as const;
+export type UsageSource = (typeof USAGE_SOURCES)[number];
+
+/**
+ * A provider-side counter for a provider whose bill this machine cannot read. It is displayed only:
+ * caps and tiers stay USD, so a counter never diverts a launch.
+ */
+export interface UsageConfig {
+	refreshMinutes: number;
+	source: UsageSource;
+	/** GCP project whose quota is read. Set either this or `projectEnv`, never both meanings at once. */
+	project?: string;
+	/** Name of an environment variable holding the project, for a config file shared between machines. */
+	projectEnv?: string;
+	/** Quota metric label value, e.g. "generativelanguage.googleapis.com/api_requests". */
+	quotaMetric: string;
+}
+
+export const DEFAULT_USAGE: Omit<UsageConfig, "source" | "project"> = {
+	refreshMinutes: 15,
+	quotaMetric: "generativelanguage.googleapis.com/api_requests",
+};
+
 /** One provider under observation. Absent monthlyCapUsd means it is tracked but never capped. */
 export interface ProviderBudget {
 	/** Provider name as recorded in Pi session logs, e.g. "github-copilot". */
@@ -60,6 +83,8 @@ export interface ProviderBudget {
 	 * `seat` is only honoured for Copilot: a provider renamed locally gets no figure.
 	 */
 	balance?: BalanceConfig;
+	/** A request counter instead of a money figure, for a provider with no readable bill. */
+	usage?: UsageConfig;
 }
 
 export interface AdvisoryConfig {
@@ -164,6 +189,39 @@ function parseBalance(raw: unknown, name: string): BalanceConfig | undefined {
 	return { refreshMinutes };
 }
 
+function parseUsage(raw: unknown, name: string): UsageConfig | undefined {
+	if (raw === undefined) return undefined;
+	const u = raw as Record<string, unknown>;
+	if (typeof u !== "object" || u === null) throw new Error(`budget config: ${name} must be an object`);
+	const refreshMinutes = u.refreshMinutes === undefined ? DEFAULT_USAGE.refreshMinutes : num(u.refreshMinutes, `${name}.refreshMinutes`);
+	if (refreshMinutes < 1) throw new Error(`budget config: ${name}.refreshMinutes must be >= 1`);
+	const project = u.project === undefined ? undefined : str(u.project, `${name}.project`);
+	const projectEnv = u.projectEnv === undefined ? undefined : str(u.projectEnv, `${name}.projectEnv`);
+	if (project === undefined && projectEnv === undefined) throw new Error(`budget config: ${name} needs project or projectEnv`);
+	return {
+		refreshMinutes,
+		source: oneOf<UsageSource>(u.source, USAGE_SOURCES, `${name}.source`, "gcp-quota"),
+		...(project === undefined ? {} : { project }),
+		...(projectEnv === undefined ? {} : { projectEnv }),
+		quotaMetric: u.quotaMetric === undefined ? DEFAULT_USAGE.quotaMetric : str(u.quotaMetric, `${name}.quotaMetric`),
+	};
+}
+
+/** The project a counter reads: the literal, else the variable named by `projectEnv`. */
+export function usageProject(cfg: UsageConfig, env: NodeJS.ProcessEnv = process.env): string | undefined {
+	if (cfg.project) return cfg.project;
+	return cfg.projectEnv ? env[cfg.projectEnv] || undefined : undefined;
+}
+
+/**
+ * The entries this machine can be billed on. Presence in the model catalog is not enough: Pi registers
+ * the built-in catalog of providers that have no credential here, and those never spend from this box.
+ */
+export function trackedProviders<T extends { provider: string }>(entries: readonly T[], authConfigured: Iterable<string>): T[] {
+	const authed = new Set(authConfigured);
+	return entries.filter((e) => authed.has(e.provider));
+}
+
 function parseProvider(raw: unknown, shared: Thresholds): ProviderBudget {
 	const r = raw as Record<string, unknown>;
 	const name = str(r.provider, "provider");
@@ -179,6 +237,7 @@ function parseProvider(raw: unknown, shared: Thresholds): ProviderBudget {
 		observed: parseObserved(r.observed, `${name}.observed`),
 		seat: parseSeat(r.seat, `${name}.seat`),
 		balance: parseBalance(r.balance, `${name}.balance`),
+		usage: parseUsage(r.usage, `${name}.usage`),
 	};
 }
 
@@ -344,6 +403,53 @@ export function parseBalanceFigure(raw: unknown): BalanceFigure {
 		periodEndMs: Number.isNaN(periodEndMs) ? Number.POSITIVE_INFINITY : periodEndMs,
 		blocked: r.blocked === true,
 		...(typeof r.block_reason === "string" ? { blockReason: r.block_reason } : {}),
+	};
+}
+
+/** A counter read from the provider's own meter, in the provider's own unit rather than dollars. */
+export interface UsageCounter {
+	requests: number;
+	/** What contributed to the total, so a spike is attributable without a second query. */
+	byMethod: Array<{ method: string; requests: number }>;
+	periodStartMs: number;
+	asOfMs: number;
+}
+
+export const QUOTA_METRIC_TYPE = "serviceruntime.googleapis.com/quota/rate/net_usage";
+
+/**
+ * Sums Cloud Monitoring quota-usage points inside the tracked month. Points before the period start are
+ * dropped rather than clamped: the fetch window is wider than the month at the edges, and clamping would
+ * count a boundary point in two periods.
+ */
+export function parseQuotaUsage(raw: unknown, opts: { quotaMetric: string; periodStartMs: number; asOfMs: number }): UsageCounter {
+	if (typeof raw !== "object" || raw === null) throw new Error("quota payload must be a JSON object");
+	const series = (raw as Record<string, unknown>).timeSeries;
+	if (series !== undefined && !Array.isArray(series)) throw new Error("quota payload has no timeSeries array");
+	const byMethod = new Map<string, number>();
+	let requests = 0;
+	for (const ts of (series ?? []) as Array<Record<string, unknown>>) {
+		const metric = ts.metric as Record<string, unknown> | undefined;
+		const labels = (metric?.labels ?? {}) as Record<string, unknown>;
+		if (metric?.type !== QUOTA_METRIC_TYPE || labels.quota_metric !== opts.quotaMetric) continue;
+		const method = typeof labels.method === "string" && labels.method !== "" ? labels.method : "unspecified";
+		const points = ts.points;
+		if (!Array.isArray(points)) continue;
+		for (const p of points as Array<Record<string, unknown>>) {
+			const start = Date.parse(((p.interval as Record<string, unknown> | undefined)?.startTime ?? "") as string);
+			if (Number.isNaN(start) || start < opts.periodStartMs) continue;
+			const value = p.value as Record<string, unknown> | undefined;
+			const n = Number(value?.int64Value);
+			if (!Number.isFinite(n) || n < 0) continue;
+			requests += n;
+			byMethod.set(method, (byMethod.get(method) ?? 0) + n);
+		}
+	}
+	return {
+		requests,
+		byMethod: [...byMethod.entries()].map(([method, count]) => ({ method, requests: count })).sort((a, b) => b.requests - a.requests),
+		periodStartMs: opts.periodStartMs,
+		asOfMs: opts.asOfMs,
 	};
 }
 
@@ -719,6 +825,8 @@ export interface ProviderStatus {
 	balanceUsd?: number;
 	/** A figure was fetched for this provider but is too old or outside its period to use. */
 	figureStale?: boolean;
+	/** Requests counted by the provider itself, for a provider with no readable bill. Never tiered. */
+	usage?: UsageCounter;
 }
 
 /** Billing shape for a provider: the config wins, otherwise a Copilot seat is credits and a zero-priced model is free. */
@@ -753,6 +861,7 @@ export function providerStatus(
 	exhausted?: Exhaustion,
 	now: Date = new Date(),
 	live?: LiveFigure,
+	usage?: UsageCounter,
 ): ProviderStatus {
 	const s: ProviderStatus = {
 		provider: pb.provider,
@@ -764,6 +873,7 @@ export function providerStatus(
 		observationIgnored: m.observationIgnored,
 		...(live?.balanceUsd === undefined ? {} : { balanceUsd: live.balanceUsd }),
 		...(live === undefined ? {} : { figureStale: !figureUsable(live, now) }),
+		...(usage === undefined ? {} : { usage }),
 	};
 	if (s.capUsd !== undefined) {
 		if (s.capUsd <= 0) {
@@ -1019,12 +1129,12 @@ export function registeredProviders(models: readonly RegistryModelLike[], authCo
  * themselves contain slashes, so the longest registered provider name that prefixes the ref decides.
  * A wrong model id under a known provider stays in the menu, where buildRoutes marks it.
  */
-export function registeredRefs(refs: readonly string[], registered: ReadonlySet<string>): string[] {
+export function registeredRefs(refs: readonly string[], registered: ReadonlySet<string>, isConfigured?: (provider: string) => boolean): string[] {
 	return refs.filter((r) => {
 		const base = stripThinkingSuffix(r.trim());
 		let best = "";
 		for (const p of registered) if ((base === p || base.startsWith(`${p}/`)) && p.length > best.length) best = p;
-		return best !== "";
+		return best !== "" && (isConfigured === undefined || isConfigured(best));
 	});
 }
 
@@ -1168,6 +1278,8 @@ export function costTable(statuses: readonly ProviderStatus[], routes: readonly 
 		const routeRows = routes.map((r) => [r.ref, r.billing, r.inOut, r.cachePair, r.ctxLabel ?? "-", headroomLabel(r.status) + (r.note ? `  (${r.note})` : "")]);
 		out.push("", renderTable(["route", "billing", "$/Mtok in/out", "cache r/w", "ctx", "provider room"], routeRows));
 	}
+	const usageRows = statuses.filter((s) => s.usage).map((s) => [shortName(s.provider), s.usage!.requests.toLocaleString("en-US"), new Date(s.usage!.periodStartMs).toISOString().slice(0, 10), s.usage!.byMethod[0]?.method ?? "-"]);
+	if (usageRows.length > 0) out.push("", renderTable(["provider", "requests this month", "period start (UTC)", "largest method"], usageRows));
 	return out.join("\n");
 }
 

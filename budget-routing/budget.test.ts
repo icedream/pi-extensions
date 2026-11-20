@@ -24,6 +24,7 @@ import {
 	parseAgentOverrideModels,
 	parseBalanceFigure,
 	parseConfig,
+	parseQuotaUsage,
 	parseSeatFigure,
 	preSwitchCompactionStep,
 	providerForModelRef,
@@ -39,6 +40,8 @@ import {
 	spendSince,
 	statusLabel,
 	tierFor,
+	trackedProviders,
+	usageProject,
 	usageReport,
 	usageSince,
 	windowLabel,
@@ -1136,4 +1139,85 @@ test("a session on a blocked provider is not asked to compact", () => {
 		exhausted: { atMs: 1, reason: "balance_exhausted" },
 	};
 	assert.deepEqual(preSwitchCompactionStep(blocked, false), { compact: false, compacted: false });
+});
+
+test("trackedProviders keeps only providers this machine can authenticate to", () => {
+	const entries = [{ provider: "github-copilot" }, { provider: "anthropic" }, { provider: "mistral" }, { provider: "strata" }];
+	// Pi registers the built-in anthropic and mistral catalog on every install. Without a credential
+	// nothing here bills on them, so the catalog alone must not make them tracked.
+	assert.deepEqual(trackedProviders(entries, ["github-copilot", "strata"]).map((e) => e.provider), ["github-copilot", "strata"]);
+});
+
+test("registeredRefs drops a ref whose provider has no credential here", () => {
+	const registered = registeredProviders([{ provider: "anthropic", id: "claude-sonnet-5-5" }, { provider: "strata", id: "qwen" }]);
+	assert.deepEqual(registeredRefs(["anthropic/claude-sonnet-5-5", "strata/qwen"], registered, (p) => p === "strata"), ["strata/qwen"]);
+});
+
+test("parseQuotaUsage sums the tracked month per method and ignores everything else", () => {
+	const periodStartMs = Date.UTC(2026, 10, 1);
+	const opts = { quotaMetric: "generativelanguage.googleapis.com/api_requests", periodStartMs, asOfMs: Date.UTC(2026, 10, 6) };
+	const raw = {
+		timeSeries: [
+			{
+				metric: { type: "serviceruntime.googleapis.com/quota/rate/net_usage", labels: { quota_metric: "generativelanguage.googleapis.com/api_requests", method: "GenerateContent" } },
+				points: [
+					{ interval: { startTime: "2026-11-02T00:00:00Z" }, value: { int64Value: "120" } },
+					{ interval: { startTime: "2026-11-03T00:00:00Z" }, value: { int64Value: "30" } },
+					// Before the month: the fetch window reaches back this far at every refresh.
+					{ interval: { startTime: "2026-10-30T00:00:00Z" }, value: { int64Value: "999" } },
+				],
+			},
+			{
+				metric: { type: "serviceruntime.googleapis.com/quota/rate/net_usage", labels: { quota_metric: "generativelanguage.googleapis.com/api_requests", method: "StreamGenerateContent" } },
+				points: [{ interval: { startTime: "2026-11-04T00:00:00Z" }, value: { int64Value: "7" } }],
+			},
+			{
+				metric: { type: "serviceruntime.googleapis.com/quota/rate/net_usage", labels: { quota_metric: "storage.googleapis.com/api_requests" } },
+				points: [{ interval: { startTime: "2026-11-05T00:00:00Z" }, value: { int64Value: "500" } }],
+			},
+		],
+	};
+	const fig = parseQuotaUsage(raw, opts);
+	assert.equal(fig.requests, 157);
+	assert.deepEqual(fig.byMethod, [{ method: "GenerateContent", requests: 150 }, { method: "StreamGenerateContent", requests: 7 }]);
+	// A project with no calls this month answers with no timeSeries at all, which is a zero and not a failure.
+	assert.equal(parseQuotaUsage({}, opts).requests, 0);
+	assert.throws(() => parseQuotaUsage({ timeSeries: {} }, opts), /no timeSeries array/);
+});
+
+test("parseConfig reads a usage block, defaulting its metric and cadence", () => {
+	const c = parseConfig({ ...validRaw, provider: "google", usage: { source: "gcp-quota", project: "my-playground" } });
+	const usage = c.providers[0].usage;
+	assert.equal(usage?.project, "my-playground");
+	assert.equal(usage?.quotaMetric, "generativelanguage.googleapis.com/api_requests");
+	assert.equal(usage?.refreshMinutes, 15);
+	// A config file shared between machines names the variable instead of the project.
+	assert.equal(parseConfig({ ...validRaw, usage: { source: "gcp-quota", projectEnv: "BUDGET_GOOGLE_PROJECT" } }).providers[0].usage?.projectEnv, "BUDGET_GOOGLE_PROJECT");
+	assert.throws(() => parseConfig({ ...validRaw, usage: { source: "gcp-quota" } }), /needs project or projectEnv/);
+	assert.throws(() => parseConfig({ ...validRaw, usage: { source: "datadog", project: "p" } }), /usage.source must be one of gcp-quota/);
+});
+
+test("usageProject resolves a literal before the named variable", () => {
+	const literal = { source: "gcp-quota" as const, refreshMinutes: 15, quotaMetric: "m", project: "a" };
+	const viaEnv = { source: "gcp-quota" as const, refreshMinutes: 15, quotaMetric: "m", projectEnv: "BUDGET_GOOGLE_PROJECT" };
+	assert.equal(usageProject(literal, { BUDGET_GOOGLE_PROJECT: "b" }), "a");
+	assert.equal(usageProject(viaEnv, { BUDGET_GOOGLE_PROJECT: "b" }), "b");
+	// An unset variable is not a project: the caller reports why the counter is missing.
+	assert.equal(usageProject(viaEnv, {}), undefined);
+});
+
+test("costTable reports a counter as requests, not as money", () => {
+	const status: ProviderStatus = {
+		provider: "google",
+		billing: "metered",
+		spend: 0,
+		tier: "ok",
+		source: "meter",
+		observationIgnored: false,
+		usage: { requests: 157, byMethod: [{ method: "GenerateContent", requests: 157 }], periodStartMs: Date.UTC(2026, 10, 1), asOfMs: Date.UTC(2026, 10, 6) },
+	};
+	const table = costTable([status], []);
+	assert.match(table, /requests this month/);
+	assert.match(table, /google\s+metered\s+none\s+\$0\.00/);
+	assert.match(table, /157/);
 });

@@ -187,6 +187,23 @@ test("an uncapped provider is reported, priced, and never tiered", async () => {
 	assert.match(trace.statuses.get("budget-routing/github-copilot") ?? "", /copilot \$5\.00/);
 });
 
+test("a provider in the catalog with no credential here is tracked nowhere", async () => {
+	const { pi } = await loadWith(50);
+	const trace = newTrace();
+	const ctx = fakeCtx(trace);
+	// Pi installs the anthropic and mistral catalogs on every machine. Nothing bills on them without a
+	// credential, and the model registry alone cannot tell those two situations apart.
+	(ctx.modelRegistry as Record<string, unknown>).getProviderAuthStatus = (p: string) => ({ configured: p !== "anthropic" && p !== "mistral" });
+	const event: { systemPromptOptions: { sections?: Record<string, string> } } = { systemPromptOptions: {} };
+	await pi.handlers.get("before_agent_start")?.[0](event, ctx);
+	assert.equal(trace.statuses.get("budget-routing/anthropic"), undefined, "no footer indicator for an unauthenticated provider");
+	assert.equal(trace.statuses.get("budget-routing/mistral"), undefined, "no footer indicator for an unauthenticated provider");
+	assert.ok(!/anthropic|mistral/.test(event.systemPromptOptions.sections?.budget ?? ""), event.systemPromptOptions.sections?.budget ?? "no section written");
+	assert.ok(trace.notices.some((n) => /anthropic is configured but this machine has no models or credentials for it/.test(n)), trace.notices.join(" | "));
+	const out = await pi.tools.get("budget").execute("c1", { action: "status" }, undefined, undefined, ctx);
+	assert.ok(!out.content[0].text.includes("anthropic") && !out.content[0].text.includes("mistral"), out.content[0].text);
+});
+
 test("a provider with no models in this machine's registry is tracked nowhere", async () => {
 	const { pi } = await loadWith(50);
 	const trace = newTrace();

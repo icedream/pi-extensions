@@ -41,6 +41,11 @@
       "reset": "utc",
       "billing": "metered",
       "balance": { "refreshMinutes": 15 }
+    },
+    {
+      "provider": "google",
+      "reset": "utc",
+      "usage": { "source": "gcp-quota", "projectEnv": "BUDGET_GOOGLE_PROJECT", "refreshMinutes": 15 }
     }
   ]
 }

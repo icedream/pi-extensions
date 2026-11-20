@@ -44,6 +44,7 @@ import {
 	registeredRefs,
 	rejectReason,
 	statusLabel,
+	trackedProviders,
 	usageReport,
 	usageSince,
 	windowLabel,
@@ -57,7 +58,9 @@ import {
 	type RegistryModelLike,
 	type SeatFigure,
 	type Tier,
+	type UsageCounter,
 } from "./budget.ts";
+import { fetchGcpQuotaUsage } from "./usage.ts";
 import { fetchCopilotSeat, isCopilotProvider } from "./seat.ts";
 import { fetchOpperBalance, isOpperProvider } from "./balance.ts";
 import { resolveGitHubToken } from "./credential.ts";
@@ -91,6 +94,8 @@ let cache: { at: number; key: string; spend: Map<string, MonthSpend> } | undefin
 const liveFigures = new Map<string, LiveFigure>();
 const seatFetchMs = new Map<string, number>();
 const balanceFetchMs = new Map<string, number>();
+const usageFigures = new Map<string, UsageCounter>();
+const usageFetchMs = new Map<string, number>();
 
 /**
  * Providers that refused a call for spend or credit reasons. In memory only: a restart forgets it and
@@ -120,8 +125,7 @@ async function currentSnapshot(
 	if (!existsSync(CONFIG_PATH)) return undefined;
 	const cfg = await loadConfig(CONFIG_PATH);
 	const names = cfg.providers.map((pb) => pb.provider);
-	const known = registeredProviders(models, authConfigured(names));
-	const tracked = cfg.providers.filter((pb) => known.has(pb.provider));
+	const tracked = trackedProviders(cfg.providers, authConfigured(names));
 	const spend = await spendAll(cfg);
 	const now = new Date();
 	const statuses = tracked.map((pb) =>
@@ -132,12 +136,14 @@ async function currentSnapshot(
 			exhausted.get(pb.provider),
 			now,
 			liveFigures.get(pb.provider),
+			usageFigures.get(pb.provider),
 		),
 	);
 	// The budget config is shared between machines, so it can name providers that only exist on some of
 	// them. Such a provider can never be spent from here, so it stays out of every surface: the footer,
 	// the prompt section, the tables and the divert decision.
-	const skipped = cfg.providers.filter((pb) => !known.has(pb.provider)).map((pb) => pb.provider);
+	const trackedNames = new Set(tracked.map((pb) => pb.provider));
+	const skipped = cfg.providers.filter((pb) => !trackedNames.has(pb.provider)).map((pb) => pb.provider);
 	return { cfg, statuses, skipped };
 }
 
@@ -149,10 +155,12 @@ function hasConfiguredAuth(ctx: ExtensionContext, provider: string): boolean {
 	return ctx.modelRegistry.getProviderAuthStatus?.(provider)?.configured === true;
 }
 
-/** Provider set this machine can be billed on, for the configured names plus the local model. */
+/** Provider names from the config that this machine can authenticate to. */
 function knownProviders(ctx: ExtensionContext, cfg: BudgetConfig): Set<string> {
 	const names = [...cfg.providers.map((pb) => pb.provider), cfg.localModel.provider];
-	return registeredProviders(ctx.modelRegistry.getAll(), names.filter((n) => hasConfiguredAuth(ctx, n)));
+	// The model registry is not evidence of a credential: Pi registers the built-in catalog of providers
+	// this machine has no key for, and those never bill here.
+	return new Set(names.filter((n) => hasConfiguredAuth(ctx, n)));
 }
 
 export default function (pi: ExtensionAPI) {
@@ -160,6 +168,7 @@ export default function (pi: ExtensionAPI) {
 	const compacted = new Map<string, boolean>();
 	let seatInFlight: Promise<FigureResult[]> | undefined;
 	let balanceInFlight: Promise<FigureResult[]> | undefined;
+	let usageInFlight: Promise<FigureResult[]> | undefined;
 	const activeStatusKeys = new Set<string>();
 
 	function notifyOnce(ctx: ExtensionContext, key: string, message: string, severity: "info" | "warning" | "error" = "warning") {
@@ -330,6 +339,47 @@ export default function (pi: ExtensionAPI) {
 		return out;
 	}
 
+	/** Counters fetch at most once at a time, separately from the money figures. */
+	function refreshUsage(ctx: ExtensionContext, force = false): Promise<FigureResult[]> {
+		if (usageInFlight) return usageInFlight;
+		usageInFlight = doRefreshUsage(ctx, force).finally(() => {
+			usageInFlight = undefined;
+		});
+		return usageInFlight;
+	}
+
+	/** Refreshes every provider whose entry has a `usage` block. A counter never caps, only displays. */
+	async function doRefreshUsage(ctx: ExtensionContext, force: boolean): Promise<FigureResult[]> {
+		if (!existsSync(CONFIG_PATH)) return [{ ok: false, note: "no config file" }];
+		let cfg: BudgetConfig;
+		try {
+			cfg = await loadConfig(CONFIG_PATH);
+		} catch (err) {
+			return [{ ok: false, note: (err as Error).message }];
+		}
+		const out: FigureResult[] = [];
+		const known = knownProviders(ctx, cfg);
+		for (const pb of cfg.providers) {
+			if (!known.has(pb.provider) || !pb.usage) continue;
+			if (!force && Date.now() - (usageFetchMs.get(pb.provider) ?? 0) < pb.usage.refreshMinutes * 60_000) {
+				out.push({ ok: true, note: "counter is fresh" });
+				continue;
+			}
+			// Recorded before the work, so an unreachable project is not retried on every settle.
+			usageFetchMs.set(pb.provider, Date.now());
+			try {
+				const fig = await fetchGcpQuotaUsage(pb.usage, monthStartMs(new Date(), pb.reset));
+				usageFigures.set(pb.provider, fig);
+				cache = undefined;
+				out.push({ ok: true, note: `${pb.provider}: ${fig.requests.toLocaleString("en-US")} requests since ${new Date(fig.periodStartMs).toISOString().slice(0, 10)}` });
+			} catch (err) {
+				notifyOnce(ctx, `usage-fetch:${pb.provider}`, `usage refresh failed: ${(err as Error).message}`);
+				out.push({ ok: false, note: (err as Error).message });
+			}
+		}
+		return out;
+	}
+
 	async function safeSnapshot(ctx: ExtensionContext): Promise<Snapshot | undefined> {
 		try {
 			return await currentSnapshot(ctx.modelRegistry.getAll(), (names) => names.filter((n) => hasConfiguredAuth(ctx, n)));
@@ -352,7 +402,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		const refs = menuModelRefs(snap.cfg, parseAgentOverrideModels(overrides), ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
 		const models = ctx.modelRegistry.getAll();
-		return buildRoutes(registeredRefs(refs, registeredProviders(models)), models, snap.statuses, snap.cfg.localModel.subagentRef);
+		return buildRoutes(registeredRefs(refs, registeredProviders(models), (p) => hasConfiguredAuth(ctx, p)), models, snap.statuses, snap.cfg.localModel.subagentRef);
 	}
 
 	/** The local model only counts as a fallback while this machine can launch on it. */
@@ -378,7 +428,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		announced.clear();
 		compacted.clear();
-		void Promise.all([refreshSeats(ctx), refreshBalances(ctx)])
+		void Promise.all([refreshSeats(ctx), refreshBalances(ctx), refreshUsage(ctx)])
 			.then(() => refreshStatus(ctx))
 			.catch(() => undefined);
 	});
@@ -453,6 +503,16 @@ export default function (pi: ExtensionAPI) {
 			const results = await refreshBalances(ctx, true);
 			const usable = results.filter((r) => r.note !== undefined);
 			ctx.ui.notify(usable.map((r) => `${r.ok ? "ok" : "failed"}: ${r.note}`).join(" | ") || "no balance block configured", usable.some((r) => r.ok) ? "info" : "warning");
+			await refreshStatus(ctx);
+		},
+	});
+
+	pi.registerCommand("budget-usage", {
+		description: "Fetch the provider-side request counters now and report them",
+		handler: async (_args, ctx) => {
+			const results = await refreshUsage(ctx, true);
+			const usable = results.filter((r) => r.note !== undefined);
+			ctx.ui.notify(usable.map((r) => `${r.ok ? "ok" : "failed"}: ${r.note}`).join(" | ") || "no usage block configured", usable.some((r) => r.ok) ? "info" : "warning");
 			await refreshStatus(ctx);
 		},
 	});
@@ -579,7 +639,7 @@ export default function (pi: ExtensionAPI) {
 	// Keep the fetched figures current between runs. Off the critical path: the next turn sees it
 	// because currentSnapshot() re-reads the config file.
 	pi.on("agent_settled", async (_event, ctx) => {
-		void Promise.all([refreshSeats(ctx), refreshBalances(ctx)])
+		void Promise.all([refreshSeats(ctx), refreshBalances(ctx), refreshUsage(ctx)])
 			.then(() => refreshStatus(ctx))
 			.catch(() => undefined);
 	});
