@@ -1,22 +1,43 @@
 # pi-skill-reminder
 
-Names the skills a session has already read after the context is compacted.
+Names the skill rules a compaction dropped, so the model reloads the ones its task needs.
 
-Pi keeps the `<available_skills>` block in the system prompt, so compaction does not lose it. What
-compaction loses is that a particular skill's text was read and applied. The next turn then re-reads the
-file, or answers without rules it had already loaded.
+Pi keeps the `<available_skills>` block in the system prompt and the compaction summary lists every file the
+session read under `<read-files>`. Neither carries the rules. A session that lost a skill's text still sees
+the path, so it answers from recall of a read it can no longer quote, and follows rules it never actually has.
 
 ## What it does
 
-- A `read` tool result whose path matches `…/skills/<name>/<file>.md` puts that skill in the session's
-  set. A failed read does not count.
-- After any compaction (manual `/compact`, the context threshold, or overflow recovery), one hidden
-  message enters the next turn with the set and the instruction to apply the rules rather than re-read
-  them. Nothing is sent while the set is unchanged.
-- `session_start` scans the transcript, so a resume or a fork rebuilds the set instead of starting empty.
-- `/skills-loaded` prints the set for the current session.
+- A skill counts as loaded once the session reads `…/skills/<name>/….md` successfully, or once Pi expands a
+  skill block for it. A failed read does not count.
+- The extension compares the transcript against the compaction-aware projection
+  (`buildContextEntries`) to find skills whose text is no longer in the model's context.
+- For those skills it puts a hidden message into the next turn: name, frontmatter description and path, with
+  the order that the model reads the files that apply to its current task **in full** before applying any
+  rule from them, leaves the ones that do not apply alone, and never restates a rule from a file it has not
+  read in this context window.
+- The check runs after a compaction inside a run (delivered by steering, so the turns that follow the
+  compaction get it) and at the start of any run that begins on a compacted transcript, a resume, a fork or a
+  branch jump.
+- One notice per compaction boundary. A read of a listed file closes it, so it is not nagged again.
+- `/skills-loaded` lists the skills the session read and which of them still hold their text, plus the mode.
+- `/skills-reload` reads the skill files and puts their text into context now; `force` includes text that is
+  already in context.
 
-The reminder lists skill-relative paths (`skills/no-ai-slop/SKILL.md`), not absolute ones.
+## Modes
+
+`PI_SKILL_RULES` selects what the message carries:
+
+| Value | Behaviour |
+|-------|-----------|
+| `relevant` (default) | the list with descriptions; the model re-reads in full only what its task needs |
+| `full` | the extension reads every dropped file and injects the text itself |
+| `off` | leave the summary alone |
+
+`full` costs the whole text of everything the session read, at every compaction: several large skills are
+several thousand tokens per compaction. Files over 48 KB are cut at a line boundary with the offset to resume
+at, since the read tool would not have given more either, and messages split at 160 KB. The default costs the
+list plus whatever the model decides to read.
 
 ## Install
 
@@ -31,4 +52,5 @@ Add the directory to `packages` in `~/.pi/agent/settings.json`:
 ```bash
 npm test              # node --test: handlers and message shape, no session and no model
 npm run typecheck     # tsc -p tsconfig.json
+npm run e2e           # real AgentSession against a scripted endpoint, asserting on request bodies
 ```

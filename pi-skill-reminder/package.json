@@ -2,7 +2,7 @@
 	"name": "pi-skill-reminder",
 	"type": "module",
 	"version": "0.1.0",
-	"description": "Pi extension: name the skills a session already read after a compaction, so the next turn applies them instead of re-reading them",
+	"description": "Pi extension: name the skill rules a compaction dropped so the model re-reads the ones its task needs",
 	"pi": {
 		"extensions": [
 			"./index.ts"
