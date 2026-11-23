@@ -30,8 +30,9 @@
  * names them. `discover.require` filters which entries register at all, because a gateway can
  * list over a thousand models and `/model` cannot show them.
  *
- * Values written in models.json for a model override what discovery reports, so a
- * context window can be pinned there and survives a refresh.
+ * The registered models replace the provider's `models` entries in models.json, so a
+ * per-model correction belongs in that provider's `modelOverrides`, which Pi applies
+ * above what this extension registers.
  *
  * Commands:
  *   /model-context            menu to turn automatic discovery on or off per provider
@@ -53,6 +54,7 @@ import {
 	modelsUrlFor,
 	readModelsJsonProviders,
 	setDiscoveryFlagInFile,
+	thinkingLevelMap,
 	type DiscoveredModel,
 	type ProviderEntry,
 	type RejectedModel,
@@ -81,23 +83,6 @@ interface LastDiscovery {
 	models: ChatModel[];
 	skipped: RejectedModel[];
 	fetchedAtMs: number;
-}
-
-/** Levels Pi offers in /thinking, in the order it climbs them. */
-const THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
-
-/**
- * The thinking levels to offer for one model. xhigh and max only reach /thinking when they are
- * mapped, so an endpoint that names its levels gets exactly those: offering a level the route
- * rejects turns a thinking-level choice into a failed request. Naming "none" is what lets
- * thinking be switched off; without a list the previous guess stays.
- */
-function thinkingLevelMap(levels: string[] | undefined): ChatModel["thinkingLevelMap"] {
-	if (!levels) return { xhigh: "xhigh", max: "max" };
-	const map: Record<string, string | null> = {};
-	for (const level of THINKING_LEVELS) map[level] = levels.includes(level) ? level : null;
-	if (!levels.includes("none")) map.off = null;
-	return map as ChatModel["thinkingLevelMap"];
 }
 
 function toModelConfig(entry: ProviderEntry, model: DiscoveredModel): ChatModel {

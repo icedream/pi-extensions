@@ -29,8 +29,9 @@ In `~/.pi/agent/models.json`:
 | `discover` | Optional. Discovery knobs: `require`, `pricing`, `refreshMinutes`. See [Narrowing a large list](#narrowing-a-large-list). |
 | `apiKey` | Literal, `$NAME`, `${NAME}`, `$$`, `$!`. A leading `!command` is refused for discovery requests. |
 
-`models.json` values for a model override what discovery reports, so a context window pinned by
-hand survives every refresh.
+The models registered here replace the provider's `models` entries in `models.json`, so a value written
+for a model there is dropped. Per-model corrections go in that provider's `modelOverrides`, which Pi
+1.5.2 applies above the registered models, and a context window pinned there survives every refresh.
 
 ## What is read from `GET /models`
 
@@ -44,7 +45,7 @@ hand survives every refresh.
 | `architecture.output_modalities` containing `decisions` | classifier marker | entry skipped with a notice |
 | `architecture.output_modalities` declared but without `text` (embeddings, image-only) | not a chat model | entry skipped with a notice |
 | `pricing.prompt`, `pricing.completion`, `pricing.input_cache_read`, `pricing.input_cache_write` | `cost`, converted from USD per token to USD per million tokens | no cost, so the model stays free |
-| `opper.reasoning.supported`, `params.reasoning.supported` | `thinkingLevelMap`: only the levels named get offered | previous guess, which maps `xhigh` and `max` |
+| `opper.reasoning.supported`, `params.reasoning.supported` | `thinkingLevelMap`: only the levels named get offered, and a named `none` becomes Pi's `off` | previous guess, which maps `xhigh` and `max` |
 | `opper.capabilities` or `capabilities` containing `reasoning` | `reasoning` | `true` |
 
 ## Narrowing a large list
@@ -112,9 +113,12 @@ the provider id skips the first pick. The list is whatever the last successful f
   is reused for `discover.refreshMinutes` (default 10), so a session does not fetch again at
   `session_start`.
 - A failed refresh keeps the last list it registered and warns, rather than emptying `/model`.
-- Thinking levels come from the endpoint when it names them, so a route without `xhigh` is not
-  offered `xhigh`. An endpoint that names none gets `xhigh` and `max` mapped as before; for a model
-  that rejects them, set them to `null` per id with `modelOverrides` in `models.json`.
+- Thinking levels come from the endpoint when it names them, so a route without `xhigh` is not offered
+  `xhigh`, and a level the endpoint does not name is never offered. Pi's `off` is sent as the endpoint's
+  own `none` token when it names one; without that mapping `off` sends no reasoning value and a model
+  that thinks by default keeps thinking. An endpoint that names no levels gets `xhigh` and `max` mapped
+  as before; for a model that rejects them, set them to `null` per id with `modelOverrides` in
+  `models.json`.
 - A registered price is what Pi's cost display, and `budget-routing`'s meter, multiply tokens
   against. A gateway that bills at provider rates with no markup is therefore metered accurately. A
   model missing a price on either side is registered unpriced rather than half-priced.

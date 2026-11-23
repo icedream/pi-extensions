@@ -24,6 +24,7 @@ import {
 	resolveConfigValue,
 	setDiscoveryFlagInFile,
 	setDiscoveryFlagInText,
+	thinkingLevelMap,
 	type RejectedModel,
 } from "./discovery.ts";
 
@@ -326,6 +327,28 @@ test("the reasoning flag and level list reach the registered model", () => {
 	assert.equal(models[0].reasoning, true);
 	assert.equal(models[1].reasoning, false);
 	assert.equal(models[1].thinkingLevels, undefined);
+});
+
+test("off maps to the endpoint's own none token, and unnamed levels are dropped", () => {
+	const map = thinkingLevelMap(["none", "low", "medium", "xhigh"]);
+	// Pi's off has to become a token this route accepts, or off sends nothing and the model keeps thinking.
+	assert.equal(map.off, "none");
+	assert.equal(map.low, "low");
+	assert.equal(map.medium, "medium");
+	assert.equal(map.xhigh, "xhigh");
+	assert.equal(map.minimal, null);
+	assert.equal(map.high, null);
+	assert.equal(map.max, null);
+});
+
+test("off stays unmapped when the endpoint names no none level", () => {
+	const map = thinkingLevelMap(["low", "medium", "high"]);
+	assert.equal(map.off, null);
+	assert.equal(map.high, "high");
+});
+
+test("an endpoint that names no levels keeps the previous guess", () => {
+	assert.deepEqual(thinkingLevelMap(undefined), { xhigh: "xhigh", max: "max" });
 });
 
 test("discover.require narrows an aggregator list by a reported field", () => {

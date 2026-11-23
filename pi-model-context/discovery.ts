@@ -252,6 +252,38 @@ export function reportedReasoning(model: EndpointModel): ReportedReasoning {
 	return { supported: caps ? caps.includes("reasoning") : true, ...(levels.length > 0 ? { levels } : {}) };
 }
 
+/** Levels Pi offers in /thinking, in the order it climbs them. */
+export const THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+/**
+ * The shape Pi's model config takes for `thinkingLevelMap`: a level mapped to `null` is not
+ * offered, and a token string is what the endpoint is sent for that level.
+ */
+export interface ThinkingLevelMap {
+	off?: string | null;
+	minimal?: string | null;
+	low?: string | null;
+	medium?: string | null;
+	high?: string | null;
+	xhigh?: string | null;
+	max?: string | null;
+}
+
+/**
+ * The thinking levels to offer for one model. xhigh and max only reach /thinking when they are
+ * mapped, so an endpoint that names its levels gets exactly those: offering a level the route
+ * rejects turns a thinking-level choice into a failed request. Pi's `off` becomes the endpoint's
+ * own "none" token when it names one, otherwise there is no value to send and off is not offered.
+ * Without a list the previous guess stays.
+ */
+export function thinkingLevelMap(levels: string[] | undefined): ThinkingLevelMap {
+	if (!levels) return { xhigh: "xhigh", max: "max" };
+	const map: ThinkingLevelMap = {};
+	for (const level of THINKING_LEVELS) map[level] = levels.includes(level) ? level : null;
+	map.off = levels.includes("none") ? "none" : null;
+	return map;
+}
+
 /** One `dotted.path=value` predicate from discover.require. */
 export interface RequirePredicate {
 	text: string;
