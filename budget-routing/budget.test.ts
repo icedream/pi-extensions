@@ -8,6 +8,8 @@ import { utimes } from "node:fs/promises";
 import {
 	advisorySection,
 	applyDivert,
+	attributeRefusal,
+	ATTRIBUTED_REFUSAL_TTL_MS,
 	balanceLiveFigure,
 	billingFor,
 	buildRoutes,
@@ -36,6 +38,7 @@ import {
 	registeredRefs,
 	seatLiveFigure,
 	rejectReason,
+	requestedProviders,
 	classifyExhaustion,
 	exhaustionActive,
 	formatTokens,
@@ -1273,4 +1276,71 @@ test("costTable reports a counter as requests, not as money", () => {
 	assert.match(table, /requests this month/);
 	assert.match(table, /google\s+metered\s+none\s+\$0\.00/);
 	assert.match(table, /157/);
+});
+
+test("monthSpendAll: a seat that was wanted here but cannot be read marks the cap unknown", async () => {
+	const dir = await tmpSessions();
+	await fs.writeFile(path.join(dir, "s.jsonl"), [line("github-copilot", "assistant", Date.now(), 40)].join("\n") + "\n");
+	const cfg = parseConfig(validRaw);
+	const stale = seatLiveFigure({ ...parseSeatFigure(seatPayload), asOfMs: Date.now() - 3 * 3600_000 }, 0.01, "local");
+
+	const aged = await monthSpendAll(cfg, dir, new Date(), new Map([["github-copilot", stale]]), new Set(["github-copilot"]));
+	assert.equal(aged.get("github-copilot")?.source, "meter");
+	assert.equal(aged.get("github-copilot")?.capUnknown, true);
+
+	// Nothing was ever fetched on this machine, so the local tally is the figure it has always shown.
+	const never = await monthSpendAll(cfg, dir, new Date());
+	assert.equal(never.get("github-copilot")?.capUnknown, undefined);
+
+	assert.equal((await monthSpend(cfg.providers[0], dir, new Date(), stale, true)).capUnknown, true);
+	assert.equal((await monthSpend(cfg.providers[0], dir, new Date(), stale)).capUnknown, undefined);
+});
+
+test("an unreadable cap is divert, and every surface says the cap is unknown rather than a percentage", () => {
+	const cfg = parseConfig(validRaw);
+	const s = providerStatus(
+		cfg.providers[0],
+		{ spend: 90.97, source: "meter", observationIgnored: true, capUnknown: true },
+		"credits",
+		undefined,
+		new Date(),
+		undefined,
+		undefined,
+		"seat fetch rejected the credential (HTTP 401)",
+	);
+	assert.equal(s.capUnknown, true);
+	assert.equal(s.tier, "divert");
+	assert.deepEqual(statusLabel(s), { text: "copilot ? cap unknown", color: "warning" });
+	assert.match(costTable([s], []), /cap unknown +meter \(figure unreadable: seat fetch rejected the credential \(HTTP 401\)\)/);
+	assert.match(advisorySection([s], LOCAL_REF, "budget"), /copilot credits, cap unreadable/);
+
+	const plan = applyDivert(
+		{ agent: "worker", task: "x", model: "github-copilot/claude-sonnet-5.5" },
+		{ mode: "reject", localSubagents: ["scout"], subagentRef: LOCAL_REF, tiers: { [COPILOT]: s.tier }, sessionProvider: LOCAL, models: REGISTRY },
+	);
+	assert.match(rejectReason(plan, [s], [], LOCAL_REF), /unable to read the cap on copilot \(cap unreadable\)/);
+});
+
+test("attributeRefusal only names a provider the call can be pinned to", () => {
+	const now = new Date("2026-11-24T17:00:00Z");
+	const hit = attributeRefusal("Error: 429 quota exceeded", [COPILOT], now);
+	assert.equal(hit?.provider, COPILOT);
+	assert.equal(hit?.exhaustion.reason, "quota exhausted");
+	assert.equal(hit?.exhaustion.untilMs, now.getTime() + ATTRIBUTED_REFUSAL_TTL_MS);
+
+	// A batch across two providers cannot say which leg failed, so nothing is refused.
+	assert.equal(attributeRefusal("Error: 429 quota exceeded", [COPILOT, "google"], now), undefined);
+	assert.equal(attributeRefusal("no refusal here", [COPILOT], now), undefined);
+	assert.equal(attributeRefusal("google: insufficient_quota", [COPILOT, "google"], now)?.provider, "google");
+
+	// A refusal that states when access returns keeps that instant instead of the short default window.
+	const stated = attributeRefusal("quota exceeded, access returns 2026-12-01T00:00:00Z", [COPILOT], now);
+	assert.ok((stated?.exhaustion.untilMs ?? 0) > now.getTime() + ATTRIBUTED_REFUSAL_TTL_MS, JSON.stringify(stated));
+});
+
+test("requestedProviders names what a launch spends, inherited launches included", () => {
+	assert.deepEqual(requestedProviders({ agent: "worker", model: "github-copilot/claude-sonnet-5.5" }, REGISTRY, LOCAL), [COPILOT]);
+	assert.deepEqual(requestedProviders({ tasks: [{ agent: "a", model: "github-copilot/claude-sonnet-5.5" }, { agent: "b" }] }, REGISTRY, COPILOT), [COPILOT, COPILOT]);
+	// An unresolvable reference is not attributed to anyone rather than guessed at.
+	assert.deepEqual(requestedProviders({ agent: "a", model: "nope/nope" }, REGISTRY, COPILOT), []);
 });

@@ -786,6 +786,13 @@ export interface MonthSpend {
 	source: "meter" | "calibrated" | "live";
 	/** An observation exists but is from another month (or in the future), so it was not used. */
 	observationIgnored: boolean;
+	/**
+	 * The provider's own figure is the only one that can see this spend, and it is unavailable: a Copilot
+	 * seat or a prepaid wallet whose fetch is missing, old, or outside its period. The meter is still
+	 * reported, but it is a local tally of one machine against a pooled account, so no headroom follows
+	 * from it.
+	 */
+	capUnknown?: boolean;
 }
 
 /**
@@ -798,6 +805,7 @@ export async function monthSpend(
 	sessionsDir: string,
 	now: Date = new Date(),
 	live?: LiveFigure,
+	unreadable = false,
 ): Promise<MonthSpend> {
 	if (live && figureUsable(live, now)) {
 		const local = await spendSince(sessionsDir, pb.provider, live.asOfMs);
@@ -810,7 +818,12 @@ export async function monthSpend(
 		return { spend: o.creditsUsed * o.usdPerCredit + local, source: "calibrated", observationIgnored: false };
 	}
 	const ignored = o !== undefined || live !== undefined;
-	return { spend: await spendSince(sessionsDir, pb.provider, start), source: "meter", observationIgnored: ignored };
+	return {
+		spend: await spendSince(sessionsDir, pb.provider, start),
+		source: "meter",
+		observationIgnored: ignored,
+		...(billsExternally(pb) && unreadable ? { capUnknown: true } : {}),
+	};
 }
 
 /**
@@ -823,6 +836,7 @@ export async function monthSpendAll(
 	sessionsDir: string,
 	now: Date = new Date(),
 	live?: Map<string, LiveFigure>,
+	unreadable?: ReadonlySet<string>,
 ): Promise<Map<string, MonthSpend>> {
 	const baselineUsd = new Map<string, number>();
 	const baselineSource = new Map<string, "live" | "calibrated">();
@@ -851,8 +865,16 @@ export async function monthSpendAll(
 		if (base !== undefined) {
 			out.set(pb.provider, { spend: base + tail, source: baselineSource.get(pb.provider) as MonthSpend["source"], observationIgnored: false });
 		} else {
-			const stale = pb.observed !== undefined || live?.has(pb.provider) === true;
-			out.set(pb.provider, { spend: tail, source: "meter", observationIgnored: stale });
+			const fig = live?.get(pb.provider);
+			const stale = pb.observed !== undefined || fig !== undefined;
+			out.set(pb.provider, {
+				spend: tail,
+				source: "meter",
+				observationIgnored: stale,
+				// Only a provider whose figure was wanted here and could not be read is unknowable: a machine
+				// that never fetches one keeps its local tally, which is what it has always shown.
+				...(billsExternally(pb) && unreadable?.has(pb.provider) === true ? { capUnknown: true } : {}),
+			});
 		}
 	}
 	return out;
@@ -878,8 +900,21 @@ export interface ProviderStatus {
 	balanceUsd?: number;
 	/** A figure was fetched for this provider but is too old or outside its period to use. */
 	figureStale?: boolean;
+	/** The spend lives on the provider's account and its figure is unusable, so the cap state is unknown. */
+	capUnknown?: boolean;
+	/** Why the provider's own figure could not be read, from the last fetch attempt. */
+	liveError?: string;
 	/** Requests counted by the provider itself, for a provider with no readable bill. Never tiered. */
 	usage?: UsageCounter;
+}
+
+/**
+ * True when the money is spent somewhere this machine's logs cannot see: a Copilot seat (credits are
+ * pooled across the billing entity) or a prepaid wallet (the account is shared). Only the provider's own
+ * figure measures those, so a missing one is not a small error but a missing quantity.
+ */
+export function billsExternally(pb: ProviderBudget): boolean {
+	return pb.provider === "github-copilot" || pb.balance !== undefined;
 }
 
 /** Billing shape for a provider: the config wins, otherwise a Copilot seat is credits and a zero-priced model is free. */
@@ -915,6 +950,7 @@ export function providerStatus(
 	now: Date = new Date(),
 	live?: LiveFigure,
 	usage?: UsageCounter,
+	liveError?: string,
 ): ProviderStatus {
 	const s: ProviderStatus = {
 		provider: pb.provider,
@@ -926,6 +962,8 @@ export function providerStatus(
 		observationIgnored: m.observationIgnored,
 		...(live?.balanceUsd === undefined ? {} : { balanceUsd: live.balanceUsd }),
 		...(live === undefined ? {} : { figureStale: !figureUsable(live, now) }),
+		...(m.capUnknown === true ? { capUnknown: true } : {}),
+		...(liveError === undefined ? {} : { liveError }),
 		...(usage === undefined ? {} : { usage }),
 	};
 	if (s.capUsd !== undefined) {
@@ -960,6 +998,10 @@ export function providerStatus(
 		s.exhausted = exhausted;
 		s.tier = "divert";
 	}
+	// Cap state the provider itself cannot confirm is not permission to spend: the percentage against a
+	// locally tallied number says nothing about a pooled seat, so an unreadable bill tightens rather than
+	// relaxes what launches are allowed.
+	if (m.capUnknown === true) s.tier = "divert";
 	return s;
 }
 
@@ -1024,6 +1066,42 @@ export function exhaustionActive(ex: Exhaustion, zone: ResetZone, now: Date = ne
 	return now.getTime() < next;
 }
 
+/** A refusal summarised by a launcher is weaker evidence than the provider's own answer, so it expires. */
+export const ATTRIBUTED_REFUSAL_TTL_MS = 30 * 60_000;
+
+/**
+ * Reads a spend or credit refusal out of the result text of a tool that made the call, for the case of a
+ * child run whose provider error never reaches this session as a message. Attribution is claimed only
+ * when the recorded launches leave exactly one candidate provider: a batch spread over two providers
+ * cannot say which leg failed, and guessing would refuse one that is fine.
+ */
+export function attributeRefusal(text: string, requested: readonly string[], now: Date = new Date()): { provider: string; exhaustion: Exhaustion } | undefined {
+	const hit = classifyExhaustion(text, now);
+	if (hit === undefined || requested.length === 0) return undefined;
+	const unique = [...new Set(requested)];
+	const named = unique.filter((p) => text.includes(p));
+	const pick = unique.length === 1 ? unique : named.length === 1 ? named : [];
+	if (pick.length === 0) return undefined;
+	return { provider: pick[0], exhaustion: { ...hit, ...(hit.untilMs === undefined ? { untilMs: now.getTime() + ATTRIBUTED_REFUSAL_TTL_MS } : {}) } };
+}
+
+/**
+ * Providers a subagent call would spend: every explicit model reference it names, plus the session's own
+ * provider for each launch that inherits one.
+ */
+export function requestedProviders(input: unknown, models: readonly RegistryModelLike[], sessionProvider?: string): string[] {
+	type Launch = { model?: unknown };
+	const root = (input ?? {}) as Launch & { tasks?: unknown };
+	const launches: Launch[] = Array.isArray(root.tasks) ? (root.tasks as Launch[]) : [root];
+	const out: string[] = [];
+	for (const l of launches) {
+		const ref = typeof l.model === "string" ? l.model : undefined;
+		const p = ref === undefined ? sessionProvider : providerForModelRef(ref, models);
+		if (p !== undefined) out.push(p);
+	}
+	return out;
+}
+
 export function tierFor(frac: number, t: Thresholds): Tier {
 	if (frac >= t.divert) return "divert";
 	if (frac >= t.prepare) return "prepare";
@@ -1086,6 +1164,9 @@ export function shortName(provider: string): string {
 export function statusLabel(s: ProviderStatus): { text: string; color: "dim" | "accent" | "warning" | "error" } {
 	const name = shortName(s.provider);
 	if (s.exhausted) return { text: `${name} out of budget`, color: "error" };
+	// A seat or wallet that could not be read leaves the percentage meaningless: it counts one machine
+	// against a pooled account, so the footer says the number is unknown rather than showing the count.
+	if (s.capUnknown) return { text: `${name} ? cap unknown`, color: "warning" };
 	// The meter can still print a number, but the one that matters is unknown.
 	if (s.figureStale && s.balanceUsd !== undefined) return { text: `${name} ? balance unknown`, color: "warning" };
 	if (s.capUsd === undefined) return { text: `${name} ${usd(s.spend)}`, color: "dim" };
@@ -1294,6 +1375,7 @@ function pad(v: string, w: number): string {
 function headroomLabel(s: ProviderStatus | undefined): string {
 	if (!s) return "not tracked";
 	if (s.exhausted) return "out of budget";
+	if (s.capUnknown) return "cap unknown";
 	// For a prepaid account the money left is the headroom, and it is the number worth reading.
 	if (s.balanceUsd !== undefined) return s.figureStale ? "balance unknown" : `${usd(s.balanceUsd)} left`;
 	if (s.capUsd === undefined) return "no cap";
@@ -1304,6 +1386,7 @@ function headroomLabel(s: ProviderStatus | undefined): string {
 /** Where the spent figure came from, with the kind of figure named when there is a fetched one. */
 function figureLabel(s: ProviderStatus): string {
 	if (s.source === "live") return s.balanceUsd === undefined ? "live (seat)" : "live (balance)";
+	if (s.capUnknown) return s.liveError === undefined ? `${s.source} (figure unreadable)` : `${s.source} (figure unreadable: ${s.liveError})`;
 	if (s.figureStale) return `${s.source} (figure stale)`;
 	return s.source;
 }
@@ -1353,6 +1436,7 @@ export function advisorySection(statuses: readonly ProviderStatus[], localRef: s
 	if (statuses.length === 0) return "";
 	const parts = statuses.map((s) => {
 		if (s.exhausted) return `${shortName(s.provider)} ${s.billing}, out of budget (${s.exhausted.reason})`;
+		if (s.capUnknown) return `${shortName(s.provider)} ${s.billing}, cap unreadable`;
 		if (s.capUsd === undefined) return `${shortName(s.provider)} ${s.billing}, no cap`;
 		return `${shortName(s.provider)} ${s.billing}, ${TIER_LABELS[s.tier]}`;
 	});
@@ -1451,8 +1535,10 @@ export function applyDivert(input: unknown, opts: DivertOptions): DivertResult {
  */
 export function rejectReason(result: DivertResult, statuses: readonly ProviderStatus[], routes: readonly Route[], localRef: string | undefined): string {
 	const diverting = statuses.filter((s) => s.tier === "divert");
-	const over = diverting.map((s) => (s.exhausted ? `${shortName(s.provider)} (${s.exhausted.reason})` : `${shortName(s.provider)} ${s.pct}%`));
-	const why = diverting.some((s) => s.exhausted) ? "out of budget on" : "over the monthly cap on";
+	const over = diverting.map((s) =>
+		s.exhausted ? `${shortName(s.provider)} (${s.exhausted.reason})` : s.capUnknown ? `${shortName(s.provider)} (cap unreadable)` : `${shortName(s.provider)} ${s.pct}%`,
+	);
+	const why = diverting.some((s) => s.exhausted) ? "out of budget on" : diverting.some((s) => s.capUnknown) ? "unable to read the cap on" : "over the monthly cap on";
 	const open = routes
 		.filter((r) => r.ref !== localRef && r.status && r.status.tier !== "divert")
 		.slice(0, 4)

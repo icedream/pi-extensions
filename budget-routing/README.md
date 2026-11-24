@@ -190,8 +190,20 @@ The state clears when a call to that provider succeeds again, when the reset ins
 passes, or at the next month boundary in that provider's `reset` zone, since a spend limit is usually a
 monthly allowance. A wallet figure saying `blocked` is the exception: it is re-read from the provider
 every refresh, so it clears as soon as the account has money again rather than waiting for a month.
+A seat figure saying credit is still left clears it too.
 It is held in memory, so a restart forgets it and the next failed call detects it again.
 `/budget clear <provider>` drops it by hand, for a limit you just raised.
+
+### Refusals seen inside another tool
+
+A subagent run bills a provider without its error ever reaching this session as a message, so a launch
+that failed with `429 quota exceeded` would otherwise teach the budget nothing. The providers a
+`subagent` call would spend are recorded when the call starts, and the text of its result is read for
+the same refusal wording. Attribution is claimed only when the recorded launches leave exactly one
+candidate provider: a batch spread over two providers cannot say which leg failed, and guessing would
+refuse a provider that is fine. Such an attributed refusal expires after 30 minutes instead of lasting to
+the month boundary, because a launcher's summary is weaker evidence than the provider's own answer, and
+it is dropped as soon as the seat or wallet says there is money left.
 
 ## The `/budget` command
 
@@ -264,6 +276,16 @@ notifies once per session.
 fresh figure the minutes between GitHub's snapshot and now are counted twice, at most a few cents
 at the default interval. The alternative would drop non-Pi usage in that window, so the overlap is
 kept.
+
+**A figure that cannot be read is not a low figure.** Copilot credits are pooled across the billing
+entity, and a wallet is shared, so the Pi-logged tally counts one machine against everybody's spend. If
+a seat or wallet was asked for here and could not be read, because the fetch failed or the figure aged
+past `refreshMinutes × 4`, the entry has no usable baseline: the footer shows `copilot ? cap unknown`,
+the table's figure column shows `meter (figure unreadable: <why the fetch failed>)`, the tier is
+`divert`, and launches that would spend it are refused with `unable to read the cap on copilot (cap
+unreadable)`. A provider that is never fetched at all keeps its local tally, which is what it has always
+shown. If this machine cannot read the seat, keep a current `observed` entry or take the `seat` block
+out; the reason in the figure column is the way to tell the two cases apart.
 
 ## Wallet figures
 

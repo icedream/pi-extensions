@@ -23,7 +23,9 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
 	applyDivert,
 	advisorySection,
+	attributeRefusal,
 	balanceLiveFigure,
+	billsExternally,
 	billingFor,
 	buildRoutes,
 	costTable,
@@ -43,6 +45,7 @@ import {
 	registeredProviders,
 	registeredRefs,
 	rejectReason,
+	requestedProviders,
 	statusLabel,
 	trackedProviders,
 	usageReport,
@@ -98,6 +101,15 @@ const usageFigures = new Map<string, UsageCounter>();
 const usageFetchMs = new Map<string, number>();
 
 /**
+ * Why the last fetch of a provider's own figure failed. Kept between attempts because `notifyOnce`
+ * says a failure exactly once: after that the surfaces are the only place the reason can be read.
+ */
+const figureErrors = new Map<string, string>();
+
+/** Providers a subagent call in flight would spend, so a refusal inside its result can be attributed. */
+const launchProviders = new Map<string, string[]>();
+
+/**
  * Providers that refused a call for spend or credit reasons. In memory only: a restart forgets it and
  * the next failed call detects it again, which costs one request rather than a state file to keep sane.
  */
@@ -106,13 +118,28 @@ const exhausted = new Map<string, Exhaustion>();
 function configKey(cfg: BudgetConfig): string {
 	const entries = cfg.providers.map((pb) => [pb.provider, pb.monthlyCapUsd ?? null, pb.reset, pb.observed?.asOfMs ?? null, pb.observed?.creditsUsed ?? null]);
 	const figures = [...liveFigures.entries()].map(([p, f]) => [p, f.spendUsd, f.balanceUsd ?? null, f.hardCapUsd ?? null, f.asOfMs]);
-	return JSON.stringify([entries, figures]);
+	return JSON.stringify([entries, figures, [...figureErrors.entries()].sort()]);
+}
+
+/**
+ * Providers whose spend lives on their own account and whose figure could not be read here: a fetch that
+ * failed, or one old enough that `monthSpendAll` would ignore it. Their meter tally is a local count
+ * against a pooled allowance, so it cannot carry a headroom claim.
+ */
+function unreadableFigures(cfg: BudgetConfig, now: Date): Set<string> {
+	const out = new Set<string>();
+	for (const pb of cfg.providers) {
+		if (!billsExternally(pb)) continue;
+		const live = liveFigures.get(pb.provider);
+		if (figureErrors.has(pb.provider) || (live !== undefined && !figureUsable(live, now))) out.add(pb.provider);
+	}
+	return out;
 }
 
 async function spendAll(cfg: BudgetConfig): Promise<Map<string, MonthSpend>> {
 	const key = configKey(cfg);
 	if (cache && cache.key === key && Date.now() - cache.at < CACHE_MS) return cache.spend;
-	const spend = await monthSpendAll(cfg, SESSIONS_DIR, new Date(), liveFigures);
+	const spend = await monthSpendAll(cfg, SESSIONS_DIR, new Date(), liveFigures, unreadableFigures(cfg, new Date()));
 	cache = { at: Date.now(), key, spend };
 	return spend;
 }
@@ -137,6 +164,7 @@ async function currentSnapshot(
 			now,
 			liveFigures.get(pb.provider),
 			usageFigures.get(pb.provider),
+			figureErrors.get(pb.provider),
 		),
 	);
 	// The budget config is shared between machines, so it can name providers that only exist on some of
@@ -243,6 +271,7 @@ export default function (pi: ExtensionAPI) {
 			try {
 				({ token, source } = await resolveGitHubToken(AGENT_DIR, seat.credential, pb.provider));
 			} catch (err) {
+				figureErrors.set(pb.provider, (err as Error).message);
 				notifyOnce(ctx, `seat-credential:${pb.provider}`, `seat refresh skipped: ${(err as Error).message}`);
 				out.push({ ok: false, note: (err as Error).message });
 				continue;
@@ -251,6 +280,7 @@ export default function (pi: ExtensionAPI) {
 			try {
 				fig = await fetchCopilotSeat(token);
 			} catch (err) {
+				figureErrors.set(pb.provider, (err as Error).message);
 				notifyOnce(ctx, `seat-fetch:${pb.provider}`, `seat refresh failed: ${(err as Error).message}`);
 				out.push({ ok: false, note: (err as Error).message });
 				continue;
@@ -258,7 +288,11 @@ export default function (pi: ExtensionAPI) {
 			const usdPerCredit = pb.observed?.usdPerCredit ?? 0.01;
 			const live = seatLiveFigure(fig, usdPerCredit, pb.reset, seat.refreshMinutes);
 			liveFigures.set(pb.provider, live);
+			figureErrors.delete(pb.provider);
 			cache = undefined;
+			// Credit left on the seat clears a refusal the same way money left in a wallet does.
+			const previousRefusal = exhausted.get(pb.provider);
+			if (fig.remaining > 0 && previousRefusal && previousRefusal.atMs <= live.asOfMs) exhausted.delete(pb.provider);
 
 			const capFromSeat = live.hardCapUsd ?? 0;
 			if (pb.monthlyCapUsd !== undefined && Math.abs(capFromSeat - pb.monthlyCapUsd) > 0.005) {
@@ -315,6 +349,7 @@ export default function (pi: ExtensionAPI) {
 			balanceFetchMs.set(pb.provider, Date.now());
 			const key = await ctx.modelRegistry.getApiKeyForProvider(pb.provider);
 			if (!key) {
+				figureErrors.set(pb.provider, `no API key for ${pb.provider}`);
 				notifyOnce(ctx, `balance-key:${pb.provider}`, `no API key for ${pb.provider}, so its balance is not tracked`);
 				out.push({ ok: false, note: `no API key for ${pb.provider}` });
 				continue;
@@ -323,12 +358,14 @@ export default function (pi: ExtensionAPI) {
 			try {
 				fig = await fetchOpperBalance(key);
 			} catch (err) {
+				figureErrors.set(pb.provider, (err as Error).message);
 				notifyOnce(ctx, `balance-fetch:${pb.provider}`, `balance refresh failed: ${(err as Error).message}`);
 				out.push({ ok: false, note: (err as Error).message });
 				continue;
 			}
 			const live = balanceLiveFigure(fig, balance.refreshMinutes);
 			liveFigures.set(pb.provider, live);
+			figureErrors.delete(pb.provider);
 			cache = undefined;
 			// A refusal remembered from a failed call should not outlive the provider saying it is fine.
 			const previous = exhausted.get(pb.provider);
@@ -649,11 +686,16 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "subagent") return undefined;
 		const snap = await safeSnapshot(ctx);
+		// Recorded whatever `enforce` says: a refusal inside the result is only attributable if the call
+		// that made it was seen here.
+		if (typeof event.toolCallId === "string")
+			launchProviders.set(event.toolCallId, requestedProviders((event as unknown as { input?: unknown }).input, ctx.modelRegistry.getAll(), ctx.model?.provider));
 		if (!snap || snap.cfg.enforce === "off") return undefined;
 
-		// A provider with no cap still counts once it refuses: its own limit is the cap.
+		// A provider with no cap still counts once it refuses: its own limit is the cap. One whose figure
+		// cannot be read counts too, because the local tally says nothing about the pooled account.
 		const tiers: Record<string, Tier> = {};
-		for (const s of snap.statuses) if (s.capUsd !== undefined || s.exhausted) tiers[s.provider] = s.tier;
+		for (const s of snap.statuses) if (s.capUsd !== undefined || s.exhausted || s.capUnknown) tiers[s.provider] = s.tier;
 
 		const plan = applyDivert((event as unknown as { input?: unknown }).input, {
 			mode: snap.cfg.enforce,
@@ -671,6 +713,21 @@ export default function (pi: ExtensionAPI) {
 	// not in every prompt.
 	pi.on("tool_result", async (event, ctx) => {
 		if (event.toolName !== "subagent") return undefined;
+		const requested = typeof event.toolCallId === "string" ? launchProviders.get(event.toolCallId) : undefined;
+		if (typeof event.toolCallId === "string") launchProviders.delete(event.toolCallId);
+		// A child run bills a provider without the parent ever seeing its error text, so the refusal is
+		// read back out of the launcher's summary.
+		const text = Array.isArray(event.content) ? event.content.map((c) => (c.type === "text" ? c.text : "")).join("\n") : "";
+		const refusal = requested === undefined ? undefined : attributeRefusal(text, requested);
+		if (refusal !== undefined) {
+			const previous = exhausted.get(refusal.provider);
+			exhausted.set(refusal.provider, refusal.exhaustion);
+			if (!previous) {
+				const until = refusal.exhaustion.untilMs === undefined ? "until it resets" : `until ${new Date(refusal.exhaustion.untilMs).toISOString()}`;
+				ctx.ui.notify(`budget-routing: ${refusal.provider} refused a subagent call (${refusal.exhaustion.reason}) ${until}. Launches that would spend it are refused.`, "error");
+			}
+			void refreshStatus(ctx);
+		}
 		const input = (event as unknown as { input?: { action?: unknown } }).input;
 		if (typeof input?.action !== "string" || input.action !== "models") return undefined;
 		const snap = await safeSnapshot(ctx);

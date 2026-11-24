@@ -577,12 +577,93 @@ test("an empty wallet refuses launches aimed at it and leaves the session alone"
 	}
 });
 
-test("no API key means no wallet, and the provider is metered from logs with one notice", async () => {
-	const { pi, trace, restore } = await loadOpper({ noKey: true });
+test("no API key means no wallet, so the cap is unknown and its launches are refused", async () => {
+	const { pi, ctx, trace, restore } = await loadOpper({ noKey: true });
 	try {
-		// Only the logged 0.35 is known, and with no cap the spend is what the footer shows.
-		assert.equal(await statusEventually(trace, "budget-routing/opper", "opper $0.35"), "opper $0.35");
+		// The logged 0.35 is still printed, but only the wallet knows what the account spent, so the
+		// footer claims nothing about headroom and a launch aimed at it is not waved through.
+		assert.equal(await statusEventually(trace, "budget-routing/opper", "opper ? cap unknown"), "opper ? cap unknown");
 		assert.equal(trace.notices.filter((n) => /no API key for opper/.test(n)).length, 1);
+		const blocked = await pi.handlers.get("tool_call")?.[0]({ toolName: "subagent", toolCallId: "k1", input: { agent: "worker", task: "x", model: "opper/aws/claude-sonnet-5-5" } }, ctx);
+		assert.equal(blocked?.block, true);
+		assert.match(blocked?.reason, /unable to read the cap on opper \(cap unreadable\)/);
+	} finally {
+		restore();
+	}
+});
+
+/** The seat payload the stub answers with, in the shape api.github.com sends. */
+function seatPayload(used: number, entitlement: number, remaining: number, timestampUtc = new Date().toISOString()) {
+	return {
+		login: "tester",
+		quota_reset_date_utc: new Date(Date.now() + 6 * 24 * 3600_000).toISOString(),
+		token_based_billing: true,
+		quota_snapshots: {
+			chat: { credits_used: 0, unlimited: true },
+			completions: { credits_used: 0, unlimited: true },
+			premium_interactions: { credits_used: used, entitlement, remaining, percent_remaining: 70, timestamp_utc: timestampUtc, token_based_billing: true },
+		},
+	};
+}
+
+/** The throwaway agent directory again, this time with a Copilot seat under observation and a stubbed endpoint. */
+async function loadSeat(opts: { seat?: unknown; seatShouldFail?: boolean } = {}) {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "budget-seat-"));
+	const now = Date.now();
+	await fs.mkdir(path.join(dir, "sessions", "proj"), { recursive: true });
+	await fs.writeFile(path.join(dir, "sessions", "proj", "current.jsonl"), [line("github-copilot", now - 5 * 60_000, 3, "claude-sonnet-5.5", 100, 9_000)].join("\n") + "\n");
+	const config = {
+		localModel: { provider: "strata", modelId: "local", subagentRef: "strata/local" },
+		localSubagents: ["scout"],
+		thresholds: { nudge: 0.7, warn: 0.8, prepare: 0.95, divert: 1 },
+		enforce: "reject",
+		providers: [{ provider: "github-copilot", monthlyCapUsd: 150, seat: { refreshMinutes: 15, credential: "pi" } }],
+	};
+	await fs.writeFile(path.join(dir, "budget-routing.json"), JSON.stringify(config));
+	await fs.writeFile(path.join(dir, "settings.json"), JSON.stringify(SETTINGS));
+	await fs.writeFile(path.join(dir, "auth.json"), JSON.stringify({ "github-copilot": { refresh: "ghu_testtokenforfixture" } }));
+	process.env.PI_BUDGET_ROUTING_AGENT_DIR = dir;
+	process.env.PI_BUDGET_ROUTING_CONFIG = path.join(dir, "budget-routing.json");
+	const mod = await import(`./index.ts?seatdir=${encodeURIComponent(dir)}`);
+	const pi = fakePi();
+	mod.default(pi as never);
+
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = (async () =>
+		opts.seatShouldFail ? new Response("nope", { status: 401 }) : new Response(JSON.stringify(opts.seat ?? seatPayload(4000, 15000, 11000)), { status: 200 })) as typeof fetch;
+
+	const trace = newTrace();
+	const ctx = fakeCtx(trace, "github-copilot");
+	await pi.handlers.get("session_start")?.[0]({}, ctx);
+	return { pi, ctx, trace, restore: () => (globalThis.fetch = realFetch) };
+}
+
+test("a seat that will not answer leaves the cap unknown and refuses Copilot launches", async () => {
+	const { pi, ctx, trace, restore } = await loadSeat({ seatShouldFail: true });
+	try {
+		assert.equal(await statusEventually(trace, "budget-routing/github-copilot", "copilot ? cap unknown"), "copilot ? cap unknown");
+		const blocked = await pi.handlers.get("tool_call")?.[0]({ toolName: "subagent", toolCallId: "c1", input: { agent: "worker", task: "x", model: "github-copilot/claude-sonnet-5.5" } }, ctx);
+		assert.equal(blocked?.block, true);
+		assert.match(blocked?.reason, /unable to read the cap on copilot \(cap unreadable\)/);
+		// The reason the figure is missing stays readable after the single notice has been spent.
+		assert.match(await runBudget(pi, "", trace), /figure unreadable: seat fetch rejected the credential \(HTTP 401\)/);
+	} finally {
+		restore();
+	}
+});
+
+test("a refusal inside a subagent result marks that provider out of budget for later launches", async () => {
+	const { pi, ctx, trace, restore } = await loadSeat();
+	try {
+		const toolCall = pi.handlers.get("tool_call")?.[0];
+		// The seat says there is credit left, so the first launch is allowed.
+		assert.equal(await toolCall?.({ toolName: "subagent", toolCallId: "c1", input: { agent: "worker", task: "x", model: "github-copilot/claude-sonnet-5.5" } }, ctx), undefined);
+		// A child run's 429 never reaches this session as a message, so it is read back from the result.
+		await pi.handlers.get("tool_result")?.[0]({ toolName: "subagent", toolCallId: "c1", input: {}, content: [{ type: "text", text: "Workflow child failed: 429 quota exceeded" }] }, ctx);
+		assert.equal(trace.notices.filter((n) => /copilot refused a subagent call/.test(n)).length, 1);
+		const blocked = await toolCall?.({ toolName: "subagent", toolCallId: "c2", input: { agent: "worker", task: "x", model: "github-copilot/claude-sonnet-5.5" } }, ctx);
+		assert.equal(blocked?.block, true);
+		assert.match(blocked?.reason, /out of budget on copilot \(quota exhausted\)/);
 	} finally {
 		restore();
 	}
